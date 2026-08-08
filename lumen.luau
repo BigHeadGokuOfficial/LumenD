@@ -8481,17 +8481,39 @@ Serializer = (function()
 	local components = CFrame.new(0,0,0).GetComponents
 	local httpService = service.HttpService
 	local urlEncode = httpService.UrlEncode
-	local concat = table.concat
+	local rawconcat = table.concat
+	local bapi = type(buffer) == "table" and buffer or nil
+	local function concat(parts)
+		if not bapi or type(bapi.create) ~= "function" or type(bapi.writestring) ~= "function" or type(bapi.tostring) ~= "function" then
+			return rawconcat(parts)
+		end
+		local total = 0
+		for i = 1,#parts do total += #parts[i] end
+		if total == 0 then return "" end
+		local ok,out = pcall(function()
+			local buf = bapi.create(total)
+			local at = 0
+			for i = 1,#parts do
+				local part = parts[i]
+				bapi.writestring(buf,at,part)
+				at += #part
+			end
+			return bapi.tostring(buf)
+		end)
+		return ok and out or rawconcat(parts)
+	end
 	local s_pack = string.pack
 	local s_unpack = string.unpack
 	local lrotate = bit32.lrotate
 	local tableCreate = table.create
 	local select = select
-	local unpack = unpack
+	local unpack = table.unpack or unpack
 	local split = string.split
 	local s_rep = string.rep
 	local nilSafe = {}
 	local gameId
+	local binaryrefs
+	local binaryplace
 
 	--[[
 	local propBypass = {
@@ -8617,10 +8639,21 @@ Serializer = (function()
 			return format('\n<CoordinateFrame name="%s">\n<X>%.12f</X>\n<Y>%.12f</Y>\n<Z>%.12f</Z>\n<R00>%.12f</R00>\n<R01>%.12f</R01>\n<R02>%.12f</R02>\n<R10>%.12f</R10>\n<R11>%.12f</R11>\n<R12>%.12f</R12>\n<R20>%.12f</R20>\n<R21>%.12f</R21>\n<R22>%.12f</R22>\n</CoordinateFrame>',name,components(val))
 		end,
 		["Content"] = function(name,val)
-			if sub(val,1,15) == "rbxgameasset://" then
-				val = format("https://assetdelivery.roblox.com/v1/asset?universeId=%d&assetName=%s&skipSigningScripts=1",gameId,urlEncode(httpService,sub(val,16)))
+			if type(val) == "string" then
+				return '\n<Content name="'..name..'"><url>'..gsub(val,xmlReplacePattern,xmlReplace)..'</url></Content>'
 			end
-			return '\n<Content name="'..name..'"><url>'..gsub(val,xmlReplacePattern,xmlReplace)..'</url></Content>'
+			local ok,source = pcall(function() return val.SourceType end)
+			if not ok or not source then return "" end
+			local kind = source.Name
+			if kind == "None" then
+				return '\n<Content name="'..name..'"><null></null></Content>'
+			elseif kind == "Uri" then
+				local uri = val.Uri or ""
+				return '\n<Content name="'..name..'"><uri>'..gsub(uri,xmlReplacePattern,xmlReplace)..'</uri></Content>'
+			elseif kind == "Object" then
+				return ""
+			end
+			return ""
 		end,
 		["UDim"] = function(name,val)
 			return format('\n<UDim name="%s">\n<S>%.12f</S>\n<O>%d</O>\n</UDim>',name,val.Scale,val.Offset)
@@ -8648,10 +8681,39 @@ Serializer = (function()
 		end,
 		["PhysicalProperties"] = function(name,val)
 			if val then
-				return format('\n<PhysicalProperties name="%s">\n<CustomPhysics>true</CustomPhysics>\n<Density>%.12f</Density>\n<Friction>%.12f</Friction>\n<Elasticity>%.12f</Elasticity>\n<FrictionWeight>%.12f</FrictionWeight>\n<ElasticityWeight>%.12f</ElasticityWeight>\n</PhysicalProperties>',name,val.Density,val.Friction,val.Elasticity,val.FrictionWeight,val.ElasticityWeight)
+				local ok,acoustic = pcall(function() return val.AcousticAbsorption end)
+				local tail = ok and acoustic ~= nil and format('\n<AcousticAbsorption>%.12f</AcousticAbsorption>',acoustic) or ""
+				return format('\n<PhysicalProperties name="%s">\n<CustomPhysics>true</CustomPhysics>\n<Density>%.12f</Density>\n<Friction>%.12f</Friction>\n<Elasticity>%.12f</Elasticity>\n<FrictionWeight>%.12f</FrictionWeight>\n<ElasticityWeight>%.12f</ElasticityWeight>',name,val.Density,val.Friction,val.Elasticity,val.FrictionWeight,val.ElasticityWeight)..tail..'\n</PhysicalProperties>'
 			else
 				return '\n<PhysicalProperties name="'..name..'">\n<CustomPhysics>false</CustomPhysics>\n</PhysicalProperties>'
 			end
+		end,
+		["OptionalCoordinateFrame"] = function(name,val)
+			if not val then return '\n<OptionalCoordinateFrame name="'..name..'"></OptionalCoordinateFrame>' end
+			return format('\n<OptionalCoordinateFrame name="%s">\n<CFrame>\n<X>%.12f</X>\n<Y>%.12f</Y>\n<Z>%.12f</Z>\n<R00>%.12f</R00>\n<R01>%.12f</R01>\n<R02>%.12f</R02>\n<R10>%.12f</R10>\n<R11>%.12f</R11>\n<R12>%.12f</R12>\n<R20>%.12f</R20>\n<R21>%.12f</R21>\n<R22>%.12f</R22>\n</CFrame>\n</OptionalCoordinateFrame>',name,components(val))
+		end,
+		["OptionalCFrame"] = function(name,val)
+			if not val then return '\n<OptionalCoordinateFrame name="'..name..'"></OptionalCoordinateFrame>' end
+			return format('\n<OptionalCoordinateFrame name="%s">\n<CFrame>\n<X>%.12f</X>\n<Y>%.12f</Y>\n<Z>%.12f</Z>\n<R00>%.12f</R00>\n<R01>%.12f</R01>\n<R02>%.12f</R02>\n<R10>%.12f</R10>\n<R11>%.12f</R11>\n<R12>%.12f</R12>\n<R20>%.12f</R20>\n<R21>%.12f</R21>\n<R22>%.12f</R22>\n</CFrame>\n</OptionalCoordinateFrame>',name,components(val))
+		end,
+		["Font"] = function(name,val)
+			local family = val.Family
+			if type(family) ~= "string" then
+				local ok,source = pcall(function() return family.SourceType end)
+				family = ok and source and source.Name == "Uri" and (family.Uri or "") or ""
+			end
+			local cached = ""
+			local ok,c = pcall(function() return val.CachedFaceId end)
+			if ok and c then
+				if type(c) == "string" then cached = c
+				else
+					local good,source = pcall(function() return c.SourceType end)
+					if good and source and source.Name == "Uri" then cached = c.Uri or "" end
+				end
+			end
+			local out = format('\n<Font name="%s">\n<Family><url>%s</url></Family>\n<Weight>%d</Weight>\n<Style>%s</Style>',name,gsub(family,xmlReplacePattern,xmlReplace),val.Weight.Value,val.Style.Name)
+			if cached ~= "" then out ..= '\n<CachedFaceId><url>'..gsub(cached,xmlReplacePattern,xmlReplace)..'</url></CachedFaceId>' end
+			return out..'\n</Font>'
 		end,
 		["Faces"] = function(name,val)
 			local faceInt = (val.Front and 32 or 0) + (val.Bottom and 16 or 0) + (val.Left and 8 or 0) + (val.Back and 4 or 0) + (val.Top and 2 or 0) + (val.Right and 1 or 0)
@@ -8679,12 +8741,28 @@ Serializer = (function()
 		["SharedString"] = function(name,val)
 			return '\n<SharedString name="'..name..'">'..val..'</SharedString>'
 		end,
+		["SecurityCapabilities"] = function(name,val)
+			local bits = 0
+			local ok,items = pcall(function() return Enum.SecurityCapability:GetEnumItems() end)
+			if ok then
+				for _,item in ipairs(items) do
+					local good,has = pcall(function() return val:Contains(item) end)
+					if good and has and item.Value <= 52 then bits += 2 ^ item.Value end
+				end
+			end
+			return '\n<SecurityCapabilities name="'..name..'">'..format("%.0f",bits)..'</SecurityCapabilities>'
+		end,
+		["UniqueId"] = function(name,val)
+			local hex = tostring(val):match("([%x]+)")
+			if not hex or #hex ~= 32 then return "" end
+			return '\n<UniqueId name="'..name..'">'..hex:lower()..'</UniqueId>'
+		end,
 	}
 
 	local binaryDataTypes = {
 		["string"] = "\1",
 		["ContentId"] = "\1",
-		["Content"] = "\1", -- Lumen: newer API dump alias
+		["Content"] = "\34",
 		["BinaryString"] = "\1",
 		["bool"] = "\2",
 		["int"] = "\3",
@@ -8711,8 +8789,14 @@ Serializer = (function()
 		["Color3uint8"] = "\26",
 		["int64"] = "\27",
 		["SharedString"] = "\28",
+		["NetAssetRef"] = "\28",
+		["Tags"] = "\28",
+		["MaterialColors"] = "\1",
 		["OptionalCoordinateFrame"] = "\30",
-		["Font"] = "\32"
+		["OptionalCFrame"] = "\30",
+		["UniqueId"] = "\31",
+		["Font"] = "\32",
+		["SecurityCapabilities"] = "\33"
 	}
 
 	local binaryCFrameMap = {
@@ -8741,6 +8825,109 @@ Serializer = (function()
 		["\0\0\0\0\0\0\128\191\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\63\0\0\128\191\0\0\0\0\0\0\0\0"] = "\34",
 		["\0\0\0\0\0\0\0\0\0\0\128\191\0\0\0\0\0\0\128\191\0\0\0\128\0\0\128\191\0\0\0\0\0\0\0\128"] = "\35",
 	}
+
+	local function readvalue(obj,name,func)
+		if func then return func(obj,name) end
+		if oldIndex then return oldIndex(obj,name) end
+		return obj[name]
+	end
+
+	local function interleaveblobs(blobs,width)
+		local count = #blobs
+		if bapi and type(bapi.create) == "function" and type(bapi.writeu8) == "function" and type(bapi.tostring) == "function" then
+			local ok,out = pcall(function()
+				local buf = bapi.create(width*count)
+				for i = 1,count do
+					local bytes = blobs[i]
+					for b = 1,width do bapi.writeu8(buf,(b-1)*count+i-1,string.byte(bytes,b)) end
+				end
+				return bapi.tostring(buf)
+			end)
+			if ok then return out end
+		end
+		local out = tableCreate(width*count)
+		local sep = count-1
+		for i = 1,count do
+			local bytes = blobs[i]
+			local start = i-1
+			for b = 1,width do out[start + b + sep*(b-1)] = sub(bytes,b,b) end
+		end
+		return concat(out)
+	end
+
+	local function interleave(values,width,zigzag)
+		local count = #values
+		local blobs = tableCreate(count)
+		local fmt = width == 8 and ">I8" or ">I4"
+		for i = 1,count do
+			local value = values[i]
+			if zigzag then value = value < 0 and 2 * -value - 1 or 2 * value end
+			blobs[i] = s_pack(fmt,value)
+		end
+		return interleaveblobs(blobs,width)
+	end
+
+	local function referents(values)
+		local count = #values
+		local out = tableCreate(count)
+		local last
+		for i = 1,count do
+			local ref = values[i]
+			local delta = last and (ref-last) or ref
+			last = ref
+			out[i] = delta
+		end
+		return interleave(out,4,true)
+	end
+
+	local function capbits(val)
+		local bits = 0
+		local ok,items = pcall(function() return Enum.SecurityCapability:GetEnumItems() end)
+		if not ok then return nil end
+		for _,item in ipairs(items) do
+			if item.Value <= 52 then
+				local good,has = pcall(function() return val:Contains(item) end)
+				if not good then return nil end
+				if has then bits += 2 ^ item.Value end
+			end
+		end
+		return bits
+	end
+
+	local function capblob(val)
+		local bytes = {0,0,0,0,0,0,0,0}
+		local ok,items = pcall(function() return Enum.SecurityCapability:GetEnumItems() end)
+		if not ok then return nil end
+		for _,item in ipairs(items) do
+			if item.Value <= 52 then
+				local good,has = pcall(function() return val:Contains(item) end)
+				if not good then return nil end
+				if has then
+					local bit = item.Value + 1
+					local index = 8 - math.floor(bit / 8)
+					bytes[index] += 2 ^ (bit % 8)
+				end
+			end
+		end
+		return string.char(unpack(bytes))
+	end
+
+	local function uidblob(val)
+		if not binaryplace then return nil end
+		local hex = tostring(val):match("([%x]+)")
+		if not hex or #hex ~= 32 then return nil end
+		hex = hex:lower()
+		local hi = tonumber(sub(hex,1,8),16)
+		local lo = tonumber(sub(hex,9,16),16)
+		local time = tonumber(sub(hex,17,24),16)
+		local index = tonumber(sub(hex,25,32),16)
+		if not hi or not lo or not time or not index then return nil end
+		local carryhi = math.floor(hi / 2147483648)
+		local carrylo = math.floor(lo / 2147483648)
+		local rhi = (hi * 2) % 4294967296 + carrylo
+		local rlo = (lo * 2) % 4294967296 + carryhi
+		return s_pack(">I4I4I4I4",index,time,rhi,rlo)
+	end
 
 	local binaryPropHandlers = {
 		["string"] = function(objs,name,func)
@@ -9142,11 +9329,14 @@ Serializer = (function()
 			local szObjs = #objs
 			local result = tableCreate(szObjs)
 			for i = 1,szObjs do
-				local val
-				if func then val = func(objs[i],name) elseif oldIndex then val = oldIndex(objs[i],name) else val = objs[i][name] end
-
+				local val = readvalue(objs[i],name,func)
 				if val then
-					result[i] = "\1"..s_pack("<fffff", val.Density, val.Friction, val.Elasticity, val.FrictionWeight, val.ElasticityWeight)
+					local ok,acoustic = pcall(function() return val.AcousticAbsorption end)
+					if ok and acoustic ~= nil and acoustic ~= 1 then
+						result[i] = "\3"..s_pack("<ffffff",val.Density,val.Friction,val.Elasticity,val.FrictionWeight,val.ElasticityWeight,acoustic)
+					else
+						result[i] = "\1"..s_pack("<fffff",val.Density,val.Friction,val.Elasticity,val.FrictionWeight,val.ElasticityWeight)
+					end
 				else
 					result[i] = "\0"
 				end
@@ -9225,21 +9415,78 @@ Serializer = (function()
 			local szObjs = #objs
 			local result = tableCreate(szObjs)
 			for i = 1,szObjs do
-				local val
-				if func then val = func(objs[i],name) elseif oldIndex then val = oldIndex(objs[i],name) else val = objs[i][name] end
-
-				local family = s_pack("<I4",#val.Family)..val.Family
-				local weight = s_pack("<I2",val.Weight.Value)
-				local style = s_pack("<I1",val.Style.Value)
-				local cached = "\0\0\0\0"--s_pack("<I4",0)..""
-
-				result[i] = family..weight..style..cached
+				local val = readvalue(objs[i],name,func)
+				local family = val.Family
+				if type(family) ~= "string" then
+					local ok,source = pcall(function() return family.SourceType end)
+					family = ok and source and source.Name == "Uri" and (family.Uri or "") or ""
+				end
+				local cached = ""
+				local ok,c = pcall(function() return val.CachedFaceId end)
+				if ok and c then
+					if type(c) == "string" then cached = c
+					else
+						local good,source = pcall(function() return c.SourceType end)
+						if good and source and source.Name == "Uri" then cached = c.Uri or "" end
+					end
+				end
+				result[i] = s_pack("<I4",#family)..family..s_pack("<I2",val.Weight.Value)..s_pack("<I1",val.Style.Value)..s_pack("<I4",#cached)..cached
 			end
 			return concat(result)
 		end,
+		["SecurityCapabilities"] = function(objs,name,func)
+			local blobs = tableCreate(#objs)
+			for i = 1,#objs do
+				local blob = capblob(readvalue(objs[i],name,func))
+				if not blob then return nil end
+				blobs[i] = blob
+			end
+			return interleaveblobs(blobs,8)
+		end,
+		["UniqueId"] = function(objs,name,func)
+			local count = #objs
+			local blobs = tableCreate(count)
+			for i = 1,count do
+				local blob = uidblob(readvalue(objs[i],name,func))
+				if not blob then return nil end
+				blobs[i] = blob
+			end
+			return interleaveblobs(blobs,16)
+		end,
+		["Content"] = function(objs,name,func)
+			local kinds,uris,objects = {},{},{}
+			for i = 1,#objs do
+				local val = readvalue(objs[i],name,func)
+				if type(val) == "string" then
+					if val == "" then kinds[i] = 0 else kinds[i] = 1 uris[#uris+1] = val end
+				else
+					local ok,source = pcall(function() return val.SourceType end)
+					if not ok or not source then return nil end
+					local kind = source.Name
+					if kind == "None" then
+						kinds[i] = 0
+					elseif kind == "Uri" then
+						kinds[i] = 1
+						uris[#uris+1] = val.Uri or ""
+					elseif kind == "Object" then
+						kinds[i] = 2
+						objects[#objects+1] = binaryrefs and (binaryrefs[val.Object] or -1) or -1
+					else
+						return nil
+					end
+				end
+			end
+			local out = {interleave(kinds,4,true),s_pack("<I4",#uris)}
+			for i = 1,#uris do out[#out+1] = s_pack("<I4",#uris[i])..uris[i] end
+			out[#out+1] = s_pack("<I4",#objects)
+			out[#out+1] = referents(objects)
+			out[#out+1] = "\0\0\0\0"
+			return concat(out)
+		end,
 	}
 
-	binaryPropHandlers.Content = binaryPropHandlers.ContentId
+	binaryPropHandlers.OptionalCFrame = binaryPropHandlers.OptionalCoordinateFrame
+	binaryPropHandlers.MaterialColors = binaryPropHandlers.BinaryString
 
 	local specialProps = {
 		["Script"] = {
@@ -9382,19 +9629,17 @@ Serializer = (function()
 				--if (prop.Serialization.CanSave and not prop.Tags.NotScriptable) or (propBypass[curClassName] and propBypass[curClassName][propName]) then
 				if prop.Serialization.CanSave or (propBypass[curClassName] and propBypass[curClassName][propName]) then
 					if not propFilter[curClassName] or not propFilter[curClassName][propName] then
-						-- Check for existence in current engine version
-						if prop.Tags and prop.Tags.NotScriptable then
-							local s,ret1,ret2 = pcall(getnspval,obj,propName)
-							if s and type(ret2) ~= "string" then
-								result[count] = prop
-								count = count + 1
-							end
-						else
-							local s,e = pcall(function() return obj[propName] end)
-							if s then
-								result[count] = prop
-								count = count + 1
-							end
+						local exists = pcall(function()
+							if oldIndex then return oldIndex(obj,propName) end
+							return obj[propName]
+						end)
+						if not exists and getnspval then
+							local ok,value = pcall(getnspval,obj,propName)
+							exists = ok and value ~= nil
+						end
+						if exists then
+							result[count] = prop
+							count += 1
 						end
 					end
 				end
@@ -9601,6 +9846,8 @@ Serializer = (function()
 		local sharedStrings = {}
 		local filter = {}
 		local refs = {}
+		binaryrefs = refs
+		binaryplace = isGame
 		local parents = {}
 		local orderedInstList = {}
 		local nilBlacklist = {[game] = true}
@@ -9811,7 +10058,7 @@ Serializer = (function()
 		end
 
 		local sharedStringHandler = function(objs,name,func)
-			if not gethiddenprop then return end
+			if not gethiddenprop and not getbspval then return end
 
 			if sharedStringCount == 0 then
 				sharedStringCount = sharedStringCount + 1
@@ -9824,7 +10071,15 @@ Serializer = (function()
 			for i = 1,szObjs do
 				pulse()
 				local start = i-1
-				local content = gethiddenprop(objs[i],name)
+				local content
+				if getbspval then
+					local ok,val = pcall(getbspval,objs[i],name,false)
+					if ok and type(val) == "string" then content = val end
+				end
+				if content == nil and gethiddenprop then
+					local ok,val = pcall(gethiddenprop,objs[i],name)
+					if ok and type(val) == "string" then content = val end
+				end
 				if content and #content > 0 then
 					local hash = content
 					local index = hashs[hash]
@@ -9948,6 +10203,11 @@ Serializer = (function()
 				else -- Assume Class
 					handler = refPropHandler
 					propChunkData[3] = binaryDataTypes.Referent
+				end
+
+				if indexName == "Tags" or propType == "Tags" or propType == "NetAssetRef" then
+					handler = sharedStringHandler
+					propChunkData[3] = binaryDataTypes.SharedString
 				end
 
 				if handler then
@@ -10125,6 +10385,8 @@ Serializer = (function()
 				task.spawn(saveSettings.Callback,totalData)
 			end
 		end
+		binaryrefs = nil
+		binaryplace = nil
 	end
 
 	local function serializeXML(root,filename,saveSettings)
@@ -10438,116 +10700,185 @@ Main = (function()
 	local Main = {}
 
 	Main.FetchAPI = function()
-		-- You should see if you can use ReflectionService here
+		local primitive = {bool=true,int=true,int64=true,float=true,double=true,string=true}
 
-		--local robloxVer = game:HttpGet("http://setup.roblox.com/versionQTStudio")
-		local rawAPI
-		
-		if game:GetService("RunService"):IsStudio() then
-			rawAPI = require(game.ReplicatedStorage.FullAPI)
-		else
-			rawAPI = game:HttpGet("https://raw.githubusercontent.com/MaximumADHD/Roblox-Client-Tracker/refs/heads/roblox/Full-API-Dump.json")
-		end
-		
-		local api = service.HttpService:JSONDecode(rawAPI)
-		local classes,enums = {},{}
-
-		for _,class in pairs(api.Classes) do
-			classes[class.Name] = {
-				Name = class.Name,
-				Superclass = nil,
-				Properties = {},
-				Functions = {},
-				Events = {},
-				Callbacks = {},
-				Tags = {},
-			}
-		end
-
-		for _,class in pairs(api.Classes) do
-			local newClass = classes[class.Name]
-			newClass.Superclass = classes[class.Superclass]
-
-			if class.Tags then
-				for _,tag in pairs(class.Tags) do
-					newClass.Tags[tag] = true
-				end
+		local function legacy()
+			local rawAPI
+			if game:GetService("RunService"):IsStudio() then
+				rawAPI = require(game.ReplicatedStorage.FullAPI)
+			else
+				rawAPI = game:HttpGet("https://raw.githubusercontent.com/MaximumADHD/Roblox-Client-Tracker/refs/heads/roblox/Full-API-Dump.json")
 			end
 
-			for _,member in pairs(class.Members) do
-				local newMember = {
-					Name = member.Name,
-					Class = class.Name,
+			local api = service.HttpService:JSONDecode(rawAPI)
+			local classes,enums = {},{}
+
+			for _,class in pairs(api.Classes) do
+				classes[class.Name] = {
+					Name = class.Name,
+					Superclass = nil,
+					Properties = {},
+					Functions = {},
+					Events = {},
+					Callbacks = {},
 					Tags = {},
 				}
+			end
 
-				if member.Tags then
-					for _,tag in pairs(member.Tags) do
-						newMember.Tags[tag] = true
-					end
+			for _,class in pairs(api.Classes) do
+				local newClass = classes[class.Name]
+				newClass.Superclass = classes[class.Superclass]
+
+				if class.Tags then
+					for _,tag in pairs(class.Tags) do newClass.Tags[tag] = true end
 				end
 
-				local memberType = member.MemberType
-				if memberType == "Property" then
-					newMember.ValueType = member.ValueType
-					newMember.Category = member.Category
-					newMember.Serialization = member.Serialization
-					table.insert(newClass.Properties,newMember)
-				elseif memberType == "Function" then
-					newMember.Parameters = {}
-					newMember.ReturnType = member.ReturnType.Name
-					for _,param in pairs(member.Parameters) do
-						table.insert(newMember.Parameters,{Name = param.Name, Type = param.Type.Name})
+				for _,member in pairs(class.Members) do
+					local newMember = {Name = member.Name,Class = class.Name,Tags = {}}
+					if member.Tags then
+						for _,tag in pairs(member.Tags) do newMember.Tags[tag] = true end
 					end
-					table.insert(newClass.Functions,newMember)
-				elseif memberType == "Event" then
-					newMember.Parameters = {}
-					for _,param in pairs(member.Parameters) do
-						table.insert(newMember.Parameters,{Name = param.Name, Type = param.Type.Name})
+
+					local memberType = member.MemberType
+					if memberType == "Property" then
+						newMember.ValueType = member.ValueType
+						newMember.Category = member.Category
+						newMember.Serialization = member.Serialization
+						table.insert(newClass.Properties,newMember)
+					elseif memberType == "Function" then
+						newMember.Parameters = {}
+						newMember.ReturnType = member.ReturnType.Name
+						for _,param in pairs(member.Parameters) do
+							table.insert(newMember.Parameters,{Name = param.Name, Type = param.Type.Name})
+						end
+						table.insert(newClass.Functions,newMember)
+					elseif memberType == "Event" then
+						newMember.Parameters = {}
+						for _,param in pairs(member.Parameters) do
+							table.insert(newMember.Parameters,{Name = param.Name, Type = param.Type.Name})
+						end
+						table.insert(newClass.Events,newMember)
 					end
-					table.insert(newClass.Events,newMember)
 				end
 			end
+
+			for _,enum in pairs(api.Enums) do
+				local newEnum = {Name = enum.Name,Items = {},Tags = {}}
+				if enum.Tags then for _,tag in pairs(enum.Tags) do newEnum.Tags[tag] = true end end
+				for _,item in pairs(enum.Items) do
+					table.insert(newEnum.Items,{Name = item.Name,Value = item.Value})
+				end
+				enums[enum.Name] = newEnum
+			end
+
+			return classes,enums
 		end
 
-		for _,enum in pairs(api.Enums) do
-			local newEnum = {}
-			newEnum.Name = enum.Name
-			newEnum.Items = {}
-			newEnum.Tags = {}
+		local function reflected()
+			local ok,reflection = pcall(function() return game:GetService("ReflectionService") end)
+			if not ok or not reflection then return nil end
 
-			if enum.Tags then for c,tag in pairs(enum.Tags) do newEnum.Tags[tag] = true end end
-			for __,item in pairs(enum.Items) do
-				local newItem = {}
-				newItem.Name = item.Name
-				newItem.Value = item.Value
-				table.insert(newEnum.Items,newItem)
+			local security
+			pcall(function()
+				security = SecurityCapabilities.new(unpack(Enum.SecurityCapability:GetEnumItems()))
+			end)
+
+			local cfilter = {ExcludeDisplay = true}
+			if security then cfilter.Security = security end
+			local good,list = pcall(function() return reflection:GetClasses(cfilter) end)
+			if not good or type(list) ~= "table" or #list == 0 then
+				cfilter.Security = nil
+				good,list = pcall(function() return reflection:GetClasses(cfilter) end)
+			end
+			if not good or type(list) ~= "table" or #list == 0 then return nil end
+
+			local classes = {}
+			for _,class in ipairs(list) do
+				if type(class) == "table" and class.Name then
+					local tags = {}
+					if class.Permits and class.Permits.GetService ~= nil then tags.Service = true end
+					if not class.Permits or class.Permits.New == nil then tags.NotCreatable = true end
+					if class.Serialized == false then tags.NotSerializable = true end
+					classes[class.Name] = {
+						Name = class.Name,
+						Superclass = class.Superclass,
+						Properties = {},
+						Functions = {},
+						Events = {},
+						Callbacks = {},
+						Tags = tags,
+					}
+				end
 			end
 
-			enums[enum.Name] = newEnum
+			local function valuetype(info)
+				local engine,script,enum
+				if type(info) == "table" then
+					engine = info.EngineType or info.Name or info.TypeName
+					script = info.ScriptType
+					enum = info.EnumType
+				elseif type(info) == "string" then
+					engine,script = info,info
+				end
+				if enum and enum ~= "" then return {Name = enum,Category = "Enum"} end
+				local name = engine or script or "string"
+				if primitive[name] then return {Name = name,Category = "Primitive"} end
+				if name == "EnumItem" or name == "Enum" or (script and sub(script,1,5) == "Enum.") then
+					return {Name = enum or script or "Enum",Category = "Enum"}
+				end
+				if name == "Object" then name = "Instance" end
+				if name == "Instance" or classes[name] then return {Name = name,Category = "Class"} end
+				return {Name = name,Category = "DataType"}
+			end
+
+			local pfilter = {ExcludeInherited = true,ExcludeDisplay = true}
+			if security then pfilter.Security = security end
+			for _,class in pairs(classes) do
+				if type(class.Superclass) == "string" then class.Superclass = classes[class.Superclass] end
+				local okp,props = pcall(function() return reflection:GetPropertiesOfClass(class.Name,pfilter) end)
+				if not okp then
+					pfilter.Security = nil
+					okp,props = pcall(function() return reflection:GetPropertiesOfClass(class.Name,pfilter) end)
+					if security then pfilter.Security = security end
+				end
+				if okp and type(props) == "table" then
+					for _,prop in ipairs(props) do
+						if type(prop) == "table" and prop.Name and prop.Serialized == true then
+							class.Properties[#class.Properties+1] = {
+								Name = prop.Name,
+								Class = prop.Owner or class.Name,
+								Tags = {},
+								ValueType = valuetype(prop.Type),
+								Category = prop.Display and prop.Display.Category,
+								Serialization = {CanSave = true,CanLoad = true},
+							}
+						end
+					end
+				end
+			end
+			return classes,{}
+		end
+
+		local classes,enums = reflected()
+		if not classes then
+			local ok,a,b = pcall(legacy)
+			if not ok then return nil,a end
+			classes,enums = a,b
 		end
 
 		local function getMember(class,member)
 			if not classes[class] or not classes[class][member] then return end
 			local result = {}
-
 			local currentClass = classes[class]
 			while currentClass do
-				for _,entry in pairs(currentClass[member]) do
-					result[#result+1] = entry
-				end
+				for _,entry in pairs(currentClass[member]) do result[#result+1] = entry end
 				currentClass = currentClass.Superclass
 			end
-
 			table.sort(result,function(a,b) return a.Name < b.Name end)
 			return result
 		end
 
-		return {
-			Classes = classes,
-			Enums = enums,
-			GetMember = getMember
-		}
+		return {Classes = classes,Enums = enums,GetMember = getMember}
 	end
 
 	Main.ResetSettings = function()
