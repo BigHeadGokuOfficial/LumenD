@@ -403,6 +403,7 @@ local function actors(lumen, jobs, opt, stat, cache)
         if w.con then pcall(function() w.con:Disconnect() end) end
     end
     if owned then pcall(function() owned:Destroy() end) end
+    task.wait()
 
     stat.decompileTime += os.clock() - started
 
@@ -635,6 +636,7 @@ function dump.run(lumen, opt)
 
     if opt.Binary then
         st.set("Saving binary", cache and "reusing source/availability cache" or tostring(game.Name))
+        task.wait()
         local file = root .. "/FullGame.rbxl"
         local ok, err = pcall(function()
             lumen:save(game, file, {
@@ -645,7 +647,7 @@ function dump.run(lumen, opt)
                 NilInstances = opt.NilInstances == true,
                 RemovePlayerCharacters = opt.RemovePlayerCharacters == true,
                 SavePlayers = opt.SavePlayers == true,
-                MaxThreads = opt.MaxThreads or 8,
+                MaxThreads = opt.MaxThreads or 3,
                 DecompileIgnore = opt.IgnoreCoreScripts and { "Chat", "CoreGui", "CorePackages", "RobloxReplicatedStorage", "CoreScriptSyncService" } or opt.DecompileIgnore,
                 ShowStatus = false,
             })
@@ -691,6 +693,8 @@ function dump.auto(lumen, boot)
     local parallel = val("Parallel")
     if parallel == nil then parallel = true else parallel = parallel == true end
     local maxworkers = tonumber(val("MaxWorkers")) or 4
+    local maxthreads = tonumber(val("MaxThreads")) or 3
+    maxthreads = math.max(1, math.min(math.floor(maxthreads), 8))
     local maxpath = tonumber(val("MaxPathLength")) or 240
     local acquirebatch = tonumber(val("AcquireBatch"))
     local acquirebudget = tonumber(val("AcquireBudgetMs")) or 3
@@ -701,7 +705,7 @@ function dump.auto(lumen, boot)
         local v = val(name)
         if v ~= nil then dopt[name] = v end
     end
-    local flags = "Binary=" .. tostring(binary) .. " | Decompile=" .. tostring(decomp) .. " | Tree=" .. tostring(treeon) .. " | IgnoreCoreScripts=" .. tostring(ignorecore) .. " | Parallel=" .. tostring(parallel) .. " | MaxWorkers=" .. tostring(maxworkers)
+    local flags = "Binary=" .. tostring(binary) .. " | Decompile=" .. tostring(decomp) .. " | Tree=" .. tostring(treeon) .. " | IgnoreCoreScripts=" .. tostring(ignorecore) .. " | Parallel=" .. tostring(parallel) .. " | MaxWorkers=" .. tostring(maxworkers) .. " | MaxThreads=" .. tostring(maxthreads)
 
     st.set("Loaded", "v" .. tostring(lumen.Version) .. " | " .. flags)
     print("[LumenDecomp] " .. flags)
@@ -720,7 +724,7 @@ function dump.auto(lumen, boot)
     st.set("Starting dump", flags)
     task.spawn(function()
         local ok, err = pcall(function()
-            dump.run(lumen, { Binary = binary, Decompile = decomp, Tree = treeon, IgnoreCoreScripts = ignorecore, Parallel = parallel, MaxWorkers = maxworkers, MaxPathLength = maxpath, AcquireBatch = acquirebatch, AcquireBudgetMs = acquirebudget, Options = dopt })
+            dump.run(lumen, { Binary = binary, Decompile = decomp, Tree = treeon, IgnoreCoreScripts = ignorecore, Parallel = parallel, MaxWorkers = maxworkers, MaxThreads = maxthreads, MaxPathLength = maxpath, AcquireBatch = acquirebatch, AcquireBudgetMs = acquirebudget, Options = dopt })
         end)
         e.__LumenDump = nil
         if not ok then
