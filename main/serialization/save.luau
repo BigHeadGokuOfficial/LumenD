@@ -1,5 +1,4 @@
 local dex = require("main.serialization.dex_serializer")
-local iri = require("main.runtime.iridium")
 local st = require("main.runtime.status")
 local core = require("main.runtime.core")
 
@@ -24,8 +23,6 @@ end
 local function start(lumen)
     if ready then return true end
     if fail then return false, fail end
-
-    iri.get()
 
     dex.SetDecompiler(function(scr)
         if skipcore and core.is(scr) then return nil, "core script ignored" end

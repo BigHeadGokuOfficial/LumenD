@@ -48,6 +48,19 @@ function api:decompile(obj, opt)
     return self:decompileBytecode(bc.fromScript(obj), opt)
 end
 
+function api:tryDecompileBytecode(raw, opt)
+    local ok, source, metadata = pcall(function()
+        local text, meta = self:decompileBytecode(raw, opt)
+        return text, meta
+    end)
+
+    if ok then
+        return { success = true, source = source, metadata = metadata }
+    end
+
+    return { success = false, error = tostring(source) }
+end
+
 function api:tryDecompile(obj, opt)
     local ok, source, metadata = pcall(function()
         local text, meta = self:decompile(obj, opt)
@@ -78,6 +91,16 @@ end
 function api:inspectIR(obj, opt)
     opt = cfg(opt)
     return view.ir(self:parse(obj, opt), opt)
+end
+
+function api:warm()
+    local ok, err = iri.warm()
+    if not ok then error("LumenDecomp: Iridium warmup failed: " .. tostring(err), 2) end
+    return true
+end
+
+function api:_iridiumPack()
+    return iri.pack()
 end
 
 function api:dependencyInfo()

@@ -865,6 +865,19 @@ function api:decompile(obj, opt)
     return self:decompileBytecode(bc.fromScript(obj), opt)
 end
 
+function api:tryDecompileBytecode(raw, opt)
+    local ok, source, metadata = pcall(function()
+        local text, meta = self:decompileBytecode(raw, opt)
+        return text, meta
+    end)
+
+    if ok then
+        return { success = true, source = source, metadata = metadata }
+    end
+
+    return { success = false, error = tostring(source) }
+end
+
 function api:tryDecompile(obj, opt)
     local ok, source, metadata = pcall(function()
         local text, meta = self:decompile(obj, opt)
@@ -895,6 +908,16 @@ end
 function api:inspectIR(obj, opt)
     opt = cfg(opt)
     return view.ir(self:parse(obj, opt), opt)
+end
+
+function api:warm()
+    local ok, err = iri.warm()
+    if not ok then error("LumenDecomp: Iridium warmup failed: " .. tostring(err), 2) end
+    return true
+end
+
+function api:_iridiumPack()
+    return iri.pack()
 end
 
 function api:dependencyInfo()
@@ -3163,97 +3186,13 @@ return view
 local env = require("main.runtime.environment")
 local st = require("main.runtime.status")
 local coref = require("main.runtime.core")
+local bc = require("main.runtime.bytecode")
+local tree = require("main.tree")
 
 local dump = {}
 
-local function clean(s)
-    s = tostring(s or "unnamed")
-    s = s:gsub("[%c<>:\"/\\|%?%*]", "_")
-    s = s:gsub("^%s+", ""):gsub("%s+$", "")
-    if s == "" or s == "." or s == ".." then s = "unnamed" end
-    return s
-end
-
-local function mkdir(path, made)
-    if made[path] then return true end
-    if type(makefolder) ~= "function" then return false end
-    if type(isfolder) == "function" then
-        local ok, yes = pcall(isfolder, path)
-        if ok and yes then
-            made[path] = true
-            return true
-        end
-    end
-    local ok = pcall(makefolder, path)
-    if ok then made[path] = true end
-    return ok
-end
-
-local function mkall(path, made)
-    local cur = ""
-    for part in tostring(path):gmatch("[^/]+") do
-        cur = cur == "" and part or cur .. "/" .. part
-        mkdir(cur, made)
-    end
-end
-
 local function rootdir()
     return "LumenDecomp/" .. tostring(game.PlaceId or 0) .. "/dump_" .. tostring(os.time())
-end
-
-local function scriptobj(obj)
-    local c = obj.ClassName
-    return c == "LocalScript" or c == "ModuleScript" or c == "Script"
-end
-
-local function parts(obj)
-    local rev = {}
-    local cur = obj.Parent
-    while cur and cur ~= game do
-        rev[#rev + 1] = clean(cur.Name)
-        cur = cur.Parent
-    end
-    local out = {}
-    for i = #rev, 1, -1 do out[#out + 1] = rev[i] end
-    return out
-end
-
-local function outpath(root, obj, flat, used, made)
-    local seg = parts(obj)
-    local dir = root .. "/Scripts"
-    if not flat then
-        for _, name in ipairs(seg) do dir = dir .. "/" .. name end
-    end
-    mkall(dir, made)
-    local base = clean(obj.Name) .. "." .. clean(obj.ClassName)
-    if flat then
-        local full = st.path(obj):gsub("%.", "_")
-        base = clean(full) .. "." .. clean(obj.ClassName)
-    end
-    local path = dir .. "/" .. base .. ".luau"
-    local n = 2
-    while used[path] do
-        path = dir .. "/" .. base .. "_" .. tostring(n) .. ".luau"
-        n += 1
-    end
-    used[path] = true
-    return path
-end
-
-local function scripts(ignorecore)
-    local out = {}
-    for _, root in ipairs(game:GetChildren()) do
-        if not (ignorecore and coref.root(root)) then
-            if scriptobj(root) and not (ignorecore and coref.is(root)) then out[#out + 1] = root end
-            local ok, list = pcall(root.GetDescendants, root)
-            if ok then
-                for _, obj in ipairs(list) do
-                    if scriptobj(obj) and not (ignorecore and coref.is(obj)) then out[#out + 1] = obj end
-                end
-            end
-        end
-    end
-    return out
 end
 
 local function write(path, data)
@@ -3262,9 +3201,10 @@ local function write(path, data)
     return ok, err
 end
 
-local function fail(stat, obj, err)
+local function decompfail(stat, cache, obj, err)
     err = tostring(err)
     stat.failed += 1
+    cache[obj] = { success = false, error = err }
     local line = st.path(obj) .. " :: " .. err
     stat.errors[#stat.errors + 1] = line
     if stat.failed <= 5 then
@@ -3273,34 +3213,96 @@ local function fail(stat, obj, err)
     end
 end
 
-local function serial(lumen, list, opt, stat)
+local function unavailable(stat, cache, obj, err)
+    err = tostring(err)
+    stat.unavailable += 1
+    if obj.ClassName == "Script" then stat.serverUnavailable += 1 end
+    cache[obj] = { success = false, unavailable = true, error = err }
+    local line = st.path(obj) .. " :: " .. err
+    stat.unavailableErrors[#stat.unavailableErrors + 1] = line
+end
+
+local function acquire(list, stat)
+    local jobs = {}
     local cache = {}
     local started = os.clock()
-    local total = #list
-    local decopt = {}
-    if type(opt.Options) == "table" then
-        for k, v in pairs(opt.Options) do decopt[k] = v end
-    end
-    stat.found = total
+    stat.found = #list
+
     for i, obj in ipairs(list) do
-        local res = lumen:tryDecompile(obj, decopt)
+        local ok, raw = bc.try(obj)
+        if ok then
+            if typeof(raw) == "buffer" then raw = buffer.tostring(raw) end
+            jobs[#jobs + 1] = { obj = obj, raw = raw }
+        else
+            unavailable(stat, cache, obj, raw)
+        end
+        st.progress("Acquiring bytecode", obj, i, #list)
+        if i % 64 == 0 then task.wait() end
+    end
+
+    stat.available = #jobs
+    stat.acquireTime = os.clock() - started
+    return jobs, cache
+end
+
+local function decopt(opt)
+    local out = {}
+    if type(opt.Options) == "table" then
+        for k, v in pairs(opt.Options) do out[k] = v end
+    end
+    return out
+end
+
+local function warm(lumen, stat)
+    local t = os.clock()
+    local ok, err = pcall(function() return lumen:warm() end)
+    stat.warmTime += os.clock() - t
+    if not ok then return false, tostring(err) end
+    return true
+end
+
+local function serial(lumen, jobs, opt, stat, cache, label)
+    local ok, err = warm(lumen, stat)
+    if not ok then
+        for _, job in ipairs(jobs) do decompfail(stat, cache, job.obj, err) end
+        stat.decompileTime = 0
+        stat.rate = 0
+        return cache
+    end
+
+    local started = os.clock()
+    local cfg = decopt(opt)
+    local total = #jobs
+    for i, job in ipairs(jobs) do
+        local res = lumen:tryDecompileBytecode(job.raw, cfg)
         if res.success and type(res.source) == "string" and res.source ~= "" then
-            cache[obj] = res.source
+            cache[job.obj] = res.source
             stat.good += 1
         else
-            fail(stat, obj, res.error)
+            decompfail(stat, cache, job.obj, res.error)
         end
         local elapsed = os.clock() - started
-        st.progress("Decompiling", obj, i, total, elapsed > 0 and i / elapsed or nil)
+        st.progress(label or "Decompiling", job.obj, i, total, elapsed > 0 and i / elapsed or nil)
     end
-    stat.decompileTime = os.clock() - started
-    stat.rate = stat.decompileTime > 0 and total / stat.decompileTime or 0
+    stat.decompileTime += os.clock() - started
+    stat.rate = stat.decompileTime > 0 and stat.available / stat.decompileTime or 0
     return cache
 end
 
 local actorcode = [[
-local id, src = ...
+local id, src, vendor = ...
 local ch = get_comm_channel(id)
+local genv = type(getgenv) == "function" and getgenv() or _G
+local okv, v = pcall(function()
+    if type(vendor) ~= "string" or vendor == "" then return nil end
+    local fn, err = loadstring(vendor, "@LumenIridiumVendor")
+    assert(fn, err)
+    return fn()
+end)
+if okv and type(v) == "table" then
+    genv.__LUMEN_IRIDIUM_VENDOR = v
+    _G.__LUMEN_IRIDIUM_VENDOR = v
+end
 local ok, api = pcall(function()
     local fn, err = loadstring(src, "@LumenWorker")
     assert(fn, err)
@@ -3310,11 +3312,21 @@ if not ok then
     ch:Fire("boot", false, tostring(api))
     return
 end
-ch.Event:Connect(function(kind, jid, obj)
+local wok, werr = pcall(function() return api:warm() end)
+if not wok then
+    ch:Fire("boot", false, tostring(werr))
+    return
+end
+genv.__LUMEN_IRIDIUM_VENDOR = nil
+_G.__LUMEN_IRIDIUM_VENDOR = nil
+local con
+con = ch.Event:Connect(function(kind, jid, raw)
+    if kind == "stop" then
+        if con then con:Disconnect() end
+        return
+    end
     if kind ~= "job" then return end
-    local good, out = pcall(function()
-        return api:decompile(obj)
-    end)
+    local good, out = pcall(function() return api:decompileBytecode(raw) end)
     if good and type(out) == "string" and out ~= "" then
         ch:Fire("done", jid, true, out)
     else
@@ -3324,46 +3336,67 @@ end)
 ch:Fire("boot", true, "")
 ]]
 
-local function actors(lumen, list, opt, stat)
-    if opt.Parallel == false then return nil, "disabled" end
-    if #list < 48 then return nil, "too few scripts" end
-    if type(run_on_actor) ~= "function" or type(create_comm_channel) ~= "function" or type(get_comm_channel) ~= "function" then
-        return nil, "Potassium actor APIs unavailable"
-    end
-    if type(lumen._workerSource) ~= "function" then return nil, "worker source unavailable" end
-
-    local want = tonumber(opt.MaxWorkers) or 4
-    want = math.max(2, math.min(math.floor(want), 32, math.max(2, math.floor(#list / 24))))
-
+local function getpool(want)
     local pool = {}
+    if type(getactors) == "function" then
+        local ok, list = pcall(getactors)
+        if ok and type(list) == "table" then
+            for _, a in ipairs(list) do
+                if typeof(a) == "Instance" and a:IsA("Actor") then
+                    pool[#pool + 1] = a
+                    if #pool >= want then return pool end
+                end
+            end
+        end
+    end
+
     local owned = nil
-    local ownok = pcall(function()
-        local parent = game:GetService("ReplicatedStorage")
+    local ok = pcall(function()
         owned = Instance.new("Folder")
         owned.Name = "__LumenWorkers_" .. tostring(math.floor(os.clock() * 1000))
         owned.Archivable = false
-        owned.Parent = parent
-        for i = 1, want do
+        owned.Parent = game:GetService("ReplicatedStorage")
+        while #pool < want do
             local a = Instance.new("Actor")
-            a.Name = "Worker" .. tostring(i)
+            a.Name = "Worker" .. tostring(#pool + 1)
             a.Archivable = false
             a.Parent = owned
             pool[#pool + 1] = a
         end
     end)
-
-    if not ownok or #pool < 2 then
+    if not ok then
         if owned then pcall(function() owned:Destroy() end) end
-        owned = nil
-        pool = {}
-        if type(getactors) ~= "function" then return nil, "could not create worker Actors and getactors is unavailable" end
-        local ok, existing = pcall(getactors)
-        if not ok then return nil, "getactors failed: " .. tostring(existing) end
-        if type(existing) ~= "table" or #existing < 2 then return nil, "fewer than 2 usable Actors" end
-        pool = existing
-        want = math.min(want, #pool)
-    else
-        task.wait()
+        return pool, nil
+    end
+    task.wait()
+    return pool, owned
+end
+
+local function actors(lumen, jobs, opt, stat, cache)
+    if opt.Parallel == false then return nil, "disabled" end
+    if #jobs < 12 then return nil, "small corpus fast path" end
+    if type(run_on_actor) ~= "function" or type(create_comm_channel) ~= "function" or type(get_comm_channel) ~= "function" then
+        return nil, "Potassium actor APIs unavailable"
+    end
+    if type(lumen._workerSource) ~= "function" or type(lumen._iridiumPack) ~= "function" then
+        return nil, "worker source unavailable"
+    end
+
+    local max = tonumber(opt.MaxWorkers) or 4
+    max = math.max(2, math.min(math.floor(max), 32))
+    local useful = math.max(2, math.floor(#jobs / 4))
+    local want = math.min(max, 16, useful)
+
+    local bootstart = os.clock()
+    local vendor, verr = lumen:_iridiumPack()
+    if type(vendor) ~= "string" then return nil, "Iridium prefetch failed: " .. tostring(verr) end
+    stat.warmTime += os.clock() - bootstart
+
+    local pool, owned = getpool(want)
+    want = math.min(want, #pool)
+    if want < 2 then
+        if owned then pcall(function() owned:Destroy() end) end
+        return nil, "fewer than 2 usable Actors"
     end
 
     local src = lumen:_workerSource()
@@ -3374,6 +3407,8 @@ local function actors(lumen, list, opt, stat)
 
     local ws = {}
     local q = {}
+    local qhead = 1
+    local qtail = 0
     local booted = 0
     local bootfail = 0
 
@@ -3391,11 +3426,12 @@ local function actors(lumen, list, opt, stat)
                     w.err = tostring(b)
                 end
             elseif kind == "done" then
-                q[#q + 1] = { w = w, jid = a, ok = b, out = c }
+                qtail += 1
+                q[qtail] = { w = w, jid = a, ok = b, out = c }
             end
         end)
         ws[#ws + 1] = w
-        local rok, rerr = pcall(run_on_actor, w.actor, actorcode, id, src)
+        local rok, rerr = pcall(run_on_actor, w.actor, actorcode, id, src, vendor)
         if not rok then
             w.dead = true
             w.err = tostring(rerr)
@@ -3404,12 +3440,11 @@ local function actors(lumen, list, opt, stat)
     end
 
     local bt = os.clock()
-    while booted + bootfail < #ws and os.clock() - bt < 8 do task.wait(0.01) end
+    while booted + bootfail < #ws and os.clock() - bt < 12 do task.wait(0.01) end
 
     local live = {}
-    for _, w in ipairs(ws) do
-        if w.ready and not w.dead then live[#live + 1] = w end
-    end
+    for _, w in ipairs(ws) do if w.ready and not w.dead then live[#live + 1] = w end end
+    stat.parallelBootTime = os.clock() - bootstart
     if #live < 2 then
         local why = {}
         for _, w in ipairs(ws) do
@@ -3421,129 +3456,153 @@ local function actors(lumen, list, opt, stat)
     end
 
     stat.parallel = #live
-    stat.found = #list
-    local cache = {}
     local nextjob = 1
     local done = 0
     local active = {}
+    local retry = {}
     local started = os.clock()
 
     local function send(w)
-        if w.dead or nextjob > #list then return end
+        if w.dead or nextjob > #jobs then return end
         local jid = nextjob
         nextjob += 1
         w.busy = true
         w.sent = os.clock()
         w.jid = jid
         active[jid] = true
-        w.ch:Fire("job", jid, list[jid])
+        w.ch:Fire("job", jid, jobs[jid].raw)
     end
 
     for _, w in ipairs(live) do send(w) end
 
-    while done < #list do
-        while #q > 0 do
-            local r = table.remove(q, 1)
+    while done < #jobs do
+        while qhead <= qtail do
+            local r = q[qhead]
+            q[qhead] = nil
+            qhead += 1
             local w = r.w
             local jid = r.jid
             if active[jid] then
                 active[jid] = nil
                 done += 1
                 w.busy = false
-                local obj = list[jid]
+                local job = jobs[jid]
                 if r.ok and type(r.out) == "string" and r.out ~= "" then
-                    cache[obj] = r.out
+                    cache[job.obj] = r.out
                     stat.good += 1
                 else
-                    local res = lumen:tryDecompile(obj, opt.Options)
-                    if res.success and type(res.source) == "string" and res.source ~= "" then
-                        cache[obj] = res.source
-                        stat.good += 1
-                        w.bad = (w.bad or 0) + 1
-                        if w.bad >= 2 then w.dead = true end
-                    else
-                        fail(stat, obj, res.error or r.out)
-                    end
+                    retry[#retry + 1] = job
                 end
                 local elapsed = os.clock() - started
-                st.progress("Parallel decompile x" .. tostring(#live), obj, done, #list, elapsed > 0 and done / elapsed or nil)
+                st.progress("Parallel decompile x" .. tostring(#live), job.obj, done, #jobs, elapsed > 0 and done / elapsed or nil)
                 send(w)
             end
         end
 
         local now = os.clock()
         for _, w in ipairs(live) do
-            if w.busy and now - w.sent > 60 then
+            if w.busy and now - w.sent > 45 then
                 local jid = w.jid
                 if active[jid] then
                     active[jid] = nil
                     w.dead = true
                     w.busy = false
-                    local obj = list[jid]
-                    local res = lumen:tryDecompile(obj, opt.Options)
                     done += 1
-                    if res.success and type(res.source) == "string" and res.source ~= "" then
-                        cache[obj] = res.source
-                        stat.good += 1
-                    else
-                        fail(stat, obj, res.error or "parallel worker timeout")
-                    end
-                    local elapsed = os.clock() - started
-                    st.progress("Parallel fallback", obj, done, #list, elapsed > 0 and done / elapsed or nil)
+                    retry[#retry + 1] = jobs[jid]
                 end
             end
         end
 
         local alive = 0
         for _, w in ipairs(live) do if not w.dead then alive += 1 end end
-        if alive == 0 and done < #list then
-            for jid = 1, #list do
-                if not cache[list[jid]] and active[jid] == nil and jid < nextjob then
-                elseif jid >= nextjob then
-                    local obj = list[jid]
-                    local res = lumen:tryDecompile(obj, opt.Options)
-                    done += 1
-                    if res.success and type(res.source) == "string" and res.source ~= "" then
-                        cache[obj] = res.source
-                        stat.good += 1
-                    else
-                        fail(stat, obj, res.error)
-                    end
-                end
-            end
+        if alive == 0 then
+            for jid = nextjob, #jobs do retry[#retry + 1] = jobs[jid] end
+            done = #jobs
             break
         end
-
-        task.wait(0.005)
+        task.wait(0.002)
     end
 
-    for _, w in ipairs(ws) do if w.con then pcall(function() w.con:Disconnect() end) end end
+    for _, w in ipairs(ws) do
+        pcall(function() w.ch:Fire("stop") end)
+        if w.con then pcall(function() w.con:Disconnect() end) end
+    end
     if owned then pcall(function() owned:Destroy() end) end
-    stat.decompileTime = os.clock() - started
-    stat.rate = stat.decompileTime > 0 and #list / stat.decompileTime or 0
+
+    stat.decompileTime += os.clock() - started
+
+    if #retry > 0 then
+        local wok, werr = warm(lumen, stat)
+        if not wok then
+            for _, job in ipairs(retry) do decompfail(stat, cache, job.obj, werr) end
+        else
+            local cfg = decopt(opt)
+            local rs = os.clock()
+            for i, job in ipairs(retry) do
+                local res = lumen:tryDecompileBytecode(job.raw, cfg)
+                if res.success and type(res.source) == "string" and res.source ~= "" then
+                    cache[job.obj] = res.source
+                    stat.good += 1
+                else
+                    decompfail(stat, cache, job.obj, res.error)
+                end
+                st.progress("Retrying locally", job.obj, i, #retry)
+            end
+            stat.decompileTime += os.clock() - rs
+        end
+    end
+
+    stat.rate = stat.decompileTime > 0 and stat.available / stat.decompileTime or 0
     return cache
 end
 
-local function writetree(root, list, cache, treeon, stat, made)
-    local used = {}
-    local total = #list
+local function writetree(root, list, cache, treeon, stat, made, opt)
+    local ctx = tree.new(root, made, opt.MaxPathLength or 240, list)
     local started = os.clock()
     local written = 0
+    local source = 0
+    local placeholders = 0
+
     for i, obj in ipairs(list) do
-        local src = cache[obj]
-        if type(src) == "string" then
-            local path = outpath(root, obj, not treeon, used, made)
-            local ok, err = write(path, src)
-            if ok then
-                written += 1
-            else
-                stat.writeFailed += 1
-                stat.errors[#stat.errors + 1] = st.path(obj) .. " :: " .. tostring(err)
-            end
+        local v = cache[obj]
+        local body
+        local state
+        if type(v) == "string" then
+            body = v
+            state = "decompiled"
+            source += 1
+        elseif type(v) == "table" then
+            body = tree.placeholder(obj, v)
+            state = v.unavailable and "unavailable" or "failed"
+            placeholders += 1
+        else
+            body = tree.placeholder(obj, { error = "no decompile result" })
+            state = "missing"
+            placeholders += 1
         end
-        st.progress("Writing source tree", obj, i, total)
+
+        local path = tree.path(ctx, obj, treeon)
+        local ok, err = write(path, body)
+        if ok then
+            written += 1
+        else
+            stat.writeFailed += 1
+            stat.errors[#stat.errors + 1] = st.path(obj) .. " :: " .. tostring(err)
+            state = "write-failed"
+        end
+        tree.record(ctx, obj, path, state)
+        st.progress("Writing source tree", obj, i, #list)
     end
+
+    local mok, merr = write(root .. "/tree-map.tsv", tree.map(ctx))
+    if not mok then
+        stat.writeFailed += 1
+        stat.errors[#stat.errors + 1] = "tree-map.tsv :: " .. tostring(merr)
+    end
+
     stat.written = written
+    stat.sourceWritten = source
+    stat.placeholderWritten = placeholders
     stat.writeTime = os.clock() - started
 end
 
@@ -3551,54 +3610,108 @@ local function summary(root, stat)
     local lines = {
         "LumenDecomp dump",
         "PlaceId: " .. tostring(game.PlaceId),
-        "Scripts found: " .. tostring(stat.found),
+        "Script instances found: " .. tostring(stat.found),
+        "Bytecode available: " .. tostring(stat.available),
         "Decompiled: " .. tostring(stat.good),
-        "Failed/skipped: " .. tostring(stat.failed),
-        "Source files written: " .. tostring(stat.written or 0),
+        "Decompile failures: " .. tostring(stat.failed),
+        "Bytecode unavailable: " .. tostring(stat.unavailable),
+        "Server Script unavailable: " .. tostring(stat.serverUnavailable),
+        "Tree files written: " .. tostring(stat.written or 0),
+        "Decompiled source files: " .. tostring(stat.sourceWritten or 0),
+        "Placeholder files: " .. tostring(stat.placeholderWritten or 0),
+        "Tree scan failures: " .. tostring(stat.scanFailed or 0),
         "Write failures: " .. tostring(stat.writeFailed),
         "Binary: " .. tostring(stat.binary),
         "Workers: " .. tostring(stat.parallel or 1),
-        "Decompile seconds: " .. string.format("%.3f", stat.decompileTime or 0),
-        "Decompile rate: " .. string.format("%.2f scripts/s", stat.rate or 0),
+        "Acquire seconds: " .. string.format("%.3f", stat.acquireTime or 0),
+        "Warmup seconds: " .. string.format("%.3f", stat.warmTime or 0),
+        "Worker boot seconds: " .. string.format("%.3f", stat.parallelBootTime or 0),
+        "Reconstruct seconds: " .. string.format("%.3f", stat.decompileTime or 0),
+        "Reconstruct rate: " .. string.format("%.2f scripts/s", stat.rate or 0),
         "Write seconds: " .. string.format("%.3f", stat.writeTime or 0),
+        "Total seconds: " .. string.format("%.3f", stat.totalTime or 0),
         "",
     }
     if #stat.errors > 0 then
-        lines[#lines + 1] = "Errors:"
+        lines[#lines + 1] = "Decompile/write errors:"
         for _, e in ipairs(stat.errors) do lines[#lines + 1] = e end
+        lines[#lines + 1] = ""
+    end
+    if #stat.unavailableErrors > 0 then
+        lines[#lines + 1] = "Unavailable bytecode:"
+        for _, e in ipairs(stat.unavailableErrors) do lines[#lines + 1] = e end
     end
     write(root .. "/summary.txt", table.concat(lines, "\n"))
 end
 
 function dump.run(lumen, opt)
     opt = opt or {}
+    local totalstart = os.clock()
     local root = opt.Root or rootdir()
-    local stat = { found = 0, good = 0, failed = 0, written = 0, writeFailed = 0, binary = false, errors = {}, decompileTime = 0, writeTime = 0, rate = 0, parallel = 1 }
+    local stat = {
+        found = 0,
+        available = 0,
+        good = 0,
+        failed = 0,
+        unavailable = 0,
+        serverUnavailable = 0,
+        written = 0,
+        sourceWritten = 0,
+        placeholderWritten = 0,
+        scanFailed = 0,
+        writeFailed = 0,
+        binary = false,
+        errors = {},
+        unavailableErrors = {},
+        acquireTime = 0,
+        warmTime = 0,
+        parallelBootTime = 0,
+        decompileTime = 0,
+        writeTime = 0,
+        totalTime = 0,
+        rate = 0,
+        parallel = 1,
+    }
     local made = {}
-    mkall(root, made)
+    tree.mkall(root, made)
     st.set("Starting", tostring(game.Name) .. " | " .. root)
 
     local list
     local cache
     if opt.Decompile and (opt.Tree or not opt.Binary) then
-        list = scripts(opt.IgnoreCoreScripts == true)
-        local pok, pout, preason = pcall(actors, lumen, list, opt, stat)
-        if pok then
-            cache = pout
-            if not cache and preason and opt.Parallel ~= false then
-                if type(rconsoleprint) == "function" then pcall(rconsoleprint, "[LumenDecomp] parallel unavailable: " .. tostring(preason) .. "\n") end
-                warn("[LumenDecomp] parallel unavailable: " .. tostring(preason))
+        local scanerr
+        list, scanerr = tree.scan(opt.IgnoreCoreScripts == true, coref)
+        stat.scanFailed = #scanerr
+        for _, e in ipairs(scanerr) do stat.errors[#stat.errors + 1] = "scan :: " .. tostring(e) end
+        local jobs
+        jobs, cache = acquire(list, stat)
+
+        if #jobs > 0 then
+            local pok, pout, preason = pcall(actors, lumen, jobs, opt, stat, cache)
+            if pok then
+                if pout then
+                    cache = pout
+                elseif preason and opt.Parallel ~= false then
+                    if type(rconsoleprint) == "function" then pcall(rconsoleprint, "[LumenDecomp] parallel: " .. tostring(preason) .. "\n") end
+                end
+            else
+                if type(rconsoleprint) == "function" then pcall(rconsoleprint, "[LumenDecomp] parallel fallback: " .. tostring(pout) .. "\n") end
+                warn("[LumenDecomp] parallel fallback: " .. tostring(pout))
             end
-        else
-            if type(rconsoleprint) == "function" then pcall(rconsoleprint, "[LumenDecomp] parallel fallback: " .. tostring(pout) .. "\n") end
-            warn("[LumenDecomp] parallel fallback: " .. tostring(pout))
+            if stat.good + stat.failed < #jobs then
+                local pending = {}
+                for _, job in ipairs(jobs) do
+                    if cache[job.obj] == nil then pending[#pending + 1] = job end
+                end
+                serial(lumen, pending, opt, stat, cache, "Decompiling")
+            end
         end
-        if not cache then cache = serial(lumen, list, opt, stat) end
-        writetree(root, list, cache, opt.Tree, stat, made)
+
+        writetree(root, list, cache, opt.Tree, stat, made, opt)
     end
 
     if opt.Binary then
-        st.set("Saving binary", cache and "reusing decompiled source cache" or tostring(game.Name))
+        st.set("Saving binary", cache and "reusing source/availability cache" or tostring(game.Name))
         local file = root .. "/FullGame.rbxl"
         local ok, err = pcall(function()
             lumen:save(game, file, {
@@ -3618,12 +3731,13 @@ function dump.run(lumen, opt)
         if not ok then stat.errors[#stat.errors + 1] = "binary :: " .. tostring(err) end
     end
 
+    stat.totalTime = os.clock() - totalstart
     summary(root, stat)
-    if stat.good == 0 and stat.failed > 0 then
-        st.done("FAILED - 0 decompiled, " .. tostring(stat.failed) .. " failed | " .. tostring(stat.errors[1] or "unknown failure"))
+    local mode = stat.parallel and stat.parallel > 1 and (" x" .. tostring(stat.parallel)) or ""
+    if stat.failed > 0 then
+        st.done("Done - " .. tostring(stat.good) .. " decompiled, " .. tostring(stat.failed) .. " failed, " .. tostring(stat.unavailable) .. " unavailable | " .. string.format("%.1f/s", stat.rate or 0) .. mode)
     else
-        local mode = stat.parallel and stat.parallel > 1 and (" x" .. tostring(stat.parallel)) or ""
-        st.done("Done - " .. tostring(stat.good) .. " decompiled, " .. tostring(stat.failed) .. " failed | " .. string.format("%.1f/s", stat.rate or 0) .. mode)
+        st.done("Done - " .. tostring(stat.good) .. " decompiled, 0 failed, " .. tostring(stat.unavailable) .. " unavailable | " .. string.format("%.1f/s", stat.rate or 0) .. mode)
     end
     return root, stat
 end
@@ -3654,6 +3768,7 @@ function dump.auto(lumen, boot)
     local parallel = val("Parallel")
     if parallel == nil then parallel = true else parallel = parallel == true end
     local maxworkers = tonumber(val("MaxWorkers")) or 4
+    local maxpath = tonumber(val("MaxPathLength")) or 240
     local flags = "Binary=" .. tostring(binary) .. " | Decompile=" .. tostring(decomp) .. " | Tree=" .. tostring(treeon) .. " | IgnoreCoreScripts=" .. tostring(ignorecore) .. " | Parallel=" .. tostring(parallel) .. " | MaxWorkers=" .. tostring(maxworkers)
 
     st.set("Loaded", "v" .. tostring(lumen.Version) .. " | " .. flags)
@@ -3671,7 +3786,7 @@ function dump.auto(lumen, boot)
     st.set("Starting dump", flags)
     task.spawn(function()
         local ok, err = pcall(function()
-            dump.run(lumen, { Binary = binary, Decompile = decomp, Tree = treeon, IgnoreCoreScripts = ignorecore, Parallel = parallel, MaxWorkers = maxworkers })
+            dump.run(lumen, { Binary = binary, Decompile = decomp, Tree = treeon, IgnoreCoreScripts = ignorecore, Parallel = parallel, MaxWorkers = maxworkers, MaxPathLength = maxpath })
         end)
         e.__LumenDump = nil
         if not ok then
@@ -5806,19 +5921,23 @@ local bc = {}
 
 function bc.fromScript(obj)
     assert(typeof(obj) == "Instance", "LumenDecomp: target must be a Roblox Instance")
-    assert(type(getscriptbytecode) == "function",
-        "LumenDecomp: executor does not expose getscriptbytecode()")
-
+    assert(type(getscriptbytecode) == "function", "LumenDecomp: executor does not expose getscriptbytecode()")
     local ok, raw = pcall(getscriptbytecode, obj)
-    if not ok then
-        error("LumenDecomp: getscriptbytecode failed: " .. tostring(raw), 2)
-    end
-
+    if not ok then error("LumenDecomp: getscriptbytecode failed: " .. tostring(raw), 2) end
     local ty = typeof(raw)
-    assert(type(raw) == "string" or ty == "buffer",
-        "LumenDecomp: getscriptbytecode returned unsupported type " .. tostring(ty))
-
+    assert(type(raw) == "string" or ty == "buffer", "LumenDecomp: getscriptbytecode returned unsupported type " .. tostring(ty))
+    if type(raw) == "string" then
+        assert(#raw > 0, "LumenDecomp: getscriptbytecode returned empty bytecode")
+    elseif ty == "buffer" then
+        assert(buffer.len(raw) > 0, "LumenDecomp: getscriptbytecode returned empty bytecode")
+    end
     return raw
+end
+
+function bc.try(obj)
+    local ok, raw = pcall(bc.fromScript, obj)
+    if ok then return true, raw end
+    return false, tostring(raw)
 end
 
 return bc
@@ -5944,30 +6063,108 @@ local repo = "Iridium"
 local commit = "2a834af6c6f72918a9222eb4ac6b258e4c6cd4bf"
 local rawBase = "https://raw.githubusercontent.com/" .. owner .. "/" .. repo .. "/" .. commit .. "/"
 
+local paths = {
+    "Src/init.luau",
+    "Src/Deserializer.d.luau",
+    "Src/Utilities/Buffer.luau",
+    "Src/Luau/Spec.luau",
+    "Src/Luau/TypeInfo.luau",
+    "Src/Classes/Proto.luau",
+    "Src/Classes/Instructions.luau",
+    "Src/Classes/Instruction.luau",
+    "Src/Classes/Hexadecimal.luau",
+    "Src/Classes/Upvalue.luau",
+    "Src/Classes/Constants/Nil.luau",
+    "Src/Classes/Constants/Boolean.luau",
+    "Src/Classes/Constants/Number.luau",
+    "Src/Classes/Constants/String.luau",
+    "Src/Classes/Constants/Import.luau",
+    "Src/Classes/Constants/Table.luau",
+    "Src/Classes/Constants/Closure.luau",
+    "Src/Classes/Constants/Vector.luau",
+    "Src/Classes/Constants/TableWithConstants.luau",
+    "Src/Classes/Constants/Integer.luau",
+    "Src/Classes/Constants/ClassShape.luau",
+}
+
 local cache = {}
+local srcs = {}
 local NIL = {}
 local LOADING = {}
 local root = nil
+local loading = false
+local loaderr = nil
+local warming = false
+local warmed = false
+local warmerr = nil
+
+local e = env.get()
+local vend = rawget(e, "__LUMEN_IRIDIUM_VENDOR")
+if type(vend) == "table" then
+    for k, v in pairs(vend) do
+        if type(k) == "string" and type(v) == "string" then srcs[k] = v end
+    end
+end
 
 local function resolve(name)
-    if name == "@root" then
-        return "Src/init.luau"
-    end
-
+    if name == "@root" then return "Src/init.luau" end
     local prefix = "@root/"
     if name:sub(1, #prefix) == prefix then
         return "Src/" .. name:sub(#prefix + 1) .. ".luau"
     end
-
     error("LumenDecomp: unsupported Iridium module " .. tostring(name), 3)
 end
 
-local req
+local function fetch(path)
+    local src = srcs[path]
+    if src then return src end
+    src = http.get(rawBase .. path)
+    srcs[path] = src
+    return src
+end
 
+function iri.prefetch()
+    if warmed then return true end
+    if warming then
+        while warming do task.wait() end
+        if warmerr then return false, warmerr end
+        return true
+    end
+
+    warming = true
+    warmerr = nil
+    local left = 0
+    local errs = {}
+
+    for _, path in ipairs(paths) do
+        if not srcs[path] then
+            left += 1
+            task.spawn(function()
+                local ok, val = pcall(http.get, rawBase .. path)
+                if ok and type(val) == "string" and val ~= "" then
+                    srcs[path] = val
+                else
+                    errs[#errs + 1] = path .. ": " .. tostring(val)
+                end
+                left -= 1
+            end)
+        end
+    end
+
+    while left > 0 do task.wait() end
+    warming = false
+    if #errs > 0 then
+        warmerr = table.concat(errs, " | ")
+        return false, warmerr
+    end
+    warmed = true
+    return true
+end
+
+local req
 req = function(name)
     local path = resolve(name)
     local hit = cache[path]
-
     if hit == LOADING then
         error("LumenDecomp: cyclic Iridium dependency at " .. path, 2)
     elseif hit ~= nil then
@@ -5975,17 +6172,13 @@ req = function(name)
     end
 
     cache[path] = LOADING
-
     local ok, value = pcall(function()
-        local src = http.get(rawBase .. path)
-        src = patch.apply(path, src)
+        local src = patch.apply(path, fetch(path))
         src = "local require = __LUMEN_IRIDIUM_REQUIRE\n" .. src
-
         local chunk, err = loadstring(src, "@Iridium/" .. path)
         if not chunk then
             error("LumenDecomp: failed compiling Iridium/" .. path .. ": " .. tostring(err), 0)
         end
-
         return chunk()
     end)
 
@@ -5999,39 +6192,79 @@ req = function(name)
 end
 
 function iri.get()
-    if root then
-        return root
+    if root then return root end
+    if loading then
+        while loading do task.wait() end
+        if root then return root end
+        error(loaderr or "LumenDecomp: Iridium load failed", 2)
     end
 
+    loading = true
+    loaderr = nil
     assert(type(loadstring) == "function", "LumenDecomp requires executor loadstring()")
     assert(type(buffer) == "table", "LumenDecomp requires Luau buffer support")
 
-    local e = env.get()
     local key = "__LUMEN_IRIDIUM_REQUIRE"
     local old = rawget(e, key)
-
     e[key] = req
     local ok, value = pcall(req, "@root")
-
-    if old == nil then
-        e[key] = nil
-    else
-        e[key] = old
-    end
+    if old == nil then e[key] = nil else e[key] = old end
 
     if not ok then
+        loading = false
+        loaderr = tostring(value)
         error(value, 2)
     end
 
-    assert(type(value) == "table" and type(value.Deserialize) == "function",
-        "LumenDecomp: Iridium root did not expose Deserialize")
+    if type(value) ~= "table" or type(value.Deserialize) ~= "function" then
+        loading = false
+        loaderr = "LumenDecomp: Iridium root did not expose Deserialize"
+        error(loaderr, 2)
+    end
 
     root = value
+    loading = false
     return root
+end
+
+function iri.warm()
+    iri.prefetch()
+    local rok, val = pcall(iri.get)
+    if not rok then return false, tostring(val) end
+    return true
+end
+
+local function lit(s)
+    for n = 3, 12 do
+        local eq = string.rep("=", n)
+        local close = "]" .. eq .. "]"
+        if not s:find(close, 1, true) then
+            return "[" .. eq .. "[" .. s .. close
+        end
+    end
+    return string.format("%q", s)
+end
+
+function iri.pack()
+    iri.prefetch()
+    for _, path in ipairs(paths) do
+        if not srcs[path] then
+            local ok, val = pcall(fetch, path)
+            if not ok then return nil, tostring(val) end
+        end
+    end
+    local out = { "return {" }
+    for _, path in ipairs(paths) do
+        out[#out + 1] = "[" .. string.format("%q", path) .. "]=" .. lit(srcs[path]) .. ","
+    end
+    out[#out + 1] = "}"
+    return table.concat(out)
 end
 
 function iri.info()
     local pi = patch.info()
+    local n = 0
+    for _ in pairs(srcs) do n += 1 end
     return {
         owner = owner,
         repo = repo,
@@ -6041,6 +6274,8 @@ function iri.info()
         target = pi.target,
         classes = pi.classes,
         loaded = root ~= nil,
+        prefetched = n,
+        vendor = type(vend) == "table",
     }
 end
 
@@ -8505,7 +8740,6 @@ return {
 ]===],
     ["main.serialization.save"] = [===[
 local dex = require("main.serialization.dex_serializer")
-local iri = require("main.runtime.iridium")
 local st = require("main.runtime.status")
 local core = require("main.runtime.core")
 
@@ -8530,8 +8764,6 @@ end
 local function start(lumen)
     if ready then return true end
     if fail then return false, fail end
-
-    iri.get()
 
     dex.SetDecompiler(function(scr)
         if skipcore and core.is(scr) then return nil, "core script ignored" end
@@ -8605,20 +8837,295 @@ end
 
 return save
 ]===],
+    ["main.tree"] = [===[
+local tree = {}
+
+local win = {
+    CON = true, PRN = true, AUX = true, NUL = true,
+    COM1 = true, COM2 = true, COM3 = true, COM4 = true, COM5 = true,
+    COM6 = true, COM7 = true, COM8 = true, COM9 = true,
+    LPT1 = true, LPT2 = true, LPT3 = true, LPT4 = true, LPT5 = true,
+    LPT6 = true, LPT7 = true, LPT8 = true, LPT9 = true,
+}
+
+local cls = { LocalScript = true, ModuleScript = true, Script = true }
+
+local function hash(s)
+    local h = 7
+    for i = 1, #s do
+        h = (h * 131 + s:byte(i)) % 2147483647
+    end
+    return string.format("%08x", h)
+end
+
+local function clean(s)
+    s = tostring(s or "")
+    s = s:gsub("[%z\1-\31]", "_")
+    s = s:gsub('[<>:"/\\|%?%*]', "_")
+    s = s:gsub("[%.%s]+$", "")
+    if s == "" then s = "_unnamed" end
+    local b = s:match("^([^%.]+)") or s
+    if win[b:upper()] then s = "_" .. s end
+    if #s > 80 then s = s:sub(1, 71) .. "_" .. hash(s) end
+    return s
+end
+
+local function kids(obj)
+    local ok, out = pcall(obj.GetChildren, obj)
+    if not ok or type(out) ~= "table" then return nil, out end
+    return out
+end
+
+local function iscript(obj)
+    local ok, c = pcall(function() return obj.ClassName end)
+    return ok and cls[c] == true
+end
+
+local function mk(path, made)
+    if made[path] then return true end
+    if type(isfolder) == "function" then
+        local ok, yes = pcall(isfolder, path)
+        if ok and yes then
+            made[path] = true
+            return true
+        end
+    end
+    if type(makefolder) ~= "function" then return false end
+    local ok = pcall(makefolder, path)
+    if ok then made[path] = true end
+    return ok
+end
+
+local function mkall(path, made)
+    local cur = ""
+    for p in tostring(path):gmatch("[^/]+") do
+        cur = cur == "" and p or cur .. "/" .. p
+        if not mk(cur, made) then return false end
+    end
+    return true
+end
+
+local function extname(s)
+    local low = s:lower()
+    if low:sub(-5) == ".luau" or low:sub(-4) == ".lua" then return s end
+    return s .. ".luau"
+end
+
+local function numbered(s, n)
+    local stem, ext = s:match("^(.*)(%.luau)$")
+    if not stem then stem, ext = s:match("^(.*)(%.lua)$") end
+    if not stem then return s .. "__" .. tostring(n) end
+    return stem .. "__" .. tostring(n) .. ext
+end
+
+local function build(parent, ctx)
+    local hit = ctx.idx[parent]
+    if hit then return hit end
+    local list, err = kids(parent)
+    local out = { seg = {}, file = {}, err = err }
+    ctx.idx[parent] = out
+    if not list then return out end
+
+    local seen = {}
+    for _, obj in ipairs(list) do
+        if ctx.dirinst[obj] then
+            local base = clean(obj.Name)
+            local key = base:lower()
+            local n = (seen[key] or 0) + 1
+            seen[key] = n
+            out.seg[obj] = n == 1 and base or base .. "__" .. tostring(n)
+        end
+    end
+
+    local used = {}
+    for _, name in pairs(out.seg) do used[name:lower()] = true end
+    for _, obj in ipairs(list) do
+        if ctx.scriptset[obj] then
+            local base = extname(clean(obj.Name))
+            local name = base
+            local n = 2
+            while used[name:lower()] do
+                name = numbered(base, n)
+                n = n + 1
+            end
+            used[name:lower()] = true
+            out.file[obj] = name
+        end
+    end
+    return out
+end
+
+local function seg(obj, ctx)
+    local p = obj and obj.Parent
+    if not p then return clean(obj and obj.Name) end
+    local x = build(p, ctx)
+    return x.seg[obj] or clean(obj.Name)
+end
+
+local function file(obj, ctx)
+    local p = obj.Parent
+    if p then
+        local x = build(p, ctx)
+        if x.file[obj] then return x.file[obj] end
+    end
+    return extname(clean(obj.Name))
+end
+
+local function rel(obj, ctx)
+    local rev = {}
+    local cur = obj.Parent
+    while cur and cur ~= game do
+        rev[#rev + 1] = seg(cur, ctx)
+        cur = cur.Parent
+    end
+    local out = {}
+    for i = #rev, 1, -1 do out[#out + 1] = rev[i] end
+    return out
+end
+
+local function flat(obj, ctx)
+    local p = rel(obj, ctx)
+    p[#p + 1] = file(obj, ctx)
+    return table.concat(p, "__")
+end
+
+local function short(ctx, path, name)
+    if #path <= ctx.max then return path end
+    local dir = ctx.root .. "/_LongPaths"
+    mkall(dir, ctx.made)
+    local stem, ext = name:match("^(.*)(%.luau)$")
+    if not stem then stem, ext = name:match("^(.*)(%.lua)$") end
+    stem = stem or name
+    ext = ext or ".luau"
+    local n = stem:sub(1, 50) .. "_" .. hash(path) .. ext
+    return dir .. "/" .. n
+end
+
+local function full(obj)
+    local ok, s = pcall(obj.GetFullName, obj)
+    if ok and type(s) == "string" then return s end
+    return tostring(obj.Name)
+end
+
+local function one(s)
+    return tostring(s or ""):gsub("[\r\n\t]", " ")
+end
+
+function tree.new(root, made, max, list)
+    local ctx = {
+        root = root,
+        made = made or {},
+        max = tonumber(max) or 240,
+        idx = {},
+        map = {},
+        dirinst = {},
+        scriptset = {},
+    }
+    for _, obj in ipairs(list or {}) do
+        ctx.scriptset[obj] = true
+        local cur = obj.Parent
+        while cur and cur ~= game do
+            ctx.dirinst[cur] = true
+            cur = cur.Parent
+        end
+    end
+    return ctx
+end
+
+function tree.path(ctx, obj, treeon)
+    local dir = ctx.root
+    local name
+    if treeon then
+        local p = rel(obj, ctx)
+        if #p > 0 then dir = dir .. "/" .. table.concat(p, "/") end
+        name = file(obj, ctx)
+    else
+        dir = ctx.root .. "/Scripts"
+        name = flat(obj, ctx)
+    end
+    mkall(dir, ctx.made)
+    return short(ctx, dir .. "/" .. name, name)
+end
+
+function tree.record(ctx, obj, path, state)
+    ctx.map[#ctx.map + 1] = table.concat({
+        one(state), one(obj.ClassName), one(full(obj)), one(path)
+    }, "\t")
+end
+
+function tree.map(ctx)
+    local out = { "status\tclass\troblox_path\tfile" }
+    for _, line in ipairs(ctx.map) do out[#out + 1] = line end
+    return table.concat(out, "\n")
+end
+
+function tree.placeholder(obj, v)
+    local state = v and v.unavailable and "source unavailable" or "decompile failed"
+    local reason = one(v and v.error or "unknown error")
+    return "-- LumenDecomp: " .. state .. "\n-- Path: " .. one(full(obj)) .. "\n-- Class: " .. one(obj.ClassName) .. "\n-- Reason: " .. reason .. "\n"
+end
+
+function tree.scan(ignore, core)
+    local out = {}
+    local errors = {}
+    local roots, err = kids(game)
+    if not roots then return out, { "game :: " .. tostring(err) } end
+    local stack = {}
+    for i = #roots, 1, -1 do stack[#stack + 1] = roots[i] end
+
+    while #stack > 0 do
+        local obj = stack[#stack]
+        stack[#stack] = nil
+        local skip = false
+        if ignore and core then
+            local ok, yes = pcall(core.is, obj)
+            skip = ok and yes == true
+        end
+        if not skip then
+            if iscript(obj) then out[#out + 1] = obj end
+            local list, e = kids(obj)
+            if list then
+                for i = #list, 1, -1 do stack[#stack + 1] = list[i] end
+            else
+                errors[#errors + 1] = full(obj) .. " :: " .. tostring(e)
+            end
+        end
+    end
+    return out, errors
+end
+
+function tree.mkall(path, made)
+    return mkall(path, made)
+end
+
+function tree.clean(s)
+    return clean(s)
+end
+
+function tree.script(obj)
+    return iscript(obj)
+end
+
+return tree
+]===],
     ["main.version"] = [===[
-return { name = "LumenDecomp", version = "3.2.2" }
+return { name = "LumenDecomp", version = "3.2.4" }
 ]===],
     ["main.worker"] = [===[
 local cfg = require("main.config")
-local bc = require("main.runtime.bytecode")
 local iri = require("main.runtime.iridium")
 local decomp = require("main.decompiler.engine")
 
 local worker = {}
 
-function worker:decompile(obj, opt)
+function worker:warm()
+    local ok, err = iri.warm()
+    if not ok then error(err, 2) end
+    return true
+end
+
+function worker:decompileBytecode(raw, opt)
     opt = cfg(opt)
-    local raw = bc.fromScript(obj)
     local parsed = iri.get():Deserialize(raw, opt.iridium)
     local src = decomp.new(opt):decompileParsed(parsed)
     return src
@@ -13703,28 +14210,6 @@ end
 
 return tab
 ]===],
-    ["main.runtime.bytecode"] = [===[
-local bc = {}
-
-function bc.fromScript(obj)
-    assert(typeof(obj) == "Instance", "LumenDecomp: target must be a Roblox Instance")
-    assert(type(getscriptbytecode) == "function",
-        "LumenDecomp: executor does not expose getscriptbytecode()")
-
-    local ok, raw = pcall(getscriptbytecode, obj)
-    if not ok then
-        error("LumenDecomp: getscriptbytecode failed: " .. tostring(raw), 2)
-    end
-
-    local ty = typeof(raw)
-    assert(type(raw) == "string" or ty == "buffer",
-        "LumenDecomp: getscriptbytecode returned unsupported type " .. tostring(ty))
-
-    return raw
-end
-
-return bc
-]===],
     ["main.runtime.environment"] = [===[
 local env = {}
 
@@ -13806,30 +14291,108 @@ local repo = "Iridium"
 local commit = "2a834af6c6f72918a9222eb4ac6b258e4c6cd4bf"
 local rawBase = "https://raw.githubusercontent.com/" .. owner .. "/" .. repo .. "/" .. commit .. "/"
 
+local paths = {
+    "Src/init.luau",
+    "Src/Deserializer.d.luau",
+    "Src/Utilities/Buffer.luau",
+    "Src/Luau/Spec.luau",
+    "Src/Luau/TypeInfo.luau",
+    "Src/Classes/Proto.luau",
+    "Src/Classes/Instructions.luau",
+    "Src/Classes/Instruction.luau",
+    "Src/Classes/Hexadecimal.luau",
+    "Src/Classes/Upvalue.luau",
+    "Src/Classes/Constants/Nil.luau",
+    "Src/Classes/Constants/Boolean.luau",
+    "Src/Classes/Constants/Number.luau",
+    "Src/Classes/Constants/String.luau",
+    "Src/Classes/Constants/Import.luau",
+    "Src/Classes/Constants/Table.luau",
+    "Src/Classes/Constants/Closure.luau",
+    "Src/Classes/Constants/Vector.luau",
+    "Src/Classes/Constants/TableWithConstants.luau",
+    "Src/Classes/Constants/Integer.luau",
+    "Src/Classes/Constants/ClassShape.luau",
+}
+
 local cache = {}
+local srcs = {}
 local NIL = {}
 local LOADING = {}
 local root = nil
+local loading = false
+local loaderr = nil
+local warming = false
+local warmed = false
+local warmerr = nil
+
+local e = env.get()
+local vend = rawget(e, "__LUMEN_IRIDIUM_VENDOR")
+if type(vend) == "table" then
+    for k, v in pairs(vend) do
+        if type(k) == "string" and type(v) == "string" then srcs[k] = v end
+    end
+end
 
 local function resolve(name)
-    if name == "@root" then
-        return "Src/init.luau"
-    end
-
+    if name == "@root" then return "Src/init.luau" end
     local prefix = "@root/"
     if name:sub(1, #prefix) == prefix then
         return "Src/" .. name:sub(#prefix + 1) .. ".luau"
     end
-
     error("LumenDecomp: unsupported Iridium module " .. tostring(name), 3)
 end
 
-local req
+local function fetch(path)
+    local src = srcs[path]
+    if src then return src end
+    src = http.get(rawBase .. path)
+    srcs[path] = src
+    return src
+end
 
+function iri.prefetch()
+    if warmed then return true end
+    if warming then
+        while warming do task.wait() end
+        if warmerr then return false, warmerr end
+        return true
+    end
+
+    warming = true
+    warmerr = nil
+    local left = 0
+    local errs = {}
+
+    for _, path in ipairs(paths) do
+        if not srcs[path] then
+            left += 1
+            task.spawn(function()
+                local ok, val = pcall(http.get, rawBase .. path)
+                if ok and type(val) == "string" and val ~= "" then
+                    srcs[path] = val
+                else
+                    errs[#errs + 1] = path .. ": " .. tostring(val)
+                end
+                left -= 1
+            end)
+        end
+    end
+
+    while left > 0 do task.wait() end
+    warming = false
+    if #errs > 0 then
+        warmerr = table.concat(errs, " | ")
+        return false, warmerr
+    end
+    warmed = true
+    return true
+end
+
+local req
 req = function(name)
     local path = resolve(name)
     local hit = cache[path]
-
     if hit == LOADING then
         error("LumenDecomp: cyclic Iridium dependency at " .. path, 2)
     elseif hit ~= nil then
@@ -13837,17 +14400,13 @@ req = function(name)
     end
 
     cache[path] = LOADING
-
     local ok, value = pcall(function()
-        local src = http.get(rawBase .. path)
-        src = patch.apply(path, src)
+        local src = patch.apply(path, fetch(path))
         src = "local require = __LUMEN_IRIDIUM_REQUIRE\n" .. src
-
         local chunk, err = loadstring(src, "@Iridium/" .. path)
         if not chunk then
             error("LumenDecomp: failed compiling Iridium/" .. path .. ": " .. tostring(err), 0)
         end
-
         return chunk()
     end)
 
@@ -13861,39 +14420,79 @@ req = function(name)
 end
 
 function iri.get()
-    if root then
-        return root
+    if root then return root end
+    if loading then
+        while loading do task.wait() end
+        if root then return root end
+        error(loaderr or "LumenDecomp: Iridium load failed", 2)
     end
 
+    loading = true
+    loaderr = nil
     assert(type(loadstring) == "function", "LumenDecomp requires executor loadstring()")
     assert(type(buffer) == "table", "LumenDecomp requires Luau buffer support")
 
-    local e = env.get()
     local key = "__LUMEN_IRIDIUM_REQUIRE"
     local old = rawget(e, key)
-
     e[key] = req
     local ok, value = pcall(req, "@root")
-
-    if old == nil then
-        e[key] = nil
-    else
-        e[key] = old
-    end
+    if old == nil then e[key] = nil else e[key] = old end
 
     if not ok then
+        loading = false
+        loaderr = tostring(value)
         error(value, 2)
     end
 
-    assert(type(value) == "table" and type(value.Deserialize) == "function",
-        "LumenDecomp: Iridium root did not expose Deserialize")
+    if type(value) ~= "table" or type(value.Deserialize) ~= "function" then
+        loading = false
+        loaderr = "LumenDecomp: Iridium root did not expose Deserialize"
+        error(loaderr, 2)
+    end
 
     root = value
+    loading = false
     return root
+end
+
+function iri.warm()
+    iri.prefetch()
+    local rok, val = pcall(iri.get)
+    if not rok then return false, tostring(val) end
+    return true
+end
+
+local function lit(s)
+    for n = 3, 12 do
+        local eq = string.rep("=", n)
+        local close = "]" .. eq .. "]"
+        if not s:find(close, 1, true) then
+            return "[" .. eq .. "[" .. s .. close
+        end
+    end
+    return string.format("%q", s)
+end
+
+function iri.pack()
+    iri.prefetch()
+    for _, path in ipairs(paths) do
+        if not srcs[path] then
+            local ok, val = pcall(fetch, path)
+            if not ok then return nil, tostring(val) end
+        end
+    end
+    local out = { "return {" }
+    for _, path in ipairs(paths) do
+        out[#out + 1] = "[" .. string.format("%q", path) .. "]=" .. lit(srcs[path]) .. ","
+    end
+    out[#out + 1] = "}"
+    return table.concat(out)
 end
 
 function iri.info()
     local pi = patch.info()
+    local n = 0
+    for _ in pairs(srcs) do n += 1 end
     return {
         owner = owner,
         repo = repo,
@@ -13903,6 +14502,8 @@ function iri.info()
         target = pi.target,
         classes = pi.classes,
         loaded = root ~= nil,
+        prefetched = n,
+        vendor = type(vend) == "table",
     }
 end
 
@@ -14058,15 +14659,19 @@ return patch
 ]===],
     ["main.worker"] = [===[
 local cfg = require("main.config")
-local bc = require("main.runtime.bytecode")
 local iri = require("main.runtime.iridium")
 local decomp = require("main.decompiler.engine")
 
 local worker = {}
 
-function worker:decompile(obj, opt)
+function worker:warm()
+    local ok, err = iri.warm()
+    if not ok then error(err, 2) end
+    return true
+end
+
+function worker:decompileBytecode(raw, opt)
     opt = cfg(opt)
-    local raw = bc.fromScript(obj)
     local parsed = iri.get():Deserialize(raw, opt.iridium)
     local src = decomp.new(opt):decompileParsed(parsed)
     return src
@@ -14106,11 +14711,12 @@ local boot = {
     IgnoreCoreScripts = rawget(_G, "IgnoreCoreScripts"),
     Parallel = rawget(_G, "Parallel"),
     MaxWorkers = rawget(_G, "MaxWorkers"),
+    MaxPathLength = rawget(_G, "MaxPathLength"),
 }
 if type(getgenv) == "function" then
     local ok, e = pcall(getgenv)
     if ok and type(e) == "table" then
-        for _, k in ipairs({ "Binary", "Decompile", "Tree", "IgnoreCoreScripts", "Parallel", "MaxWorkers" }) do
+        for _, k in ipairs({ "Binary", "Decompile", "Tree", "IgnoreCoreScripts", "Parallel", "MaxWorkers", "MaxPathLength" }) do
             if boot[k] == nil then boot[k] = rawget(e, k) end
         end
     end

@@ -1,4 +1,4 @@
-# LumenDecomp V3.2.2
+# LumenDecomp V3.2.4
 
 ```lua
 local g = getgenv()
