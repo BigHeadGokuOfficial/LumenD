@@ -4506,7 +4506,6 @@ end
 return view
 ]===],
     ["main.dump"] = [===[
-
 local env = require("main.runtime.environment")
 local st = require("main.runtime.status")
 local coref = require("main.runtime.core")
@@ -4911,6 +4910,7 @@ local function actors(lumen, jobs, opt, stat, cache)
         if w.con then pcall(function() w.con:Disconnect() end) end
     end
     if owned then pcall(function() owned:Destroy() end) end
+    task.wait()
 
     stat.decompileTime += os.clock() - started
 
@@ -5143,6 +5143,7 @@ function dump.run(lumen, opt)
 
     if opt.Binary then
         st.set("Saving binary", cache and "reusing source/availability cache" or tostring(game.Name))
+        task.wait()
         local file = root .. "/FullGame.rbxl"
         local ok, err = pcall(function()
             lumen:save(game, file, {
@@ -5153,7 +5154,7 @@ function dump.run(lumen, opt)
                 NilInstances = opt.NilInstances == true,
                 RemovePlayerCharacters = opt.RemovePlayerCharacters == true,
                 SavePlayers = opt.SavePlayers == true,
-                MaxThreads = opt.MaxThreads or 8,
+                MaxThreads = opt.MaxThreads or 3,
                 DecompileIgnore = opt.IgnoreCoreScripts and { "Chat", "CoreGui", "CorePackages", "RobloxReplicatedStorage", "CoreScriptSyncService" } or opt.DecompileIgnore,
                 ShowStatus = false,
             })
@@ -5199,6 +5200,8 @@ function dump.auto(lumen, boot)
     local parallel = val("Parallel")
     if parallel == nil then parallel = true else parallel = parallel == true end
     local maxworkers = tonumber(val("MaxWorkers")) or 4
+    local maxthreads = tonumber(val("MaxThreads")) or 3
+    maxthreads = math.max(1, math.min(math.floor(maxthreads), 8))
     local maxpath = tonumber(val("MaxPathLength")) or 240
     local acquirebatch = tonumber(val("AcquireBatch"))
     local acquirebudget = tonumber(val("AcquireBudgetMs")) or 3
@@ -5209,7 +5212,7 @@ function dump.auto(lumen, boot)
         local v = val(name)
         if v ~= nil then dopt[name] = v end
     end
-    local flags = "Binary=" .. tostring(binary) .. " | Decompile=" .. tostring(decomp) .. " | Tree=" .. tostring(treeon) .. " | IgnoreCoreScripts=" .. tostring(ignorecore) .. " | Parallel=" .. tostring(parallel) .. " | MaxWorkers=" .. tostring(maxworkers)
+    local flags = "Binary=" .. tostring(binary) .. " | Decompile=" .. tostring(decomp) .. " | Tree=" .. tostring(treeon) .. " | IgnoreCoreScripts=" .. tostring(ignorecore) .. " | Parallel=" .. tostring(parallel) .. " | MaxWorkers=" .. tostring(maxworkers) .. " | MaxThreads=" .. tostring(maxthreads)
 
     st.set("Loaded", "v" .. tostring(lumen.Version) .. " | " .. flags)
     print("[LumenDecomp] " .. flags)
@@ -5228,7 +5231,7 @@ function dump.auto(lumen, boot)
     st.set("Starting dump", flags)
     task.spawn(function()
         local ok, err = pcall(function()
-            dump.run(lumen, { Binary = binary, Decompile = decomp, Tree = treeon, IgnoreCoreScripts = ignorecore, Parallel = parallel, MaxWorkers = maxworkers, MaxPathLength = maxpath, AcquireBatch = acquirebatch, AcquireBudgetMs = acquirebudget, Options = dopt })
+            dump.run(lumen, { Binary = binary, Decompile = decomp, Tree = treeon, IgnoreCoreScripts = ignorecore, Parallel = parallel, MaxWorkers = maxworkers, MaxThreads = maxthreads, MaxPathLength = maxpath, AcquireBatch = acquirebatch, AcquireBudgetMs = acquirebudget, Options = dopt })
         end)
         e.__LumenDump = nil
         if not ok then
@@ -8386,7 +8389,6 @@ end
 return st
 ]===],
     ["main.serialization.dex_serializer"] = [===[
-
 --[[
 
     ____               _____           _       ___                
@@ -9587,6 +9589,19 @@ Serializer = (function()
 		local folderClasses = {["Player"] = true, ["PlayerScripts"] = true, ["PlayerGui"] = true, ["ScriptDebugger"] = true, ["Breakpoints"] = true, ["DebuggerWatch"] = true}
 		local savingDefaultProps = not saveSettings.IgnoreDefaultProps
 		local decompileEnabled = saveSettings.Decompile
+		local slice = os.clock()
+		local spins = 0
+		local function pulse(force)
+			spins = spins + 1
+			if force or spins >= 64 then
+				spins = 0
+				local now = os.clock()
+				if force or now - slice >= 0.004 then
+					task.wait()
+					slice = os.clock()
+				end
+			end
+		end
 
 		if isTable and not root[1] then error("Empty Table") end
 
@@ -9624,9 +9639,11 @@ Serializer = (function()
 
 		local statusText = saveSettings.ShowStatus and createStatusText()
 		local sources = predecompile(root,statusText,saveSettings)
+		pulse(true)
 
 		-- Count instances and instance types
 		local function recur(obj)
+			pulse()
 			if filter[obj] then return end
 
 			local class = oldIndex and oldIndex(obj,"ClassName") or obj.ClassName
@@ -9754,6 +9771,7 @@ Serializer = (function()
 
 			local lastRef
 			for i = 1,szObjs do
+				pulse()
 				local start = i-1
 				local val
 				if func then val = func(objs[i],name) elseif oldIndex then val = oldIndex(objs[i],name) else val = objs[i][name] end
@@ -9786,6 +9804,7 @@ Serializer = (function()
 			local result = tableCreate(4*szObjs,"\0")
 			local sep = szObjs-1
 			for i = 1,szObjs do
+				pulse()
 				local start = i-1
 				local content = gethiddenprop(objs[i],name)
 				if content and #content > 0 then
@@ -9811,6 +9830,7 @@ Serializer = (function()
 			local szObjs = #objs
 			local result = tableCreate(szObjs)
 			for i = 1,szObjs do
+				pulse()
 				local val
 				if sources[objs[i]] then
 					val = sources[objs[i]]
@@ -9840,6 +9860,7 @@ Serializer = (function()
 			local lastRef
 			local sep = #objs-1
 			for i = 1,#objs do
+				pulse()
 				local start = 4 + (i-1)
 				local obj = objs[i]
 				local ref = refs[obj]
@@ -9865,6 +9886,7 @@ Serializer = (function()
 			instChunkData = concat(instChunkData)
 			instHeader[3] = s_pack("<I4",#instChunkData)
 
+			pulse(true)
 			if lz4compress then
 				instChunkData = lz4compress(instChunkData)
 				instHeader[2] = s_pack("<I4",#instChunkData)
@@ -9878,6 +9900,7 @@ Serializer = (function()
 			-- Make PROP chunk
 			local props = saveProps[class]
 			for propInd = 1,#props do
+				pulse()
 				local prop = props[propInd]
 				local propName = prop.Name
 				local indexName = prop.IndexName or propName
@@ -9949,6 +9972,7 @@ Serializer = (function()
 					propChunkData = concat(propChunkData)
 					propHeader[3] = s_pack("<I4",#propChunkData)
 
+					pulse(true)
 					if lz4compress then
 						propChunkData = lz4compress(propChunkData)
 						propHeader[2] = s_pack("<I4",#propChunkData)
@@ -9971,6 +9995,7 @@ Serializer = (function()
 			local count = 3
 
 			for i = 1,#sharedStrings do
+				pulse()
 				local data = sharedStrings[i]
 				local hash,content = data[1],data[2]
 				sstrChunkData[count] = hash..s_pack("<I4",#content)..content
@@ -10002,6 +10027,7 @@ Serializer = (function()
 			local prntRefCount = 1
 			local lastObjIndex = 2 + 4*instCount
 			for i = 1,instCount do
+				pulse()
 				local obj = orderedInstList[i]
 				local ref = refs[obj]
 
@@ -10049,6 +10075,7 @@ Serializer = (function()
 			prntBuf[2] = prntChunkData
 		end
 		makePRNT()
+		pulse(true)
 
 
 		-- Wrap up
