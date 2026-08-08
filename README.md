@@ -13,4 +13,8 @@ g.MaxWorkers = 4
 local lumen = loadstring(game:HttpGet("https://raw.githubusercontent.com/BigHeadGokuOfficial/LumenD/main/lumen.luau"))()
 ```
 
-Credits: Moon / DexSerializer, ActualMasterOogway / Iridium.
+# Credits:
+
+Moon / DexSerializer,
+
+ActualMasterOogway / Iridium.
