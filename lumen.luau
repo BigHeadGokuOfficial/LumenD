@@ -824,6 +824,7 @@ local dis = require("main.diagnostics.disassembler")
 local view = require("main.diagnostics.inspect")
 local env = require("main.runtime.environment")
 local save = require("main.serialization.save")
+local dump = require("main.dump")
 
 local api = {
     Version = ver.version,
@@ -902,6 +903,14 @@ end
 
 function api:save(obj, file, opt)
     return save.run(self, obj, file, opt)
+end
+
+function api:dump(opt)
+    return dump.run(self, opt)
+end
+
+function api:auto()
+    return dump.auto(self)
 end
 
 function api:serializerInfo()
@@ -3149,6 +3158,220 @@ function view.ir(data, opt)
 end
 
 return view
+]===],
+    ["main.dump"] = [===[
+local env = require("main.runtime.environment")
+local st = require("main.runtime.status")
+
+local dump = {}
+
+local function clean(s)
+    s = tostring(s or "unnamed")
+    s = s:gsub("[%c<>:\"/\\|%?%*]", "_")
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    if s == "" or s == "." or s == ".." then s = "unnamed" end
+    return s
+end
+
+local function mkdir(path)
+    if type(makefolder) ~= "function" then return false end
+    if type(isfolder) == "function" then
+        local ok, yes = pcall(isfolder, path)
+        if ok and yes then return true end
+    end
+    return pcall(makefolder, path)
+end
+
+local function mkall(path)
+    local cur = ""
+    for part in tostring(path):gmatch("[^/]+") do
+        cur = cur == "" and part or cur .. "/" .. part
+        mkdir(cur)
+    end
+end
+
+local function rootdir()
+    local id = tostring(game.PlaceId or 0)
+    local stamp = tostring(os.time())
+    return "LumenDecomp/" .. id .. "/dump_" .. stamp
+end
+
+local function scriptobj(obj)
+    return obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")
+end
+
+local function parts(obj)
+    local out = {}
+    local cur = obj.Parent
+    while cur and cur ~= game do
+        table.insert(out, 1, clean(cur.Name))
+        cur = cur.Parent
+    end
+    return out
+end
+
+local function outpath(root, obj, flat, used)
+    local seg = parts(obj)
+    local dir = root .. "/Scripts"
+
+    if not flat then
+        for _, name in ipairs(seg) do dir = dir .. "/" .. name end
+    end
+
+    mkall(dir)
+
+    local base = clean(obj.Name) .. "." .. clean(obj.ClassName)
+    if flat then
+        local full = st.path(obj):gsub("%.", "_")
+        base = clean(full) .. "." .. clean(obj.ClassName)
+    end
+
+    local path = dir .. "/" .. base .. ".luau"
+    local n = 2
+    while used[path] do
+        path = dir .. "/" .. base .. "_" .. tostring(n) .. ".luau"
+        n += 1
+    end
+    used[path] = true
+    return path
+end
+
+local function scripts()
+    local out = {}
+    for _, obj in ipairs(game:GetDescendants()) do
+        if scriptobj(obj) then out[#out + 1] = obj end
+    end
+    return out
+end
+
+local function write(path, data)
+    if type(writefile) ~= "function" then
+        return false, "executor does not expose writefile()"
+    end
+    local ok, err = pcall(writefile, path, data)
+    return ok, err
+end
+
+local function tree(lumen, root, opt, stat)
+    local list = scripts()
+    local used = {}
+    stat.found = #list
+
+    for i, obj in ipairs(list) do
+        st.set("Decompiling", obj, i, #list)
+        local res = lumen:tryDecompile(obj, opt.Options)
+
+        if res.success and type(res.source) == "string" and res.source ~= "" then
+            local path = outpath(root, obj, not opt.Tree, used)
+            local ok, err = write(path, res.source)
+            if ok then
+                stat.good += 1
+            else
+                stat.failed += 1
+                stat.errors[#stat.errors + 1] = st.path(obj) .. " :: " .. tostring(err)
+            end
+        else
+            stat.failed += 1
+            stat.errors[#stat.errors + 1] = st.path(obj) .. " :: " .. tostring(res.error)
+        end
+
+        if i % 16 == 0 then task.wait() end
+    end
+end
+
+local function summary(root, stat)
+    local lines = {
+        "LumenDecomp dump",
+        "PlaceId: " .. tostring(game.PlaceId),
+        "Scripts found: " .. tostring(stat.found),
+        "Decompiled: " .. tostring(stat.good),
+        "Failed/skipped: " .. tostring(stat.failed),
+        "Binary: " .. tostring(stat.binary),
+        "",
+    }
+
+    if #stat.errors > 0 then
+        lines[#lines + 1] = "Errors:"
+        for _, e in ipairs(stat.errors) do lines[#lines + 1] = e end
+    end
+
+    write(root .. "/summary.txt", table.concat(lines, "\n"))
+end
+
+function dump.run(lumen, opt)
+    opt = opt or {}
+    local root = opt.Root or rootdir()
+    local stat = { found = 0, good = 0, failed = 0, binary = false, errors = {} }
+
+    mkall(root)
+    st.set("Starting", tostring(game.Name) .. " | " .. root)
+
+    if opt.Decompile and (opt.Tree or not opt.Binary) then
+        tree(lumen, root, opt, stat)
+    end
+
+    if opt.Binary then
+        st.set("Saving binary", tostring(game.Name))
+        local file = root .. "/FullGame.rbxl"
+        local ok, err = pcall(function()
+            lumen:save(game, file, {
+                Binary = true,
+                Decompile = opt.Decompile == true,
+                NilInstances = opt.NilInstances == true,
+                RemovePlayerCharacters = opt.RemovePlayerCharacters == true,
+                SavePlayers = opt.SavePlayers == true,
+                MaxThreads = opt.MaxThreads or 4,
+                ShowStatus = false,
+            })
+        end)
+        stat.binary = ok
+        if not ok then
+            stat.errors[#stat.errors + 1] = "binary :: " .. tostring(err)
+        end
+    end
+
+    summary(root, stat)
+    st.done("Done — " .. tostring(stat.good) .. " decompiled, " .. tostring(stat.failed) .. " failed")
+    return root, stat
+end
+
+function dump.auto(lumen)
+    local e = env.get()
+    local binary = rawget(e, "Binary") == true
+    local decomp = rawget(e, "Decompile") == true
+    local treeon = rawget(e, "Tree") == true
+
+    st.set("Loaded", "v" .. tostring(lumen.Version))
+
+    if not binary and not decomp and not treeon then
+        task.delay(2, function() st.done("Loaded — idle") end)
+        return false
+    end
+
+    if rawget(e, "__LumenDump") then
+        st.set("Already running")
+        return false
+    end
+
+    e.__LumenDump = true
+    task.spawn(function()
+        local ok, err = pcall(function()
+            dump.run(lumen, {
+                Binary = binary,
+                Decompile = decomp,
+                Tree = treeon,
+            })
+        end)
+        e.__LumenDump = nil
+        if not ok then
+            st.set("ERROR", tostring(err))
+            warn("[LumenDecomp] " .. tostring(err))
+        end
+    end)
+    return true
+end
+
+return dump
 ]===],
     ["main.ir.block"] = [===[
 local block = {}
@@ -5637,6 +5860,119 @@ end
 
 return patch
 ]===],
+    ["main.runtime.status"] = [===[
+local st = {}
+
+local gui
+local text
+local dead = false
+
+local function parent()
+    if type(gethui) == "function" then
+        local ok, out = pcall(gethui)
+        if ok and out then return out end
+    end
+
+    local ok, out = pcall(function()
+        return game:GetService("CoreGui")
+    end)
+    if ok then return out end
+end
+
+local function make()
+    if gui and gui.Parent then return true end
+
+    local p = parent()
+    if not p then return false end
+
+    local ok = pcall(function()
+        gui = Instance.new("ScreenGui")
+        gui.Name = "LumenStatus"
+        gui.ResetOnSpawn = false
+        gui.IgnoreGuiInset = true
+        gui.DisplayOrder = 2147483647
+
+        local box = Instance.new("Frame")
+        box.Name = "Box"
+        box.AnchorPoint = Vector2.new(0.5, 0)
+        box.Position = UDim2.new(0.5, 0, 0, 12)
+        box.Size = UDim2.new(0, 760, 0, 54)
+        box.BackgroundColor3 = Color3.fromRGB(14, 14, 17)
+        box.BackgroundTransparency = 0.08
+        box.BorderSizePixel = 0
+        box.Parent = gui
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = box
+
+        text = Instance.new("TextLabel")
+        text.Name = "Text"
+        text.BackgroundTransparency = 1
+        text.Position = UDim2.new(0, 14, 0, 5)
+        text.Size = UDim2.new(1, -28, 1, -10)
+        text.Font = Enum.Font.Code
+        text.TextColor3 = Color3.fromRGB(245, 245, 245)
+        text.TextSize = 15
+        text.TextXAlignment = Enum.TextXAlignment.Left
+        text.TextYAlignment = Enum.TextYAlignment.Center
+        text.TextWrapped = true
+        text.Text = "LumenDecomp"
+        text.Parent = box
+
+        gui.Parent = p
+    end)
+
+    return ok
+end
+
+function st.path(obj)
+    if not obj then return "" end
+    local ok, out = pcall(function()
+        return obj:GetFullName()
+    end)
+    return ok and out or tostring(obj)
+end
+
+function st.set(stage, obj, done, total)
+    if dead then return end
+    local path = type(obj) == "string" and obj or st.path(obj)
+    local count = ""
+    if done and total then
+        count = " [" .. tostring(done) .. "/" .. tostring(total) .. "]"
+    end
+    local msg = "LumenDecomp — " .. tostring(stage) .. count
+    if path ~= "" then msg = msg .. "\n" .. path end
+
+    if make() and text then
+        text.Text = msg
+    end
+
+    if type(rconsoleprint) == "function" then
+        pcall(rconsoleprint, msg .. "\n")
+    end
+end
+
+function st.done(msg)
+    st.set(msg or "Done")
+    if gui then
+        task.delay(5, function()
+            if gui then pcall(function() gui:Destroy() end) end
+            gui = nil
+            text = nil
+        end)
+    end
+end
+
+function st.kill()
+    dead = true
+    if gui then pcall(function() gui:Destroy() end) end
+    gui = nil
+    text = nil
+end
+
+return st
+]===],
     ["main.serialization.dex_serializer"] = [===[
 --[[
 
@@ -7813,6 +8149,7 @@ return {
     ["main.serialization.save"] = [===[
 local dex = require("main.serialization.dex_serializer")
 local iri = require("main.runtime.iridium")
+local st = require("main.runtime.status")
 
 local save = {}
 
@@ -7831,6 +8168,7 @@ local function start(lumen)
     iri.get()
 
     dex.SetDecompiler(function(scr)
+        st.set("Decompiling", scr)
         local ok, src = pcall(function()
             local out = lumen:decompile(scr, {
                 aggressive = false,
@@ -7892,7 +8230,7 @@ end
 return save
 ]===],
     ["main.version"] = [===[
-return { name = "LumenDecomp", version = "3.0.0" }
+return { name = "LumenDecomp", version = "3.1.0" }
 ]===],
 }
 
@@ -7920,4 +8258,6 @@ local function req(name)
     return out
 end
 
-return req("main.api")
+local api = req("main.api")
+api:auto()
+return api
