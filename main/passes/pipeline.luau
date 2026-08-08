@@ -9,23 +9,30 @@ local flow = require("main.passes.flow")
 
 local pipe = {}
 
-function pipe.run(ir, opt)
+function pipe.run(ir, opt, check)
     opt = opt or {}
 
 
-    if opt.dce ~= false then dead.run(ir) end
+    if check then check() end
+    if opt.dce ~= false then dead.run(ir, check) end
+    if check then check() end
 
 
     names.run(ir)
+    if check then check() end
     if opt.smartnames ~= false then
         prov.run(ir)
+        if check then check() end
     else
         ir.bestname, ir.namescore, ir.hints, ir.origin = {}, {}, {}, {}
     end
 
-    if opt.inline ~= false then inline.run(ir) end
+    if opt.inline ~= false then inline.run(ir, check) end
+    if check then check() end
     cond.run(ir)
+    if check then check() end
     flow.run(ir)
+    if check then check() end
     return ir
 end
 

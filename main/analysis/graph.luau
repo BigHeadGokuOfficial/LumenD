@@ -6,9 +6,10 @@ local post = require("main.analysis.postdom")
 
 local graph = {}
 
-local function immediatefromsets(blocks, sets)
+local function immediatefromsets(blocks, sets, check)
     local out = {}
     for _, b in ipairs(blocks) do
+        if check then check() end
         local cand = {}
         for id in pairs(sets[b.id] or {}) do if id ~= b.id then cand[#cand + 1] = id end end
         table.sort(cand)
@@ -23,9 +24,10 @@ local function immediatefromsets(blocks, sets)
     return out
 end
 
-local function dominancefrontiers(blocks, idom)
+local function dominancefrontiers(blocks, idom, check)
     local df = {}; for _, b in ipairs(blocks) do df[b.id] = {} end
     for _, b in ipairs(blocks) do
+        if check then check() end
         if #b.predecessors >= 2 then
             for _, pred in ipairs(b.predecessors) do
                 local runner = pred
@@ -41,9 +43,10 @@ local function dominancefrontiers(blocks, idom)
     return df
 end
 
-local function tarjan(blocks)
+local function tarjan(blocks, check)
     local index, stack, onstack, idx, low, out = 0, {}, {}, {}, {}, {}
     local function visit(v)
+        if check then check() end
         index += 1; idx[v] = index; low[v] = index; stack[#stack + 1] = v; onstack[v] = true
         for _, w in ipairs(blocks[v].successors) do
             if not idx[w] then visit(w); low[v] = math.min(low[v], low[w])
@@ -73,13 +76,14 @@ local function tarjan(blocks)
     return out
 end
 
-local function loopforest(natural)
+local function loopforest(natural, check)
     local parent = {}
     local function subset(a, b)
         for id in pairs(a) do if not b[id] then return false end end
         return true
     end
     for i, loop in ipairs(natural) do
+        if check then check() end
         local best, bestsize
         local size = 0; for _ in pairs(loop.nodes) do size += 1 end
         for j, outer in ipairs(natural) do
@@ -161,8 +165,15 @@ local function verify(proto, aux, blocks, blockmap, nexts)
     return true
 end
 
-function graph.build(proto)
+function graph.build(proto, check, limits)
     local ops = proto.Instructions
+    limits = limits or {}
+    local maxinstructions = tonumber(limits.maxinstructions) or 0
+    local maxblocks = tonumber(limits.maxblocks) or 0
+    if maxinstructions > 0 and #ops > maxinstructions then
+        error("LumenV4: STRUCTURED_COMPLEXITY proto instructions " .. tostring(#ops) .. " > " .. tostring(maxinstructions), 2)
+    end
+    if check then check() end
     local aux = ins.auxSlots(proto)
     local leaders = { [1] = true }
     local nexts = {}
@@ -248,11 +259,15 @@ function graph.build(proto)
         for _, sid in ipairs(b.successors) do push(blocks[sid].predecessors, b.id) end
     end
 
-    local dominators = dom.compute(blocks)
-    local idom = immediatefromsets(blocks, dominators)
-    local postdom, ipdom, exitid = post.run(blocks)
-    local naturalloops = loops.find(blocks, dominators)
-    local sccs = tarjan(blocks)
+    if maxblocks > 0 and #blocks > maxblocks then
+        error("LumenV4: STRUCTURED_COMPLEXITY cfg blocks " .. tostring(#blocks) .. " > " .. tostring(maxblocks), 2)
+    end
+    if check then check() end
+    local dominators = dom.compute(blocks, check)
+    local idom = immediatefromsets(blocks, dominators, check)
+    local postdom, ipdom, exitid = post.run(blocks, check)
+    local naturalloops = loops.find(blocks, dominators, check)
+    local sccs = tarjan(blocks, check)
     local out = {
         proto = proto,
         aux = aux,
@@ -261,12 +276,12 @@ function graph.build(proto)
         nexts = nexts,
         dominators = dominators,
         idom = idom,
-        dominanceFrontiers = dominancefrontiers(blocks, idom),
+        dominanceFrontiers = dominancefrontiers(blocks, idom, check),
         postdom = postdom,
         ipdom = ipdom,
         exitId = exitid,
         loops = naturalloops,
-        loopForest = loopforest(naturalloops),
+        loopForest = loopforest(naturalloops, check),
         sccs = sccs,
         irreducible = false,
         registerStats = regs.stats(proto, aux),

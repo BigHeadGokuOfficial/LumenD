@@ -21,7 +21,7 @@ end
 local ambig = {}
 
 
-local function packflow(proto, cfg)
+local function packflow(proto, cfg, check)
     local pin, pout, before, consumer = {}, {}, {}, {}
     local changed, iterations = true, 0
     local limit = math.max(64, (#cfg.blocks + 1) * 256)
@@ -38,6 +38,7 @@ local function packflow(proto, cfg)
     end
 
     while changed do
+        if check then check() end
         iterations += 1
         if iterations > limit then error("LumenV4: ValuePack dataflow failed to converge", 2) end
         changed = false
@@ -71,7 +72,7 @@ local function packflow(proto, cfg)
     return pin, pout, before, consumer, ambig
 end
 
-local function liveness(proto, cfg, packinput, ambiguous)
+local function liveness(proto, cfg, packinput, ambiguous, check)
     local use, def, lin, lout = {}, {}, {}, {}
     for _, b in ipairs(cfg.blocks) do
         local u, d = {}, {}
@@ -98,6 +99,7 @@ local function liveness(proto, cfg, packinput, ambiguous)
     local iterations = 0
     local limit = math.max(64, #cfg.blocks * 512)
     while changed do
+        if check then check() end
         iterations += 1
         if iterations > limit then error("LumenV4: liveness failed to converge", 2) end
         changed = false
@@ -138,10 +140,10 @@ local function liveness(proto, cfg, packinput, ambiguous)
     return lin, lout, after
 end
 
-function ssa.build(proto, cfg)
-    cfg = cfg or graph.build(proto)
-    local packinblock, packoutblock, packbefore, packinput, ambiguouspack = packflow(proto, cfg)
-    local livein, liveout, liveafter = liveness(proto, cfg, packinput, ambiguouspack)
+function ssa.build(proto, cfg, check, limits)
+    cfg = cfg or graph.build(proto, check, limits)
+    local packinblock, packoutblock, packbefore, packinput, ambiguouspack = packflow(proto, cfg, check)
+    local livein, liveout, liveafter = liveness(proto, cfg, packinput, ambiguouspack, check)
     local result = {
         proto = proto, cfg = cfg, params = {}, defsByPC = {}, usesByPC = {}, versions = {}, phisByBlock = {},
         inVersions = {}, outVersions = {}, useCount = {}, defUse = {}, undefByReg = {}, packsByPC = {},
@@ -167,6 +169,7 @@ function ssa.build(proto, cfg)
 
 
     for _, b in ipairs(cfg.blocks) do
+        if check then check() end
         for _, pc in ipairs(b.pcs) do
             local _, writes, pack = regs.readWrite(proto.Instructions[pc])
             result.packsByPC[pc] = next(pack) and pack or nil
@@ -220,6 +223,7 @@ function ssa.build(proto, cfg)
     local changed, iterations = true, 0
     local limit = math.max(128, (#cfg.blocks + 1) * 1024)
     while changed do
+        if check then check() end
         iterations += 1
         if iterations > limit then error("LumenV4: SSA failed to converge", 2) end
         changed = false

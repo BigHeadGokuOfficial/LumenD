@@ -18,6 +18,10 @@ local base = {
     doblocks = 0,
     iridium = nil,
     fidelity = true,
+    structuredbudget = 1.25,
+    structuredmaxinstructions = 8000,
+    structuredmaxprotoinstructions = 4000,
+    structuredmaxblocks = 256,
 }
 
 local map = {
@@ -28,6 +32,10 @@ local map = {
     ConditionalStructurer = "conditions",
     DoBlockInsertionThreshold = "doblocks",
     FidelityMode = "fidelity",
+    StructuredBudgetSeconds = "structuredbudget",
+    StructuredMaxInstructions = "structuredmaxinstructions",
+    StructuredMaxProtoInstructions = "structuredmaxprotoinstructions",
+    StructuredMaxBlocks = "structuredmaxblocks",
 }
 
 return function(opt)
@@ -35,6 +43,10 @@ return function(opt)
     for k, v in pairs(base) do out[k] = v end
     if opt then for k, v in pairs(opt) do out[map[k] or k] = v end end
     out.doblocks = math.max(0, math.floor(tonumber(out.doblocks) or 0))
+    out.structuredbudget = math.max(0, tonumber(out.structuredbudget) or 1.25)
+    out.structuredmaxinstructions = math.max(0, math.floor(tonumber(out.structuredmaxinstructions) or 8000))
+    out.structuredmaxprotoinstructions = math.max(0, math.floor(tonumber(out.structuredmaxprotoinstructions) or 4000))
+    out.structuredmaxblocks = math.max(0, math.floor(tonumber(out.structuredmaxblocks) or 256))
     if out.fidelity ~= false then
 
         out.fold = false

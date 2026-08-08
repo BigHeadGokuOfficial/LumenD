@@ -186,7 +186,7 @@ local function closurechild(parsed, proto, op, byobject)
     end
 end
 
-local function emitprotofactory(out, parsed, proto, id, byobject)
+local function emitprotofactory(out, parsed, proto, id, byobject, pulse)
     local pcs, slots = realpcs(proto)
     local maxstack = math.max(1, tonumber(proto.MaxStackSize) or 255)
     local params = math.max(0, tonumber(proto.ParameterCount) or 0)
@@ -235,6 +235,7 @@ local function emitprotofactory(out, parsed, proto, id, byobject)
 
     local consumedcaptures = {}
     for _, pc in ipairs(pcs) do
+        if pulse then pulse() end
         local op = proto.Instructions[pc]
         local name = ins.name(op)
         if name == "NEWCLOSURE" or name == "DUPCLOSURE" then
@@ -248,6 +249,7 @@ local function emitprotofactory(out, parsed, proto, id, byobject)
 
     local branchindex = 0
     for _, pc in ipairs(pcs) do
+        if pulse then pulse() end
         if not consumedcaptures[pc] then
             local op = proto.Instructions[pc]
             local name = ins.name(op)
@@ -489,9 +491,18 @@ end
 
 function vm.run(parsed, reason)
     local entry = assert(parsed and parsed.Protos and parsed.Protos[parsed.ProtoEntryPoint], "LumenV4 VM fallback: missing entry proto")
+    local slice = os.clock()
+    local function pulse(force)
+        local now = os.clock()
+        if force or now - slice >= 0.008 then
+            if task and type(task.wait) == "function" then task.wait() end
+            slice = os.clock()
+        end
+    end
     local byobject = protomap(parsed)
     local decoded = 0
     for _, proto in ipairs(parsed.Protos or {}) do
+        pulse()
         local pcs = realpcs(proto)
         decoded += #pcs
     end
@@ -670,7 +681,8 @@ function vm.run(parsed, reason)
         "",
     }
 
-    for i, proto in ipairs(parsed.Protos or {}) do emitprotofactory(out, parsed, proto, i, byobject) end
+    for i, proto in ipairs(parsed.Protos or {}) do pulse(); emitprotofactory(out, parsed, proto, i, byobject, pulse) end
+    pulse(true)
     local entryid = byobject[entry] or parsed.ProtoEntryPoint
     line(out, 0, "return (__factory[" .. tostring(entryid) .. "]({}))()")
 
@@ -711,12 +723,31 @@ local function hashard(st)
     return #st.bad > 0
 end
 
-function decomp.new(opt) return setmetatable({ opt = opt or {} }, decomp) end
+function decomp.new(opt) return setmetatable({ opt = opt or {}, deadline = nil, slice = os.clock() }, decomp) end
+
+function decomp:_check()
+    local now = os.clock()
+    if now - (self.slice or now) >= 0.008 then
+        if task and type(task.wait) == "function" then task.wait() end
+        self.slice = os.clock()
+        now = self.slice
+    end
+    if self.deadline and now > self.deadline then
+        error("LumenV4: STRUCTURED_BUDGET exceeded", 2)
+    end
+end
 
 function decomp:_state(proto, up, ph)
-    local ir = irbuild.run(proto)
+    self:_check()
+    local limits = {
+        maxinstructions = self.opt.structuredmaxprotoinstructions or self.opt.structuredmaxinstructions,
+        maxblocks = self.opt.structuredmaxblocks,
+    }
+    local ir = irbuild.run(proto, function() self:_check() end, limits)
     ir.paramhints = ph or {}
-    ir = irpass.run(ir, self.opt)
+    self:_check()
+    ir = irpass.run(ir, self.opt, function() self:_check() end)
+    self:_check()
     local naming = names.new(ir.cfg.registerStats, self.opt, proto)
     local st = context.new(proto, ir, naming, up, lower.new(), self.opt)
     st.v4 = { fallback = false, visited = {}, status = "STRUCTURED", cellNames = {} }
@@ -898,6 +929,7 @@ function decomp:_op(st, pc)
 end
 
 function decomp:_child(proto, up, ph)
+    self:_check()
     local st = self:_state(proto, up, ph)
     local args = arguments(st, proto)
     preparepacks(st)
@@ -916,7 +948,9 @@ function decomp:_child(proto, up, ph)
         end
     end
 
+    self:_check()
     local root = astpass.run(st.ast:done(), self.opt)
+    self:_check()
     return root, st, args
 end
 
@@ -1005,7 +1039,10 @@ end
 
 function decomp:_region(st, start, stop, active)
     local pc = start; active = active or {}
+    local budgettick = 0
     while pc < stop and pc <= #st.proto.Instructions do
+        budgettick += 1
+        if budgettick >= 64 then budgettick = 0; self:_check() end
         if st.cfg.aux[pc] then pc += 1
         elseif st.consumed[pc] then st.v4.visited[pc] = true; pc += 1
         else
@@ -1207,14 +1244,33 @@ function decomp:decompileParsed(parsed)
     assert(proto, "LumenV4: parsed bytecode has no entry proto")
     self.parsed = parsed
 
-    local ok, src, info = pcall(function() return self:decompileProto(proto, {}) end)
-    if ok then
-        self.parsed = nil
-        return src, info
+    local totalinstructions = 0
+    local maxprotoinstructions = 0
+    for _, p in ipairs(parsed.Protos or {}) do
+        local n = #(p.Instructions or {})
+        totalinstructions += n
+        if n > maxprotoinstructions then maxprotoinstructions = n end
+    end
+    local maxtotal = tonumber(self.opt.structuredmaxinstructions) or 8000
+    local maxproto = tonumber(self.opt.structuredmaxprotoinstructions) or 4000
+    local structurederror
+    if (maxtotal > 0 and totalinstructions > maxtotal) or (maxproto > 0 and maxprotoinstructions > maxproto) then
+        structurederror = "LumenV4: STRUCTURED_COMPLEXITY total=" .. tostring(totalinstructions) .. " maxproto=" .. tostring(maxprotoinstructions)
+    else
+        local budget = tonumber(self.opt.structuredbudget) or 1.25
+        self.slice = os.clock()
+        self.deadline = budget > 0 and (self.slice + budget) or nil
+        local ok, src, info = pcall(function() return self:decompileProto(proto, {}) end)
+        self.deadline = nil
+        if ok then
+            self.parsed = nil
+            return src, info
+        end
+        structurederror = tostring(src)
     end
 
-
-    local structurederror = tostring(src)
+    self.deadline = nil
+    self.slice = os.clock()
     local fok, fsrc, finfo = pcall(function()
         return vmfallback.run(parsed, structurederror)
     end)

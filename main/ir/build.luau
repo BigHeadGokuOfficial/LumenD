@@ -39,7 +39,7 @@ local function stateeq(a, b)
 end
 
 
-local function analyzecells(out)
+local function analyzecells(out, check)
     local capturecell, capturereg, nextcell = {}, {}, 1
     for _, n in ipairs(out.ops) do
         if n.name == "CAPTURE" and n.op.A == 1 then
@@ -87,6 +87,7 @@ local function analyzecells(out)
     local changed, iterations = true, 0
     local limit = math.max(32, #out.cfg.blocks * (nextcell + 8) * 4)
     while changed do
+        if check then check() end
         iterations += 1
         if iterations > limit then error("LumenV4: CellId dataflow failed to converge", 2) end
         changed = false
@@ -192,7 +193,7 @@ local function analyzecells(out)
     return out
 end
 
-local function analyzeobjects(out)
+local function analyzeobjects(out, check)
     local sets, objects, nextobject = {}, {}, 1
     local function def(pc, reg)
         local d = out.ssa.defsByPC[pc]; return d and d[reg] or nil
@@ -220,6 +221,7 @@ local function analyzeobjects(out)
     local changed, iterations = true, 0
     local limit = math.max(32, #out.ops * 8 + 32)
     while changed do
+        if check then check() end
         iterations += 1; if iterations > limit then error("LumenV4: ObjectId propagation failed to converge", 2) end
         changed = false
         for _, n in ipairs(out.ops) do
@@ -285,9 +287,9 @@ local function analyzeobjects(out)
     return out
 end
 
-function build.run(proto)
-    local cfg = graph.build(proto)
-    local flow = ssa.build(proto, cfg)
+function build.run(proto, check, limits)
+    local cfg = graph.build(proto, check, limits)
+    local flow = ssa.build(proto, cfg, check, limits)
     assert(flow.converged, "LumenV4: refusing non-converged SSA")
     local out = fn.new(proto, cfg, flow)
     for id, src in ipairs(flow.versions) do
@@ -313,8 +315,8 @@ function build.run(proto)
         end
     end
     out:reindex()
-    analyzecells(out)
-    analyzeobjects(out)
+    analyzecells(out, check)
+    analyzeobjects(out, check)
     return out
 end
 return build

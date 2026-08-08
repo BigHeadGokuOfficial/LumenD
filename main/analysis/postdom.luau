@@ -19,7 +19,7 @@ local function intersectinto(dst, src)
     end
 end
 
-function post.run(blocks)
+function post.run(blocks, check)
     local exitid = #blocks + 1
     local all = { [exitid] = true }
     for _, b in ipairs(blocks) do all[b.id] = true end
@@ -31,6 +31,7 @@ function post.run(blocks)
     local iterations = 0
     local limit = math.max(64, (#blocks + 1) * (#blocks + 1) * 4)
     while dirty do
+        if check then check() end
         iterations += 1
         if iterations > limit then
             error("LumenV4: post-dominator analysis failed to converge", 2)
@@ -62,6 +63,7 @@ function post.run(blocks)
 
     local ip = {}
     for _, b in ipairs(blocks) do
+        if check then check() end
         local cand = {}
         for id in pairs(pd[b.id]) do
             if id ~= b.id then cand[#cand + 1] = id end

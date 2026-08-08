@@ -139,6 +139,8 @@ local function serial(lumen, jobs, opt, stat, cache, label)
     local started = os.clock()
     local cfg = decopt(opt)
     local total = #jobs
+    local slice = os.clock()
+    local budget = math.max(0.001, (tonumber(opt.DecompileBudgetMs) or 8) / 1000)
     for i, job in ipairs(jobs) do
         local res = lumen:tryDecompileBytecode(job.raw, cfg)
         if res.success and type(res.source) == "string" and res.source ~= "" then
@@ -149,6 +151,10 @@ local function serial(lumen, jobs, opt, stat, cache, label)
         end
         local elapsed = os.clock() - started
         st.progress(label or "Decompiling", job.obj, i, total, elapsed > 0 and i / elapsed or nil)
+        if i < total and os.clock() - slice >= budget then
+            task.wait()
+            slice = os.clock()
+        end
     end
     stat.decompileTime += os.clock() - started
     stat.rate = stat.decompileTime > 0 and stat.available / stat.decompileTime or 0
@@ -210,40 +216,15 @@ end)
 ch:Fire("boot", true, "")
 ]]
 
-local function getpool(want)
+local function getpool()
     local pool = {}
-    if type(getactors) == "function" then
-        local ok, list = pcall(getactors)
-        if ok and type(list) == "table" then
-            for _, a in ipairs(list) do
-                if typeof(a) == "Instance" and a:IsA("Actor") then
-                    pool[#pool + 1] = a
-                    if #pool >= want then return pool end
-                end
-            end
-        end
+    if type(getactors) ~= "function" then return pool end
+    local ok, list = pcall(getactors)
+    if not ok or type(list) ~= "table" then return pool end
+    for _, a in ipairs(list) do
+        if typeof(a) == "Instance" and a:IsA("Actor") then pool[#pool + 1] = a end
     end
-
-    local owned = nil
-    local ok = pcall(function()
-        owned = Instance.new("Folder")
-        owned.Name = "__LumenWorkers_" .. tostring(math.floor(os.clock() * 1000))
-        owned.Archivable = false
-        owned.Parent = game:GetService("ReplicatedStorage")
-        while #pool < want do
-            local a = Instance.new("Actor")
-            a.Name = "Worker" .. tostring(#pool + 1)
-            a.Archivable = false
-            a.Parent = owned
-            pool[#pool + 1] = a
-        end
-    end)
-    if not ok then
-        if owned then pcall(function() owned:Destroy() end) end
-        return pool, nil
-    end
-    task.wait()
-    return pool, owned
+    return pool
 end
 
 local function actors(lumen, jobs, opt, stat, cache)
@@ -266,67 +247,60 @@ local function actors(lumen, jobs, opt, stat, cache)
     if type(vendor) ~= "string" then return nil, "Iridium prefetch failed: " .. tostring(verr) end
     stat.warmTime += os.clock() - bootstart
 
-    local pool, owned = getpool(want)
-    want = math.min(want, #pool)
-    if want < 2 then
-        if owned then pcall(function() owned:Destroy() end) end
-        return nil, "fewer than 2 usable Actors"
-    end
+    local pool = getpool()
+    if #pool < 2 then return nil, "fewer than 2 executor-reported Actors" end
 
     local src = lumen:_workerSource()
-    if type(src) ~= "string" or src == "" then
-        if owned then pcall(function() owned:Destroy() end) end
-        return nil, "empty worker source"
-    end
+    if type(src) ~= "string" or src == "" then return nil, "empty worker source" end
 
     local ws = {}
+    local live = {}
     local dc = config(decopt(opt))
     local q = {}
     local qhead = 1
     local qtail = 0
-    local booted = 0
-    local bootfail = 0
+    local why = {}
 
-    for i = 1, want do
+    for _, actor in ipairs(pool) do
+        if #live >= want then break end
         local id, ch = create_comm_channel()
-        local w = { id = id, ch = ch, actor = pool[i], ready = false, dead = false, busy = false, sent = 0 }
+        local w = { id = id, ch = ch, actor = actor, ready = false, dead = false, busy = false, sent = 0 }
         w.con = ch.Event:Connect(function(kind, a, b, c)
             if kind == "boot" then
-                if a then
-                    if not w.ready then booted += 1 end
-                    w.ready = true
-                else
-                    if not w.dead then bootfail += 1 end
-                    w.dead = true
-                    w.err = tostring(b)
-                end
+                if a then w.ready = true else w.dead = true; w.err = tostring(b) end
             elseif kind == "done" then
                 qtail += 1
                 q[qtail] = { w = w, jid = a, ok = b, out = c }
             end
         end)
         ws[#ws + 1] = w
-        local rok, rerr = pcall(run_on_actor, w.actor, actorcode, id, src, vendor, dc.smartnames ~= false, dc.functions ~= false, dc.guards ~= false, dc.fold ~= false, dc.conditions ~= false, dc.doblocks or 0)
+        local rok, rerr = pcall(run_on_actor, actor, actorcode, id, src, vendor, dc.smartnames ~= false, dc.functions ~= false, dc.guards ~= false, dc.fold ~= false, dc.conditions ~= false, dc.doblocks or 0)
         if not rok then
             w.dead = true
             w.err = tostring(rerr)
-            bootfail += 1
+        else
+            local bt = os.clock()
+            while not w.ready and not w.dead and os.clock() - bt < 3 do task.wait(0.01) end
+            if not w.ready then
+                w.dead = true
+                w.err = w.err or "worker boot timeout"
+            end
+        end
+        if w.ready and not w.dead then
+            live[#live + 1] = w
+            task.wait()
+        else
+            why[#why + 1] = w.err or "unusable Actor"
+            if w.con then pcall(function() w.con:Disconnect() end) end
         end
     end
 
-    local bt = os.clock()
-    while booted + bootfail < #ws and os.clock() - bt < 12 do task.wait(0.01) end
-
-    local live = {}
-    for _, w in ipairs(ws) do if w.ready and not w.dead then live[#live + 1] = w end end
     stat.parallelBootTime = os.clock() - bootstart
     if #live < 2 then
-        local why = {}
         for _, w in ipairs(ws) do
-            if w.err then why[#why + 1] = w.err end
+            if w.ready then pcall(function() w.ch:Fire("stop") end) end
             if w.con then pcall(function() w.con:Disconnect() end) end
         end
-        if owned then pcall(function() owned:Destroy() end) end
         return nil, "worker boot failed" .. (#why > 0 and (": " .. table.concat(why, " | ")) or "")
     end
 
@@ -402,7 +376,6 @@ local function actors(lumen, jobs, opt, stat, cache)
         pcall(function() w.ch:Fire("stop") end)
         if w.con then pcall(function() w.con:Disconnect() end) end
     end
-    if owned then pcall(function() owned:Destroy() end) end
     task.wait()
 
     stat.decompileTime += os.clock() - started
@@ -438,6 +411,8 @@ local function writetree(root, list, cache, treeon, stat, made, opt)
     local written = 0
     local source = 0
     local placeholders = 0
+    local slice = os.clock()
+    local budget = math.max(0.001, (tonumber(opt.WriteBudgetMs) or 8) / 1000)
 
     for i, obj in ipairs(list) do
         local v = cache[obj]
@@ -468,6 +443,10 @@ local function writetree(root, list, cache, treeon, stat, made, opt)
         end
         tree.record(ctx, obj, path, state)
         st.progress("Writing source tree", obj, i, #list)
+        if i < #list and os.clock() - slice >= budget then
+            task.wait()
+            slice = os.clock()
+        end
     end
 
     local mok, merr = write(root .. "/tree-map.tsv", tree.map(ctx))
@@ -698,6 +677,8 @@ function dump.auto(lumen, boot)
     local maxpath = tonumber(val("MaxPathLength")) or 240
     local acquirebatch = tonumber(val("AcquireBatch"))
     local acquirebudget = tonumber(val("AcquireBudgetMs")) or 3
+    local decompilebudget = tonumber(val("DecompileBudgetMs")) or 8
+    local writebudget = tonumber(val("WriteBudgetMs")) or 8
     local dopt = val("DecompilerOptions")
     if type(dopt) ~= "table" then dopt = {} end
     local names = { "SmartVariableRenamer", "FunctionDeclarations", "GuardClauses", "ConstantFolding", "ConditionalStructurer", "DoBlockInsertionThreshold" }
@@ -724,7 +705,7 @@ function dump.auto(lumen, boot)
     st.set("Starting dump", flags)
     task.spawn(function()
         local ok, err = pcall(function()
-            dump.run(lumen, { Binary = binary, Decompile = decomp, Tree = treeon, IgnoreCoreScripts = ignorecore, Parallel = parallel, MaxWorkers = maxworkers, MaxThreads = maxthreads, MaxPathLength = maxpath, AcquireBatch = acquirebatch, AcquireBudgetMs = acquirebudget, Options = dopt })
+            dump.run(lumen, { Binary = binary, Decompile = decomp, Tree = treeon, IgnoreCoreScripts = ignorecore, Parallel = parallel, MaxWorkers = maxworkers, MaxThreads = maxthreads, MaxPathLength = maxpath, AcquireBatch = acquirebatch, AcquireBudgetMs = acquirebudget, DecompileBudgetMs = decompilebudget, WriteBudgetMs = writebudget, Options = dopt })
         end)
         e.__LumenDump = nil
         if not ok then

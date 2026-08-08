@@ -1,10 +1,11 @@
 
 local loops = {}
 
-function loops.find(blocks, dom)
+function loops.find(blocks, dom, check)
     local out = {}
 
     for _, latch in ipairs(blocks) do
+        if check then check() end
         for _, hid in ipairs(latch.successors) do
             if dom[latch.id] and dom[latch.id][hid] then
                 local set = { [hid] = true, [latch.id] = true }

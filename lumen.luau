@@ -2,7 +2,6 @@ assert(type(loadstring) == "function", "LumenDecomp requires loadstring()")
 
 local mod = {
     ["main.analysis.dominators"] = [===[
-
 local dom = {}
 
 local function equal(a, b)
@@ -11,7 +10,7 @@ local function equal(a, b)
     return true
 end
 
-function dom.compute(blocks)
+function dom.compute(blocks, check)
     local all = {}
     for _, block in ipairs(blocks) do all[block.id] = true end
 
@@ -30,9 +29,11 @@ function dom.compute(blocks)
 
     local chg = true
     while chg do
+        if check then check() end
         chg = false
 
         for _, block in ipairs(blocks) do
+            if check then check() end
             if block.id ~= 1 then
                 local set = nil
 
@@ -65,8 +66,7 @@ end
 
 return dom
 ]===],
-    ["main.analysis.graph"] = [===[
-local ins = require("main.bytecode.instructions")
+    ["main.analysis.graph"] = [===[local ins = require("main.bytecode.instructions")
 local regs = require("main.analysis.registers")
 local dom = require("main.analysis.dominators")
 local loops = require("main.analysis.loops")
@@ -74,9 +74,10 @@ local post = require("main.analysis.postdom")
 
 local graph = {}
 
-local function immediatefromsets(blocks, sets)
+local function immediatefromsets(blocks, sets, check)
     local out = {}
     for _, b in ipairs(blocks) do
+        if check then check() end
         local cand = {}
         for id in pairs(sets[b.id] or {}) do if id ~= b.id then cand[#cand + 1] = id end end
         table.sort(cand)
@@ -91,9 +92,10 @@ local function immediatefromsets(blocks, sets)
     return out
 end
 
-local function dominancefrontiers(blocks, idom)
+local function dominancefrontiers(blocks, idom, check)
     local df = {}; for _, b in ipairs(blocks) do df[b.id] = {} end
     for _, b in ipairs(blocks) do
+        if check then check() end
         if #b.predecessors >= 2 then
             for _, pred in ipairs(b.predecessors) do
                 local runner = pred
@@ -109,9 +111,10 @@ local function dominancefrontiers(blocks, idom)
     return df
 end
 
-local function tarjan(blocks)
+local function tarjan(blocks, check)
     local index, stack, onstack, idx, low, out = 0, {}, {}, {}, {}, {}
     local function visit(v)
+        if check then check() end
         index += 1; idx[v] = index; low[v] = index; stack[#stack + 1] = v; onstack[v] = true
         for _, w in ipairs(blocks[v].successors) do
             if not idx[w] then visit(w); low[v] = math.min(low[v], low[w])
@@ -141,13 +144,14 @@ local function tarjan(blocks)
     return out
 end
 
-local function loopforest(natural)
+local function loopforest(natural, check)
     local parent = {}
     local function subset(a, b)
         for id in pairs(a) do if not b[id] then return false end end
         return true
     end
     for i, loop in ipairs(natural) do
+        if check then check() end
         local best, bestsize
         local size = 0; for _ in pairs(loop.nodes) do size += 1 end
         for j, outer in ipairs(natural) do
@@ -229,8 +233,15 @@ local function verify(proto, aux, blocks, blockmap, nexts)
     return true
 end
 
-function graph.build(proto)
+function graph.build(proto, check, limits)
     local ops = proto.Instructions
+    limits = limits or {}
+    local maxinstructions = tonumber(limits.maxinstructions) or 0
+    local maxblocks = tonumber(limits.maxblocks) or 0
+    if maxinstructions > 0 and #ops > maxinstructions then
+        error("LumenV4: STRUCTURED_COMPLEXITY proto instructions " .. tostring(#ops) .. " > " .. tostring(maxinstructions), 2)
+    end
+    if check then check() end
     local aux = ins.auxSlots(proto)
     local leaders = { [1] = true }
     local nexts = {}
@@ -316,11 +327,15 @@ function graph.build(proto)
         for _, sid in ipairs(b.successors) do push(blocks[sid].predecessors, b.id) end
     end
 
-    local dominators = dom.compute(blocks)
-    local idom = immediatefromsets(blocks, dominators)
-    local postdom, ipdom, exitid = post.run(blocks)
-    local naturalloops = loops.find(blocks, dominators)
-    local sccs = tarjan(blocks)
+    if maxblocks > 0 and #blocks > maxblocks then
+        error("LumenV4: STRUCTURED_COMPLEXITY cfg blocks " .. tostring(#blocks) .. " > " .. tostring(maxblocks), 2)
+    end
+    if check then check() end
+    local dominators = dom.compute(blocks, check)
+    local idom = immediatefromsets(blocks, dominators, check)
+    local postdom, ipdom, exitid = post.run(blocks, check)
+    local naturalloops = loops.find(blocks, dominators, check)
+    local sccs = tarjan(blocks, check)
     local out = {
         proto = proto,
         aux = aux,
@@ -329,12 +344,12 @@ function graph.build(proto)
         nexts = nexts,
         dominators = dominators,
         idom = idom,
-        dominanceFrontiers = dominancefrontiers(blocks, idom),
+        dominanceFrontiers = dominancefrontiers(blocks, idom, check),
         postdom = postdom,
         ipdom = ipdom,
         exitId = exitid,
         loops = naturalloops,
-        loopForest = loopforest(naturalloops),
+        loopForest = loopforest(naturalloops, check),
         sccs = sccs,
         irreducible = false,
         registerStats = regs.stats(proto, aux),
@@ -347,13 +362,13 @@ end
 return graph
 ]===],
     ["main.analysis.loops"] = [===[
-
 local loops = {}
 
-function loops.find(blocks, dom)
+function loops.find(blocks, dom, check)
     local out = {}
 
     for _, latch in ipairs(blocks) do
+        if check then check() end
         for _, hid in ipairs(latch.successors) do
             if dom[latch.id] and dom[latch.id][hid] then
                 local set = { [hid] = true, [latch.id] = true }
@@ -402,7 +417,6 @@ end
 return loops
 ]===],
     ["main.analysis.postdom"] = [===[
-
 local post = {}
 
 local function clone(s)
@@ -423,7 +437,7 @@ local function intersectinto(dst, src)
     end
 end
 
-function post.run(blocks)
+function post.run(blocks, check)
     local exitid = #blocks + 1
     local all = { [exitid] = true }
     for _, b in ipairs(blocks) do all[b.id] = true end
@@ -435,6 +449,7 @@ function post.run(blocks)
     local iterations = 0
     local limit = math.max(64, (#blocks + 1) * (#blocks + 1) * 4)
     while dirty do
+        if check then check() end
         iterations += 1
         if iterations > limit then
             error("LumenV4: post-dominator analysis failed to converge", 2)
@@ -466,6 +481,7 @@ function post.run(blocks)
 
     local ip = {}
     for _, b in ipairs(blocks) do
+        if check then check() end
         local cand = {}
         for id in pairs(pd[b.id]) do
             if id ~= b.id then cand[#cand + 1] = id end
@@ -493,8 +509,7 @@ end
 
 return post
 ]===],
-    ["main.analysis.registers"] = [===[
-local ins = require("main.bytecode.instructions")
+    ["main.analysis.registers"] = [===[local ins = require("main.bytecode.instructions")
 
 local regs = {}
 
@@ -606,8 +621,7 @@ end
 
 return regs
 ]===],
-    ["main.analysis.ssa"] = [===[
-local graph = require("main.analysis.graph")
+    ["main.analysis.ssa"] = [===[local graph = require("main.analysis.graph")
 local regs = require("main.analysis.registers")
 
 local ssa = {}
@@ -630,7 +644,7 @@ end
 local ambig = {}
 
 
-local function packflow(proto, cfg)
+local function packflow(proto, cfg, check)
     local pin, pout, before, consumer = {}, {}, {}, {}
     local changed, iterations = true, 0
     local limit = math.max(64, (#cfg.blocks + 1) * 256)
@@ -647,6 +661,7 @@ local function packflow(proto, cfg)
     end
 
     while changed do
+        if check then check() end
         iterations += 1
         if iterations > limit then error("LumenV4: ValuePack dataflow failed to converge", 2) end
         changed = false
@@ -680,7 +695,7 @@ local function packflow(proto, cfg)
     return pin, pout, before, consumer, ambig
 end
 
-local function liveness(proto, cfg, packinput, ambiguous)
+local function liveness(proto, cfg, packinput, ambiguous, check)
     local use, def, lin, lout = {}, {}, {}, {}
     for _, b in ipairs(cfg.blocks) do
         local u, d = {}, {}
@@ -707,6 +722,7 @@ local function liveness(proto, cfg, packinput, ambiguous)
     local iterations = 0
     local limit = math.max(64, #cfg.blocks * 512)
     while changed do
+        if check then check() end
         iterations += 1
         if iterations > limit then error("LumenV4: liveness failed to converge", 2) end
         changed = false
@@ -747,10 +763,10 @@ local function liveness(proto, cfg, packinput, ambiguous)
     return lin, lout, after
 end
 
-function ssa.build(proto, cfg)
-    cfg = cfg or graph.build(proto)
-    local packinblock, packoutblock, packbefore, packinput, ambiguouspack = packflow(proto, cfg)
-    local livein, liveout, liveafter = liveness(proto, cfg, packinput, ambiguouspack)
+function ssa.build(proto, cfg, check, limits)
+    cfg = cfg or graph.build(proto, check, limits)
+    local packinblock, packoutblock, packbefore, packinput, ambiguouspack = packflow(proto, cfg, check)
+    local livein, liveout, liveafter = liveness(proto, cfg, packinput, ambiguouspack, check)
     local result = {
         proto = proto, cfg = cfg, params = {}, defsByPC = {}, usesByPC = {}, versions = {}, phisByBlock = {},
         inVersions = {}, outVersions = {}, useCount = {}, defUse = {}, undefByReg = {}, packsByPC = {},
@@ -776,6 +792,7 @@ function ssa.build(proto, cfg)
 
 
     for _, b in ipairs(cfg.blocks) do
+        if check then check() end
         for _, pc in ipairs(b.pcs) do
             local _, writes, pack = regs.readWrite(proto.Instructions[pc])
             result.packsByPC[pc] = next(pack) and pack or nil
@@ -829,6 +846,7 @@ function ssa.build(proto, cfg)
     local changed, iterations = true, 0
     local limit = math.max(128, (#cfg.blocks + 1) * 1024)
     while changed do
+        if check then check() end
         iterations += 1
         if iterations > limit then error("LumenV4: SSA failed to converge", 2) end
         changed = false
@@ -955,7 +973,6 @@ end
 return ssa
 ]===],
     ["main.api"] = [===[
-
 local ver = require("main.version")
 local cfg = require("main.config")
 local options = require("main.options")
@@ -1111,7 +1128,6 @@ end
 return api
 ]===],
     ["main.ast.booleans"] = [===[
-
 local pass = {}
 
 local function val(n)
@@ -1176,7 +1192,6 @@ end
 return pass
 ]===],
     ["main.ast.callbacks"] = [===[
-
 local pass = {}
 
 local function esc(s)
@@ -1272,7 +1287,6 @@ end
 return pass
 ]===],
     ["main.ast.compound"] = [===[
-
 local pass = {}
 
 local list = {
@@ -1315,7 +1329,6 @@ end
 return pass
 ]===],
     ["main.ast.conditions"] = [===[
-
 local pass = {}
 
 local function same(a, b)
@@ -1372,7 +1385,6 @@ end
 return pass
 ]===],
     ["main.ast.deadcode"] = [===[
-
 local pass = {}
 
 local function walk(block)
@@ -1401,7 +1413,6 @@ end
 return pass
 ]===],
     ["main.ast.doblocks"] = [===[
-
 local pass = {}
 
 local function words(s, out)
@@ -1564,7 +1575,6 @@ end
 return pass
 ]===],
     ["main.ast.fold"] = [===[
-
 local pass = {}
 
 local function bool(s)
@@ -1629,7 +1639,6 @@ end
 return pass
 ]===],
     ["main.ast.guards2"] = [===[
-
 local pass = {}
 
 local inv = {
@@ -1692,7 +1701,6 @@ end
 return pass
 ]===],
     ["main.ast.inline"] = [===[
-
 local pass = {}
 
 local function init(n)
@@ -1790,7 +1798,6 @@ end
 return pass
 ]===],
     ["main.ast.locals"] = [===[
-
 local pass = {}
 
 local function walk(block)
@@ -1830,7 +1837,6 @@ end
 return pass
 ]===],
     ["main.ast.logic"] = [===[
-
 local pass = {}
 
 local inv = {
@@ -1881,7 +1887,6 @@ end
 return pass
 ]===],
     ["main.ast.lower"] = [===[
-
 local n = require("main.ast.nodes")
 
 local build = {}
@@ -2021,7 +2026,6 @@ end
 return build
 ]===],
     ["main.ast.nodes"] = [===[
-
 local n = {}
 
 function n.block()
@@ -2065,7 +2069,6 @@ return n
     ["main.ast.pipeline"] = [===[
 
 
-
 local pass = {}
 
 function pass.run(root, opt)
@@ -2075,7 +2078,6 @@ end
 return pass
 ]===],
     ["main.ast.printer"] = [===[
-
 local printast = {}
 
 local function esc(s)
@@ -2200,7 +2202,6 @@ end
 return printast
 ]===],
     ["main.ast.returns"] = [===[
-
 local pass = {}
 
 local function ret(b)
@@ -2259,7 +2260,6 @@ end
 return pass
 ]===],
     ["main.ast.selects"] = [===[
-
 local pass = {}
 
 local function asn(node)
@@ -2336,7 +2336,6 @@ end
 return pass
 ]===],
     ["main.bytecode.instructions"] = [===[
-
 local ins = {}
 
 local conditional = {
@@ -2425,7 +2424,6 @@ end
 return ins
 ]===],
     ["main.config"] = [===[
-
 local base = {
     aggressive = false,
     fold = true,
@@ -2445,6 +2443,10 @@ local base = {
     doblocks = 0,
     iridium = nil,
     fidelity = true,
+    structuredbudget = 1.25,
+    structuredmaxinstructions = 8000,
+    structuredmaxprotoinstructions = 4000,
+    structuredmaxblocks = 256,
 }
 
 local map = {
@@ -2455,6 +2457,10 @@ local map = {
     ConditionalStructurer = "conditions",
     DoBlockInsertionThreshold = "doblocks",
     FidelityMode = "fidelity",
+    StructuredBudgetSeconds = "structuredbudget",
+    StructuredMaxInstructions = "structuredmaxinstructions",
+    StructuredMaxProtoInstructions = "structuredmaxprotoinstructions",
+    StructuredMaxBlocks = "structuredmaxblocks",
 }
 
 return function(opt)
@@ -2462,6 +2468,10 @@ return function(opt)
     for k, v in pairs(base) do out[k] = v end
     if opt then for k, v in pairs(opt) do out[map[k] or k] = v end end
     out.doblocks = math.max(0, math.floor(tonumber(out.doblocks) or 0))
+    out.structuredbudget = math.max(0, tonumber(out.structuredbudget) or 1.25)
+    out.structuredmaxinstructions = math.max(0, math.floor(tonumber(out.structuredmaxinstructions) or 8000))
+    out.structuredmaxprotoinstructions = math.max(0, math.floor(tonumber(out.structuredmaxprotoinstructions) or 4000))
+    out.structuredmaxblocks = math.max(0, math.floor(tonumber(out.structuredmaxblocks) or 256))
     if out.fidelity ~= false then
 
         out.fold = false
@@ -2478,7 +2488,6 @@ return function(opt)
 end
 ]===],
     ["main.decompiler.context"] = [===[
-
 local ins = require("main.bytecode.instructions")
 local ex = require("main.output.expr")
 local lit = require("main.output.literals")
@@ -2878,8 +2887,7 @@ end
 
 return ctx
 ]===],
-    ["main.decompiler.engine"] = [===[
-local irbuild = require("main.ir.build")
+    ["main.decompiler.engine"] = [===[local irbuild = require("main.ir.build")
 local irpass = require("main.passes.pipeline")
 local names = require("main.naming.resolver")
 local lower = require("main.ast.lower")
@@ -3067,7 +3075,7 @@ local function closurechild(parsed, proto, op, byobject)
     end
 end
 
-local function emitprotofactory(out, parsed, proto, id, byobject)
+local function emitprotofactory(out, parsed, proto, id, byobject, pulse)
     local pcs, slots = realpcs(proto)
     local maxstack = math.max(1, tonumber(proto.MaxStackSize) or 255)
     local params = math.max(0, tonumber(proto.ParameterCount) or 0)
@@ -3116,6 +3124,7 @@ local function emitprotofactory(out, parsed, proto, id, byobject)
 
     local consumedcaptures = {}
     for _, pc in ipairs(pcs) do
+        if pulse then pulse() end
         local op = proto.Instructions[pc]
         local name = ins.name(op)
         if name == "NEWCLOSURE" or name == "DUPCLOSURE" then
@@ -3129,6 +3138,7 @@ local function emitprotofactory(out, parsed, proto, id, byobject)
 
     local branchindex = 0
     for _, pc in ipairs(pcs) do
+        if pulse then pulse() end
         if not consumedcaptures[pc] then
             local op = proto.Instructions[pc]
             local name = ins.name(op)
@@ -3370,9 +3380,18 @@ end
 
 function vm.run(parsed, reason)
     local entry = assert(parsed and parsed.Protos and parsed.Protos[parsed.ProtoEntryPoint], "LumenV4 VM fallback: missing entry proto")
+    local slice = os.clock()
+    local function pulse(force)
+        local now = os.clock()
+        if force or now - slice >= 0.008 then
+            if task and type(task.wait) == "function" then task.wait() end
+            slice = os.clock()
+        end
+    end
     local byobject = protomap(parsed)
     local decoded = 0
     for _, proto in ipairs(parsed.Protos or {}) do
+        pulse()
         local pcs = realpcs(proto)
         decoded += #pcs
     end
@@ -3551,7 +3570,8 @@ function vm.run(parsed, reason)
         "",
     }
 
-    for i, proto in ipairs(parsed.Protos or {}) do emitprotofactory(out, parsed, proto, i, byobject) end
+    for i, proto in ipairs(parsed.Protos or {}) do pulse(); emitprotofactory(out, parsed, proto, i, byobject, pulse) end
+    pulse(true)
     local entryid = byobject[entry] or parsed.ProtoEntryPoint
     line(out, 0, "return (__factory[" .. tostring(entryid) .. "]({}))()")
 
@@ -3592,12 +3612,31 @@ local function hashard(st)
     return #st.bad > 0
 end
 
-function decomp.new(opt) return setmetatable({ opt = opt or {} }, decomp) end
+function decomp.new(opt) return setmetatable({ opt = opt or {}, deadline = nil, slice = os.clock() }, decomp) end
+
+function decomp:_check()
+    local now = os.clock()
+    if now - (self.slice or now) >= 0.008 then
+        if task and type(task.wait) == "function" then task.wait() end
+        self.slice = os.clock()
+        now = self.slice
+    end
+    if self.deadline and now > self.deadline then
+        error("LumenV4: STRUCTURED_BUDGET exceeded", 2)
+    end
+end
 
 function decomp:_state(proto, up, ph)
-    local ir = irbuild.run(proto)
+    self:_check()
+    local limits = {
+        maxinstructions = self.opt.structuredmaxprotoinstructions or self.opt.structuredmaxinstructions,
+        maxblocks = self.opt.structuredmaxblocks,
+    }
+    local ir = irbuild.run(proto, function() self:_check() end, limits)
     ir.paramhints = ph or {}
-    ir = irpass.run(ir, self.opt)
+    self:_check()
+    ir = irpass.run(ir, self.opt, function() self:_check() end)
+    self:_check()
     local naming = names.new(ir.cfg.registerStats, self.opt, proto)
     local st = context.new(proto, ir, naming, up, lower.new(), self.opt)
     st.v4 = { fallback = false, visited = {}, status = "STRUCTURED", cellNames = {} }
@@ -3779,6 +3818,7 @@ function decomp:_op(st, pc)
 end
 
 function decomp:_child(proto, up, ph)
+    self:_check()
     local st = self:_state(proto, up, ph)
     local args = arguments(st, proto)
     preparepacks(st)
@@ -3797,7 +3837,9 @@ function decomp:_child(proto, up, ph)
         end
     end
 
+    self:_check()
     local root = astpass.run(st.ast:done(), self.opt)
+    self:_check()
     return root, st, args
 end
 
@@ -3886,7 +3928,10 @@ end
 
 function decomp:_region(st, start, stop, active)
     local pc = start; active = active or {}
+    local budgettick = 0
     while pc < stop and pc <= #st.proto.Instructions do
+        budgettick += 1
+        if budgettick >= 64 then budgettick = 0; self:_check() end
         if st.cfg.aux[pc] then pc += 1
         elseif st.consumed[pc] then st.v4.visited[pc] = true; pc += 1
         else
@@ -4088,14 +4133,33 @@ function decomp:decompileParsed(parsed)
     assert(proto, "LumenV4: parsed bytecode has no entry proto")
     self.parsed = parsed
 
-    local ok, src, info = pcall(function() return self:decompileProto(proto, {}) end)
-    if ok then
-        self.parsed = nil
-        return src, info
+    local totalinstructions = 0
+    local maxprotoinstructions = 0
+    for _, p in ipairs(parsed.Protos or {}) do
+        local n = #(p.Instructions or {})
+        totalinstructions += n
+        if n > maxprotoinstructions then maxprotoinstructions = n end
+    end
+    local maxtotal = tonumber(self.opt.structuredmaxinstructions) or 8000
+    local maxproto = tonumber(self.opt.structuredmaxprotoinstructions) or 4000
+    local structurederror
+    if (maxtotal > 0 and totalinstructions > maxtotal) or (maxproto > 0 and maxprotoinstructions > maxproto) then
+        structurederror = "LumenV4: STRUCTURED_COMPLEXITY total=" .. tostring(totalinstructions) .. " maxproto=" .. tostring(maxprotoinstructions)
+    else
+        local budget = tonumber(self.opt.structuredbudget) or 1.25
+        self.slice = os.clock()
+        self.deadline = budget > 0 and (self.slice + budget) or nil
+        local ok, src, info = pcall(function() return self:decompileProto(proto, {}) end)
+        self.deadline = nil
+        if ok then
+            self.parsed = nil
+            return src, info
+        end
+        structurederror = tostring(src)
     end
 
-
-    local structurederror = tostring(src)
+    self.deadline = nil
+    self.slice = os.clock()
     local fok, fsrc, finfo = pcall(function()
         return vmfallback.run(parsed, structurederror)
     end)
@@ -4111,7 +4175,6 @@ end
 return decomp
 ]===],
     ["main.decompiler.ops"] = [===[
-
 local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 local ex = require("main.output.expr")
@@ -4408,7 +4471,6 @@ end
 return ops
 ]===],
     ["main.diagnostics.disassembler"] = [===[
-
 local graph = require("main.analysis.graph")
 local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
@@ -4479,7 +4541,6 @@ end
 return dis
 ]===],
     ["main.diagnostics.inspect"] = [===[
-
 local graph = require("main.analysis.graph")
 local ssa = require("main.analysis.ssa")
 local irbuild = require("main.ir.build")
@@ -4646,6 +4707,8 @@ local function serial(lumen, jobs, opt, stat, cache, label)
     local started = os.clock()
     local cfg = decopt(opt)
     local total = #jobs
+    local slice = os.clock()
+    local budget = math.max(0.001, (tonumber(opt.DecompileBudgetMs) or 8) / 1000)
     for i, job in ipairs(jobs) do
         local res = lumen:tryDecompileBytecode(job.raw, cfg)
         if res.success and type(res.source) == "string" and res.source ~= "" then
@@ -4656,6 +4719,10 @@ local function serial(lumen, jobs, opt, stat, cache, label)
         end
         local elapsed = os.clock() - started
         st.progress(label or "Decompiling", job.obj, i, total, elapsed > 0 and i / elapsed or nil)
+        if i < total and os.clock() - slice >= budget then
+            task.wait()
+            slice = os.clock()
+        end
     end
     stat.decompileTime += os.clock() - started
     stat.rate = stat.decompileTime > 0 and stat.available / stat.decompileTime or 0
@@ -4717,40 +4784,15 @@ end)
 ch:Fire("boot", true, "")
 ]]
 
-local function getpool(want)
+local function getpool()
     local pool = {}
-    if type(getactors) == "function" then
-        local ok, list = pcall(getactors)
-        if ok and type(list) == "table" then
-            for _, a in ipairs(list) do
-                if typeof(a) == "Instance" and a:IsA("Actor") then
-                    pool[#pool + 1] = a
-                    if #pool >= want then return pool end
-                end
-            end
-        end
+    if type(getactors) ~= "function" then return pool end
+    local ok, list = pcall(getactors)
+    if not ok or type(list) ~= "table" then return pool end
+    for _, a in ipairs(list) do
+        if typeof(a) == "Instance" and a:IsA("Actor") then pool[#pool + 1] = a end
     end
-
-    local owned = nil
-    local ok = pcall(function()
-        owned = Instance.new("Folder")
-        owned.Name = "__LumenWorkers_" .. tostring(math.floor(os.clock() * 1000))
-        owned.Archivable = false
-        owned.Parent = game:GetService("ReplicatedStorage")
-        while #pool < want do
-            local a = Instance.new("Actor")
-            a.Name = "Worker" .. tostring(#pool + 1)
-            a.Archivable = false
-            a.Parent = owned
-            pool[#pool + 1] = a
-        end
-    end)
-    if not ok then
-        if owned then pcall(function() owned:Destroy() end) end
-        return pool, nil
-    end
-    task.wait()
-    return pool, owned
+    return pool
 end
 
 local function actors(lumen, jobs, opt, stat, cache)
@@ -4773,67 +4815,60 @@ local function actors(lumen, jobs, opt, stat, cache)
     if type(vendor) ~= "string" then return nil, "Iridium prefetch failed: " .. tostring(verr) end
     stat.warmTime += os.clock() - bootstart
 
-    local pool, owned = getpool(want)
-    want = math.min(want, #pool)
-    if want < 2 then
-        if owned then pcall(function() owned:Destroy() end) end
-        return nil, "fewer than 2 usable Actors"
-    end
+    local pool = getpool()
+    if #pool < 2 then return nil, "fewer than 2 executor-reported Actors" end
 
     local src = lumen:_workerSource()
-    if type(src) ~= "string" or src == "" then
-        if owned then pcall(function() owned:Destroy() end) end
-        return nil, "empty worker source"
-    end
+    if type(src) ~= "string" or src == "" then return nil, "empty worker source" end
 
     local ws = {}
+    local live = {}
     local dc = config(decopt(opt))
     local q = {}
     local qhead = 1
     local qtail = 0
-    local booted = 0
-    local bootfail = 0
+    local why = {}
 
-    for i = 1, want do
+    for _, actor in ipairs(pool) do
+        if #live >= want then break end
         local id, ch = create_comm_channel()
-        local w = { id = id, ch = ch, actor = pool[i], ready = false, dead = false, busy = false, sent = 0 }
+        local w = { id = id, ch = ch, actor = actor, ready = false, dead = false, busy = false, sent = 0 }
         w.con = ch.Event:Connect(function(kind, a, b, c)
             if kind == "boot" then
-                if a then
-                    if not w.ready then booted += 1 end
-                    w.ready = true
-                else
-                    if not w.dead then bootfail += 1 end
-                    w.dead = true
-                    w.err = tostring(b)
-                end
+                if a then w.ready = true else w.dead = true; w.err = tostring(b) end
             elseif kind == "done" then
                 qtail += 1
                 q[qtail] = { w = w, jid = a, ok = b, out = c }
             end
         end)
         ws[#ws + 1] = w
-        local rok, rerr = pcall(run_on_actor, w.actor, actorcode, id, src, vendor, dc.smartnames ~= false, dc.functions ~= false, dc.guards ~= false, dc.fold ~= false, dc.conditions ~= false, dc.doblocks or 0)
+        local rok, rerr = pcall(run_on_actor, actor, actorcode, id, src, vendor, dc.smartnames ~= false, dc.functions ~= false, dc.guards ~= false, dc.fold ~= false, dc.conditions ~= false, dc.doblocks or 0)
         if not rok then
             w.dead = true
             w.err = tostring(rerr)
-            bootfail += 1
+        else
+            local bt = os.clock()
+            while not w.ready and not w.dead and os.clock() - bt < 3 do task.wait(0.01) end
+            if not w.ready then
+                w.dead = true
+                w.err = w.err or "worker boot timeout"
+            end
+        end
+        if w.ready and not w.dead then
+            live[#live + 1] = w
+            task.wait()
+        else
+            why[#why + 1] = w.err or "unusable Actor"
+            if w.con then pcall(function() w.con:Disconnect() end) end
         end
     end
 
-    local bt = os.clock()
-    while booted + bootfail < #ws and os.clock() - bt < 12 do task.wait(0.01) end
-
-    local live = {}
-    for _, w in ipairs(ws) do if w.ready and not w.dead then live[#live + 1] = w end end
     stat.parallelBootTime = os.clock() - bootstart
     if #live < 2 then
-        local why = {}
         for _, w in ipairs(ws) do
-            if w.err then why[#why + 1] = w.err end
+            if w.ready then pcall(function() w.ch:Fire("stop") end) end
             if w.con then pcall(function() w.con:Disconnect() end) end
         end
-        if owned then pcall(function() owned:Destroy() end) end
         return nil, "worker boot failed" .. (#why > 0 and (": " .. table.concat(why, " | ")) or "")
     end
 
@@ -4909,7 +4944,6 @@ local function actors(lumen, jobs, opt, stat, cache)
         pcall(function() w.ch:Fire("stop") end)
         if w.con then pcall(function() w.con:Disconnect() end) end
     end
-    if owned then pcall(function() owned:Destroy() end) end
     task.wait()
 
     stat.decompileTime += os.clock() - started
@@ -4945,6 +4979,8 @@ local function writetree(root, list, cache, treeon, stat, made, opt)
     local written = 0
     local source = 0
     local placeholders = 0
+    local slice = os.clock()
+    local budget = math.max(0.001, (tonumber(opt.WriteBudgetMs) or 8) / 1000)
 
     for i, obj in ipairs(list) do
         local v = cache[obj]
@@ -4975,6 +5011,10 @@ local function writetree(root, list, cache, treeon, stat, made, opt)
         end
         tree.record(ctx, obj, path, state)
         st.progress("Writing source tree", obj, i, #list)
+        if i < #list and os.clock() - slice >= budget then
+            task.wait()
+            slice = os.clock()
+        end
     end
 
     local mok, merr = write(root .. "/tree-map.tsv", tree.map(ctx))
@@ -5205,6 +5245,8 @@ function dump.auto(lumen, boot)
     local maxpath = tonumber(val("MaxPathLength")) or 240
     local acquirebatch = tonumber(val("AcquireBatch"))
     local acquirebudget = tonumber(val("AcquireBudgetMs")) or 3
+    local decompilebudget = tonumber(val("DecompileBudgetMs")) or 8
+    local writebudget = tonumber(val("WriteBudgetMs")) or 8
     local dopt = val("DecompilerOptions")
     if type(dopt) ~= "table" then dopt = {} end
     local names = { "SmartVariableRenamer", "FunctionDeclarations", "GuardClauses", "ConstantFolding", "ConditionalStructurer", "DoBlockInsertionThreshold" }
@@ -5231,7 +5273,7 @@ function dump.auto(lumen, boot)
     st.set("Starting dump", flags)
     task.spawn(function()
         local ok, err = pcall(function()
-            dump.run(lumen, { Binary = binary, Decompile = decomp, Tree = treeon, IgnoreCoreScripts = ignorecore, Parallel = parallel, MaxWorkers = maxworkers, MaxThreads = maxthreads, MaxPathLength = maxpath, AcquireBatch = acquirebatch, AcquireBudgetMs = acquirebudget, Options = dopt })
+            dump.run(lumen, { Binary = binary, Decompile = decomp, Tree = treeon, IgnoreCoreScripts = ignorecore, Parallel = parallel, MaxWorkers = maxworkers, MaxThreads = maxthreads, MaxPathLength = maxpath, AcquireBatch = acquirebatch, AcquireBudgetMs = acquirebudget, DecompileBudgetMs = decompilebudget, WriteBudgetMs = writebudget, Options = dopt })
         end)
         e.__LumenDump = nil
         if not ok then
@@ -5245,7 +5287,6 @@ end
 return dump
 ]===],
     ["main.ir.block"] = [===[
-
 local block = {}
 block.__index = block
 
@@ -5263,8 +5304,7 @@ end
 
 return block
 ]===],
-    ["main.ir.build"] = [===[
-local graph = require("main.analysis.graph")
+    ["main.ir.build"] = [===[local graph = require("main.analysis.graph")
 local ssa = require("main.analysis.ssa")
 local regs = require("main.analysis.registers")
 local ins = require("main.bytecode.instructions")
@@ -5305,7 +5345,7 @@ local function stateeq(a, b)
 end
 
 
-local function analyzecells(out)
+local function analyzecells(out, check)
     local capturecell, capturereg, nextcell = {}, {}, 1
     for _, n in ipairs(out.ops) do
         if n.name == "CAPTURE" and n.op.A == 1 then
@@ -5353,6 +5393,7 @@ local function analyzecells(out)
     local changed, iterations = true, 0
     local limit = math.max(32, #out.cfg.blocks * (nextcell + 8) * 4)
     while changed do
+        if check then check() end
         iterations += 1
         if iterations > limit then error("LumenV4: CellId dataflow failed to converge", 2) end
         changed = false
@@ -5458,7 +5499,7 @@ local function analyzecells(out)
     return out
 end
 
-local function analyzeobjects(out)
+local function analyzeobjects(out, check)
     local sets, objects, nextobject = {}, {}, 1
     local function def(pc, reg)
         local d = out.ssa.defsByPC[pc]; return d and d[reg] or nil
@@ -5486,6 +5527,7 @@ local function analyzeobjects(out)
     local changed, iterations = true, 0
     local limit = math.max(32, #out.ops * 8 + 32)
     while changed do
+        if check then check() end
         iterations += 1; if iterations > limit then error("LumenV4: ObjectId propagation failed to converge", 2) end
         changed = false
         for _, n in ipairs(out.ops) do
@@ -5551,9 +5593,9 @@ local function analyzeobjects(out)
     return out
 end
 
-function build.run(proto)
-    local cfg = graph.build(proto)
-    local flow = ssa.build(proto, cfg)
+function build.run(proto, check, limits)
+    local cfg = graph.build(proto, check, limits)
+    local flow = ssa.build(proto, cfg, check, limits)
     assert(flow.converged, "LumenV4: refusing non-converged SSA")
     local out = fn.new(proto, cfg, flow)
     for id, src in ipairs(flow.versions) do
@@ -5579,14 +5621,13 @@ function build.run(proto)
         end
     end
     out:reindex()
-    analyzecells(out)
-    analyzeobjects(out)
+    analyzecells(out, check)
+    analyzeobjects(out, check)
     return out
 end
 return build
 ]===],
     ["main.ir.effects"] = [===[
-
 local fx = {}
 
 local relocatable = {
@@ -5648,7 +5689,6 @@ function fx.canRelocate(name) return relocatable[name] == true end
 return fx
 ]===],
     ["main.ir.function"] = [===[
-
 local fn = {}
 fn.__index = fn
 
@@ -5745,7 +5785,6 @@ end
 return fn
 ]===],
     ["main.ir.value"] = [===[
-
 local val = {}
 val.__index = val
 
@@ -5767,7 +5806,6 @@ end
 return val
 ]===],
     ["main.naming.debug_names"] = [===[
-
 local id = require("main.naming.identifiers")
 
 local dbg = {}
@@ -5816,7 +5854,6 @@ end
 return dbg
 ]===],
     ["main.naming.identifiers"] = [===[
-
 local id = {}
 
 local kw = {
@@ -5862,7 +5899,6 @@ end
 return id
 ]===],
     ["main.naming.resolver"] = [===[
-
 local id = require("main.naming.identifiers")
 local rbx = require("main.naming.roblox")
 local dbg = require("main.naming.debug_names")
@@ -5980,7 +6016,6 @@ names.fromCall = rbx.fromCall
 return names
 ]===],
     ["main.naming.roblox"] = [===[
-
 local id = require("main.naming.identifiers")
 local words = require("main.naming.words")
 
@@ -6070,7 +6105,6 @@ end
 return rbx
 ]===],
     ["main.naming.types"] = [===[
-
 local id = require("main.naming.identifiers")
 
 local types = {}
@@ -6147,7 +6181,6 @@ end
 return types
 ]===],
     ["main.naming.words"] = [===[
-
 local id = require("main.naming.identifiers")
 
 local w = {}
@@ -6231,7 +6264,6 @@ end
 return w
 ]===],
     ["main.options"] = [===[
-
 local opt = {}
 
 function opt.new()
@@ -6248,7 +6280,6 @@ end
 return opt
 ]===],
     ["main.output.expr"] = [===[
-
 local expr = {}
 
 local prec = {
@@ -6332,7 +6363,6 @@ end
 return expr
 ]===],
     ["main.output.literals"] = [===[
-
 local id = require("main.naming.identifiers")
 
 local lit = {}
@@ -6435,7 +6465,6 @@ end
 return lit
 ]===],
     ["main.passes.conditions"] = [===[
-
 local ins = require("main.bytecode.instructions")
 
 local pass = {}
@@ -6459,7 +6488,6 @@ end
 return pass
 ]===],
     ["main.passes.constants"] = [===[
-
 local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 
@@ -6589,10 +6617,9 @@ end
 return pass
 ]===],
     ["main.passes.deadcode"] = [===[
-
 local pass = {}
 
-function pass.run(ir)
+function pass.run(ir, check)
     local memo = {}
     local function live(id, seen)
         id = ir:resolve(id)
@@ -6618,6 +6645,7 @@ function pass.run(ir)
     end
 
     for id, v in pairs(ir.vals) do
+        if check then check() end
         id = ir:resolve(id)
         if id and not ir.dead[id] and not live(id) then
             local pc = v.pc
@@ -6631,7 +6659,6 @@ end
 return pass
 ]===],
     ["main.passes.flow"] = [===[
-
 local pass = {}
 
 function pass.run(ir)
@@ -6645,8 +6672,7 @@ end
 
 return pass
 ]===],
-    ["main.passes.inline"] = [===[
-local ins = require("main.bytecode.instructions")
+    ["main.passes.inline"] = [===[local ins = require("main.bytecode.instructions")
 
 local pass = {}
 
@@ -6660,7 +6686,7 @@ local function quiet(ir, a, b)
     return true
 end
 
-local function mutablevalues(ir)
+local function mutablevalues(ir, check)
     local mutable = {}
     local changed = true
 
@@ -6681,6 +6707,7 @@ local function mutablevalues(ir)
     end
 
     while changed do
+        if check then check() end
         changed = false
         for _, n in ipairs(ir.ops) do
             if n.name == "MOVE" then
@@ -6706,11 +6733,12 @@ local function mutablevalues(ir)
     return mutable
 end
 
-function pass.run(ir)
-    local mutable = mutablevalues(ir)
+function pass.run(ir, check)
+    local mutable = mutablevalues(ir, check)
     ir.mutableObjects = mutable
 
     for id, v in pairs(ir.vals) do
+        if check then check() end
         id = ir:resolve(id)
         if id and not ir.dead[id] and v.kind == "def" and not mutable[id] then
             local u = ir:only(id)
@@ -6744,7 +6772,6 @@ end
 return pass
 ]===],
     ["main.passes.names"] = [===[
-
 local pass = {}
 
 function pass.run(ir)
@@ -6785,7 +6812,6 @@ return pass
 ]===],
     ["main.passes.pipeline"] = [===[
 
-
 local dead = require("main.passes.deadcode")
 local names = require("main.passes.names")
 local prov = require("main.passes.provenance")
@@ -6795,30 +6821,36 @@ local flow = require("main.passes.flow")
 
 local pipe = {}
 
-function pipe.run(ir, opt)
+function pipe.run(ir, opt, check)
     opt = opt or {}
 
 
-    if opt.dce ~= false then dead.run(ir) end
+    if check then check() end
+    if opt.dce ~= false then dead.run(ir, check) end
+    if check then check() end
 
 
     names.run(ir)
+    if check then check() end
     if opt.smartnames ~= false then
         prov.run(ir)
+        if check then check() end
     else
         ir.bestname, ir.namescore, ir.hints, ir.origin = {}, {}, {}, {}
     end
 
-    if opt.inline ~= false then inline.run(ir) end
+    if opt.inline ~= false then inline.run(ir, check) end
+    if check then check() end
     cond.run(ir)
+    if check then check() end
     flow.run(ir)
+    if check then check() end
     return ir
 end
 
 return pipe
 ]===],
     ["main.passes.provenance"] = [===[
-
 local lit = require("main.output.literals")
 local id = require("main.naming.identifiers")
 local rbx = require("main.naming.roblox")
@@ -7162,7 +7194,6 @@ end
 return pass
 ]===],
     ["main.passes.simplify"] = [===[
-
 local pass = {}
 
 function pass.run(ir)
@@ -7197,8 +7228,7 @@ end
 
 return pass
 ]===],
-    ["main.recover.branches"] = [===[
-local ins = require("main.bytecode.instructions")
+    ["main.recover.branches"] = [===[local ins = require("main.bytecode.instructions")
 local cond = require("main.recover.conditions")
 
 local branch = {}
@@ -7228,7 +7258,6 @@ end
 return branch
 ]===],
     ["main.recover.conditions"] = [===[
-
 local ins = require("main.bytecode.instructions")
 local ex = require("main.output.expr")
 local lit = require("main.output.literals")
@@ -7387,8 +7416,7 @@ end
 
 return cond
 ]===],
-    ["main.recover.functions"] = [===[
-local ins = require("main.bytecode.instructions")
+    ["main.recover.functions"] = [===[local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 
 local fn = {}
@@ -7528,7 +7556,6 @@ end
 return fn
 ]===],
     ["main.recover.guards"] = [===[
-
 local pass = {}
 
 local function term(block)
@@ -7567,7 +7594,6 @@ end
 return pass
 ]===],
     ["main.recover.loops"] = [===[
-
 local ins = require("main.bytecode.instructions")
 local cond = require("main.recover.conditions")
 
@@ -7636,7 +7662,6 @@ end
 return loops
 ]===],
     ["main.recover.tables"] = [===[
-
 local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 local ex = require("main.output.expr")
@@ -7733,7 +7758,6 @@ end
 return tab
 ]===],
     ["main.runtime.bytecode"] = [===[
-
 local bc = {}
 
 function bc.fromScript(obj)
@@ -7760,7 +7784,6 @@ end
 return bc
 ]===],
     ["main.runtime.core"] = [===[
-
 local core = {}
 
 local roots = {
@@ -7801,7 +7824,6 @@ end
 return core
 ]===],
     ["main.runtime.environment"] = [===[
-
 local env = {}
 
 function env.get()
@@ -7833,7 +7855,6 @@ end
 return env
 ]===],
     ["main.runtime.http"] = [===[
-
 local env = require("main.runtime.environment")
 
 local http = {}
@@ -7872,7 +7893,6 @@ end
 return http
 ]===],
     ["main.runtime.iridium"] = [===[
-
 local env = require("main.runtime.environment")
 local http = require("main.runtime.http")
 local patch = require("main.runtime.iridium_patch")
@@ -8103,7 +8123,6 @@ end
 return iri
 ]===],
     ["main.runtime.iridium_patch"] = [===[
-
 local patch = {}
 
 local rev = "v13-3"
@@ -8252,7 +8271,6 @@ end
 return patch
 ]===],
     ["main.runtime.status"] = [===[
-
 local st = {}
 
 local gui
@@ -10587,7 +10605,6 @@ return {
 }
 ]===],
     ["main.serialization.save"] = [===[
-
 local dex = require("main.serialization.dex_serializer")
 local st = require("main.runtime.status")
 local core = require("main.runtime.core")
@@ -10687,7 +10704,6 @@ end
 return save
 ]===],
     ["main.tree"] = [===[
-
 local tree = {}
 
 local win = {
@@ -10958,11 +10974,9 @@ end
 
 return tree
 ]===],
-    ["main.version"] = [===[
-return { name = "LumenDecomp", version = "4.0.0" }
+    ["main.version"] = [===[return { name = "LumenDecomp", version = "4.0.0" }
 ]===],
     ["main.worker"] = [===[
-
 local cfg = require("main.config")
 local iri = require("main.runtime.iridium")
 local decomp = require("main.decompiler.engine")
@@ -11012,7 +11026,6 @@ assert(type(loadstring) == "function", "LumenDecomp worker requires loadstring()
 
 local mod = {
     ["main.analysis.dominators"] = [===[
-
 local dom = {}
 
 local function equal(a, b)
@@ -11021,7 +11034,7 @@ local function equal(a, b)
     return true
 end
 
-function dom.compute(blocks)
+function dom.compute(blocks, check)
     local all = {}
     for _, block in ipairs(blocks) do all[block.id] = true end
 
@@ -11040,9 +11053,11 @@ function dom.compute(blocks)
 
     local chg = true
     while chg do
+        if check then check() end
         chg = false
 
         for _, block in ipairs(blocks) do
+            if check then check() end
             if block.id ~= 1 then
                 local set = nil
 
@@ -11075,8 +11090,7 @@ end
 
 return dom
 ]===],
-    ["main.analysis.graph"] = [===[
-local ins = require("main.bytecode.instructions")
+    ["main.analysis.graph"] = [===[local ins = require("main.bytecode.instructions")
 local regs = require("main.analysis.registers")
 local dom = require("main.analysis.dominators")
 local loops = require("main.analysis.loops")
@@ -11084,9 +11098,10 @@ local post = require("main.analysis.postdom")
 
 local graph = {}
 
-local function immediatefromsets(blocks, sets)
+local function immediatefromsets(blocks, sets, check)
     local out = {}
     for _, b in ipairs(blocks) do
+        if check then check() end
         local cand = {}
         for id in pairs(sets[b.id] or {}) do if id ~= b.id then cand[#cand + 1] = id end end
         table.sort(cand)
@@ -11101,9 +11116,10 @@ local function immediatefromsets(blocks, sets)
     return out
 end
 
-local function dominancefrontiers(blocks, idom)
+local function dominancefrontiers(blocks, idom, check)
     local df = {}; for _, b in ipairs(blocks) do df[b.id] = {} end
     for _, b in ipairs(blocks) do
+        if check then check() end
         if #b.predecessors >= 2 then
             for _, pred in ipairs(b.predecessors) do
                 local runner = pred
@@ -11119,9 +11135,10 @@ local function dominancefrontiers(blocks, idom)
     return df
 end
 
-local function tarjan(blocks)
+local function tarjan(blocks, check)
     local index, stack, onstack, idx, low, out = 0, {}, {}, {}, {}, {}
     local function visit(v)
+        if check then check() end
         index += 1; idx[v] = index; low[v] = index; stack[#stack + 1] = v; onstack[v] = true
         for _, w in ipairs(blocks[v].successors) do
             if not idx[w] then visit(w); low[v] = math.min(low[v], low[w])
@@ -11151,13 +11168,14 @@ local function tarjan(blocks)
     return out
 end
 
-local function loopforest(natural)
+local function loopforest(natural, check)
     local parent = {}
     local function subset(a, b)
         for id in pairs(a) do if not b[id] then return false end end
         return true
     end
     for i, loop in ipairs(natural) do
+        if check then check() end
         local best, bestsize
         local size = 0; for _ in pairs(loop.nodes) do size += 1 end
         for j, outer in ipairs(natural) do
@@ -11239,8 +11257,15 @@ local function verify(proto, aux, blocks, blockmap, nexts)
     return true
 end
 
-function graph.build(proto)
+function graph.build(proto, check, limits)
     local ops = proto.Instructions
+    limits = limits or {}
+    local maxinstructions = tonumber(limits.maxinstructions) or 0
+    local maxblocks = tonumber(limits.maxblocks) or 0
+    if maxinstructions > 0 and #ops > maxinstructions then
+        error("LumenV4: STRUCTURED_COMPLEXITY proto instructions " .. tostring(#ops) .. " > " .. tostring(maxinstructions), 2)
+    end
+    if check then check() end
     local aux = ins.auxSlots(proto)
     local leaders = { [1] = true }
     local nexts = {}
@@ -11326,11 +11351,15 @@ function graph.build(proto)
         for _, sid in ipairs(b.successors) do push(blocks[sid].predecessors, b.id) end
     end
 
-    local dominators = dom.compute(blocks)
-    local idom = immediatefromsets(blocks, dominators)
-    local postdom, ipdom, exitid = post.run(blocks)
-    local naturalloops = loops.find(blocks, dominators)
-    local sccs = tarjan(blocks)
+    if maxblocks > 0 and #blocks > maxblocks then
+        error("LumenV4: STRUCTURED_COMPLEXITY cfg blocks " .. tostring(#blocks) .. " > " .. tostring(maxblocks), 2)
+    end
+    if check then check() end
+    local dominators = dom.compute(blocks, check)
+    local idom = immediatefromsets(blocks, dominators, check)
+    local postdom, ipdom, exitid = post.run(blocks, check)
+    local naturalloops = loops.find(blocks, dominators, check)
+    local sccs = tarjan(blocks, check)
     local out = {
         proto = proto,
         aux = aux,
@@ -11339,12 +11368,12 @@ function graph.build(proto)
         nexts = nexts,
         dominators = dominators,
         idom = idom,
-        dominanceFrontiers = dominancefrontiers(blocks, idom),
+        dominanceFrontiers = dominancefrontiers(blocks, idom, check),
         postdom = postdom,
         ipdom = ipdom,
         exitId = exitid,
         loops = naturalloops,
-        loopForest = loopforest(naturalloops),
+        loopForest = loopforest(naturalloops, check),
         sccs = sccs,
         irreducible = false,
         registerStats = regs.stats(proto, aux),
@@ -11357,13 +11386,13 @@ end
 return graph
 ]===],
     ["main.analysis.loops"] = [===[
-
 local loops = {}
 
-function loops.find(blocks, dom)
+function loops.find(blocks, dom, check)
     local out = {}
 
     for _, latch in ipairs(blocks) do
+        if check then check() end
         for _, hid in ipairs(latch.successors) do
             if dom[latch.id] and dom[latch.id][hid] then
                 local set = { [hid] = true, [latch.id] = true }
@@ -11412,7 +11441,6 @@ end
 return loops
 ]===],
     ["main.analysis.postdom"] = [===[
-
 local post = {}
 
 local function clone(s)
@@ -11433,7 +11461,7 @@ local function intersectinto(dst, src)
     end
 end
 
-function post.run(blocks)
+function post.run(blocks, check)
     local exitid = #blocks + 1
     local all = { [exitid] = true }
     for _, b in ipairs(blocks) do all[b.id] = true end
@@ -11445,6 +11473,7 @@ function post.run(blocks)
     local iterations = 0
     local limit = math.max(64, (#blocks + 1) * (#blocks + 1) * 4)
     while dirty do
+        if check then check() end
         iterations += 1
         if iterations > limit then
             error("LumenV4: post-dominator analysis failed to converge", 2)
@@ -11476,6 +11505,7 @@ function post.run(blocks)
 
     local ip = {}
     for _, b in ipairs(blocks) do
+        if check then check() end
         local cand = {}
         for id in pairs(pd[b.id]) do
             if id ~= b.id then cand[#cand + 1] = id end
@@ -11503,8 +11533,7 @@ end
 
 return post
 ]===],
-    ["main.analysis.registers"] = [===[
-local ins = require("main.bytecode.instructions")
+    ["main.analysis.registers"] = [===[local ins = require("main.bytecode.instructions")
 
 local regs = {}
 
@@ -11616,8 +11645,7 @@ end
 
 return regs
 ]===],
-    ["main.analysis.ssa"] = [===[
-local graph = require("main.analysis.graph")
+    ["main.analysis.ssa"] = [===[local graph = require("main.analysis.graph")
 local regs = require("main.analysis.registers")
 
 local ssa = {}
@@ -11640,7 +11668,7 @@ end
 local ambig = {}
 
 
-local function packflow(proto, cfg)
+local function packflow(proto, cfg, check)
     local pin, pout, before, consumer = {}, {}, {}, {}
     local changed, iterations = true, 0
     local limit = math.max(64, (#cfg.blocks + 1) * 256)
@@ -11657,6 +11685,7 @@ local function packflow(proto, cfg)
     end
 
     while changed do
+        if check then check() end
         iterations += 1
         if iterations > limit then error("LumenV4: ValuePack dataflow failed to converge", 2) end
         changed = false
@@ -11690,7 +11719,7 @@ local function packflow(proto, cfg)
     return pin, pout, before, consumer, ambig
 end
 
-local function liveness(proto, cfg, packinput, ambiguous)
+local function liveness(proto, cfg, packinput, ambiguous, check)
     local use, def, lin, lout = {}, {}, {}, {}
     for _, b in ipairs(cfg.blocks) do
         local u, d = {}, {}
@@ -11717,6 +11746,7 @@ local function liveness(proto, cfg, packinput, ambiguous)
     local iterations = 0
     local limit = math.max(64, #cfg.blocks * 512)
     while changed do
+        if check then check() end
         iterations += 1
         if iterations > limit then error("LumenV4: liveness failed to converge", 2) end
         changed = false
@@ -11757,10 +11787,10 @@ local function liveness(proto, cfg, packinput, ambiguous)
     return lin, lout, after
 end
 
-function ssa.build(proto, cfg)
-    cfg = cfg or graph.build(proto)
-    local packinblock, packoutblock, packbefore, packinput, ambiguouspack = packflow(proto, cfg)
-    local livein, liveout, liveafter = liveness(proto, cfg, packinput, ambiguouspack)
+function ssa.build(proto, cfg, check, limits)
+    cfg = cfg or graph.build(proto, check, limits)
+    local packinblock, packoutblock, packbefore, packinput, ambiguouspack = packflow(proto, cfg, check)
+    local livein, liveout, liveafter = liveness(proto, cfg, packinput, ambiguouspack, check)
     local result = {
         proto = proto, cfg = cfg, params = {}, defsByPC = {}, usesByPC = {}, versions = {}, phisByBlock = {},
         inVersions = {}, outVersions = {}, useCount = {}, defUse = {}, undefByReg = {}, packsByPC = {},
@@ -11786,6 +11816,7 @@ function ssa.build(proto, cfg)
 
 
     for _, b in ipairs(cfg.blocks) do
+        if check then check() end
         for _, pc in ipairs(b.pcs) do
             local _, writes, pack = regs.readWrite(proto.Instructions[pc])
             result.packsByPC[pc] = next(pack) and pack or nil
@@ -11839,6 +11870,7 @@ function ssa.build(proto, cfg)
     local changed, iterations = true, 0
     local limit = math.max(128, (#cfg.blocks + 1) * 1024)
     while changed do
+        if check then check() end
         iterations += 1
         if iterations > limit then error("LumenV4: SSA failed to converge", 2) end
         changed = false
@@ -11965,7 +11997,6 @@ end
 return ssa
 ]===],
     ["main.ast.booleans"] = [===[
-
 local pass = {}
 
 local function val(n)
@@ -12030,7 +12061,6 @@ end
 return pass
 ]===],
     ["main.ast.callbacks"] = [===[
-
 local pass = {}
 
 local function esc(s)
@@ -12126,7 +12156,6 @@ end
 return pass
 ]===],
     ["main.ast.compound"] = [===[
-
 local pass = {}
 
 local list = {
@@ -12169,7 +12198,6 @@ end
 return pass
 ]===],
     ["main.ast.conditions"] = [===[
-
 local pass = {}
 
 local function same(a, b)
@@ -12226,7 +12254,6 @@ end
 return pass
 ]===],
     ["main.ast.deadcode"] = [===[
-
 local pass = {}
 
 local function walk(block)
@@ -12255,7 +12282,6 @@ end
 return pass
 ]===],
     ["main.ast.doblocks"] = [===[
-
 local pass = {}
 
 local function words(s, out)
@@ -12418,7 +12444,6 @@ end
 return pass
 ]===],
     ["main.ast.fold"] = [===[
-
 local pass = {}
 
 local function bool(s)
@@ -12483,7 +12508,6 @@ end
 return pass
 ]===],
     ["main.ast.guards2"] = [===[
-
 local pass = {}
 
 local inv = {
@@ -12546,7 +12570,6 @@ end
 return pass
 ]===],
     ["main.ast.inline"] = [===[
-
 local pass = {}
 
 local function init(n)
@@ -12644,7 +12667,6 @@ end
 return pass
 ]===],
     ["main.ast.locals"] = [===[
-
 local pass = {}
 
 local function walk(block)
@@ -12684,7 +12706,6 @@ end
 return pass
 ]===],
     ["main.ast.logic"] = [===[
-
 local pass = {}
 
 local inv = {
@@ -12735,7 +12756,6 @@ end
 return pass
 ]===],
     ["main.ast.lower"] = [===[
-
 local n = require("main.ast.nodes")
 
 local build = {}
@@ -12875,7 +12895,6 @@ end
 return build
 ]===],
     ["main.ast.nodes"] = [===[
-
 local n = {}
 
 function n.block()
@@ -12919,7 +12938,6 @@ return n
     ["main.ast.pipeline"] = [===[
 
 
-
 local pass = {}
 
 function pass.run(root, opt)
@@ -12929,7 +12947,6 @@ end
 return pass
 ]===],
     ["main.ast.printer"] = [===[
-
 local printast = {}
 
 local function esc(s)
@@ -13054,7 +13071,6 @@ end
 return printast
 ]===],
     ["main.ast.returns"] = [===[
-
 local pass = {}
 
 local function ret(b)
@@ -13113,7 +13129,6 @@ end
 return pass
 ]===],
     ["main.ast.selects"] = [===[
-
 local pass = {}
 
 local function asn(node)
@@ -13190,7 +13205,6 @@ end
 return pass
 ]===],
     ["main.bytecode.instructions"] = [===[
-
 local ins = {}
 
 local conditional = {
@@ -13279,7 +13293,6 @@ end
 return ins
 ]===],
     ["main.config"] = [===[
-
 local base = {
     aggressive = false,
     fold = true,
@@ -13299,6 +13312,10 @@ local base = {
     doblocks = 0,
     iridium = nil,
     fidelity = true,
+    structuredbudget = 1.25,
+    structuredmaxinstructions = 8000,
+    structuredmaxprotoinstructions = 4000,
+    structuredmaxblocks = 256,
 }
 
 local map = {
@@ -13309,6 +13326,10 @@ local map = {
     ConditionalStructurer = "conditions",
     DoBlockInsertionThreshold = "doblocks",
     FidelityMode = "fidelity",
+    StructuredBudgetSeconds = "structuredbudget",
+    StructuredMaxInstructions = "structuredmaxinstructions",
+    StructuredMaxProtoInstructions = "structuredmaxprotoinstructions",
+    StructuredMaxBlocks = "structuredmaxblocks",
 }
 
 return function(opt)
@@ -13316,6 +13337,10 @@ return function(opt)
     for k, v in pairs(base) do out[k] = v end
     if opt then for k, v in pairs(opt) do out[map[k] or k] = v end end
     out.doblocks = math.max(0, math.floor(tonumber(out.doblocks) or 0))
+    out.structuredbudget = math.max(0, tonumber(out.structuredbudget) or 1.25)
+    out.structuredmaxinstructions = math.max(0, math.floor(tonumber(out.structuredmaxinstructions) or 8000))
+    out.structuredmaxprotoinstructions = math.max(0, math.floor(tonumber(out.structuredmaxprotoinstructions) or 4000))
+    out.structuredmaxblocks = math.max(0, math.floor(tonumber(out.structuredmaxblocks) or 256))
     if out.fidelity ~= false then
 
         out.fold = false
@@ -13332,7 +13357,6 @@ return function(opt)
 end
 ]===],
     ["main.decompiler.context"] = [===[
-
 local ins = require("main.bytecode.instructions")
 local ex = require("main.output.expr")
 local lit = require("main.output.literals")
@@ -13732,8 +13756,7 @@ end
 
 return ctx
 ]===],
-    ["main.decompiler.engine"] = [===[
-local irbuild = require("main.ir.build")
+    ["main.decompiler.engine"] = [===[local irbuild = require("main.ir.build")
 local irpass = require("main.passes.pipeline")
 local names = require("main.naming.resolver")
 local lower = require("main.ast.lower")
@@ -13921,7 +13944,7 @@ local function closurechild(parsed, proto, op, byobject)
     end
 end
 
-local function emitprotofactory(out, parsed, proto, id, byobject)
+local function emitprotofactory(out, parsed, proto, id, byobject, pulse)
     local pcs, slots = realpcs(proto)
     local maxstack = math.max(1, tonumber(proto.MaxStackSize) or 255)
     local params = math.max(0, tonumber(proto.ParameterCount) or 0)
@@ -13970,6 +13993,7 @@ local function emitprotofactory(out, parsed, proto, id, byobject)
 
     local consumedcaptures = {}
     for _, pc in ipairs(pcs) do
+        if pulse then pulse() end
         local op = proto.Instructions[pc]
         local name = ins.name(op)
         if name == "NEWCLOSURE" or name == "DUPCLOSURE" then
@@ -13983,6 +14007,7 @@ local function emitprotofactory(out, parsed, proto, id, byobject)
 
     local branchindex = 0
     for _, pc in ipairs(pcs) do
+        if pulse then pulse() end
         if not consumedcaptures[pc] then
             local op = proto.Instructions[pc]
             local name = ins.name(op)
@@ -14224,9 +14249,18 @@ end
 
 function vm.run(parsed, reason)
     local entry = assert(parsed and parsed.Protos and parsed.Protos[parsed.ProtoEntryPoint], "LumenV4 VM fallback: missing entry proto")
+    local slice = os.clock()
+    local function pulse(force)
+        local now = os.clock()
+        if force or now - slice >= 0.008 then
+            if task and type(task.wait) == "function" then task.wait() end
+            slice = os.clock()
+        end
+    end
     local byobject = protomap(parsed)
     local decoded = 0
     for _, proto in ipairs(parsed.Protos or {}) do
+        pulse()
         local pcs = realpcs(proto)
         decoded += #pcs
     end
@@ -14405,7 +14439,8 @@ function vm.run(parsed, reason)
         "",
     }
 
-    for i, proto in ipairs(parsed.Protos or {}) do emitprotofactory(out, parsed, proto, i, byobject) end
+    for i, proto in ipairs(parsed.Protos or {}) do pulse(); emitprotofactory(out, parsed, proto, i, byobject, pulse) end
+    pulse(true)
     local entryid = byobject[entry] or parsed.ProtoEntryPoint
     line(out, 0, "return (__factory[" .. tostring(entryid) .. "]({}))()")
 
@@ -14446,12 +14481,31 @@ local function hashard(st)
     return #st.bad > 0
 end
 
-function decomp.new(opt) return setmetatable({ opt = opt or {} }, decomp) end
+function decomp.new(opt) return setmetatable({ opt = opt or {}, deadline = nil, slice = os.clock() }, decomp) end
+
+function decomp:_check()
+    local now = os.clock()
+    if now - (self.slice or now) >= 0.008 then
+        if task and type(task.wait) == "function" then task.wait() end
+        self.slice = os.clock()
+        now = self.slice
+    end
+    if self.deadline and now > self.deadline then
+        error("LumenV4: STRUCTURED_BUDGET exceeded", 2)
+    end
+end
 
 function decomp:_state(proto, up, ph)
-    local ir = irbuild.run(proto)
+    self:_check()
+    local limits = {
+        maxinstructions = self.opt.structuredmaxprotoinstructions or self.opt.structuredmaxinstructions,
+        maxblocks = self.opt.structuredmaxblocks,
+    }
+    local ir = irbuild.run(proto, function() self:_check() end, limits)
     ir.paramhints = ph or {}
-    ir = irpass.run(ir, self.opt)
+    self:_check()
+    ir = irpass.run(ir, self.opt, function() self:_check() end)
+    self:_check()
     local naming = names.new(ir.cfg.registerStats, self.opt, proto)
     local st = context.new(proto, ir, naming, up, lower.new(), self.opt)
     st.v4 = { fallback = false, visited = {}, status = "STRUCTURED", cellNames = {} }
@@ -14633,6 +14687,7 @@ function decomp:_op(st, pc)
 end
 
 function decomp:_child(proto, up, ph)
+    self:_check()
     local st = self:_state(proto, up, ph)
     local args = arguments(st, proto)
     preparepacks(st)
@@ -14651,7 +14706,9 @@ function decomp:_child(proto, up, ph)
         end
     end
 
+    self:_check()
     local root = astpass.run(st.ast:done(), self.opt)
+    self:_check()
     return root, st, args
 end
 
@@ -14740,7 +14797,10 @@ end
 
 function decomp:_region(st, start, stop, active)
     local pc = start; active = active or {}
+    local budgettick = 0
     while pc < stop and pc <= #st.proto.Instructions do
+        budgettick += 1
+        if budgettick >= 64 then budgettick = 0; self:_check() end
         if st.cfg.aux[pc] then pc += 1
         elseif st.consumed[pc] then st.v4.visited[pc] = true; pc += 1
         else
@@ -14942,14 +15002,33 @@ function decomp:decompileParsed(parsed)
     assert(proto, "LumenV4: parsed bytecode has no entry proto")
     self.parsed = parsed
 
-    local ok, src, info = pcall(function() return self:decompileProto(proto, {}) end)
-    if ok then
-        self.parsed = nil
-        return src, info
+    local totalinstructions = 0
+    local maxprotoinstructions = 0
+    for _, p in ipairs(parsed.Protos or {}) do
+        local n = #(p.Instructions or {})
+        totalinstructions += n
+        if n > maxprotoinstructions then maxprotoinstructions = n end
+    end
+    local maxtotal = tonumber(self.opt.structuredmaxinstructions) or 8000
+    local maxproto = tonumber(self.opt.structuredmaxprotoinstructions) or 4000
+    local structurederror
+    if (maxtotal > 0 and totalinstructions > maxtotal) or (maxproto > 0 and maxprotoinstructions > maxproto) then
+        structurederror = "LumenV4: STRUCTURED_COMPLEXITY total=" .. tostring(totalinstructions) .. " maxproto=" .. tostring(maxprotoinstructions)
+    else
+        local budget = tonumber(self.opt.structuredbudget) or 1.25
+        self.slice = os.clock()
+        self.deadline = budget > 0 and (self.slice + budget) or nil
+        local ok, src, info = pcall(function() return self:decompileProto(proto, {}) end)
+        self.deadline = nil
+        if ok then
+            self.parsed = nil
+            return src, info
+        end
+        structurederror = tostring(src)
     end
 
-
-    local structurederror = tostring(src)
+    self.deadline = nil
+    self.slice = os.clock()
     local fok, fsrc, finfo = pcall(function()
         return vmfallback.run(parsed, structurederror)
     end)
@@ -14965,7 +15044,6 @@ end
 return decomp
 ]===],
     ["main.decompiler.ops"] = [===[
-
 local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 local ex = require("main.output.expr")
@@ -15262,7 +15340,6 @@ end
 return ops
 ]===],
     ["main.ir.block"] = [===[
-
 local block = {}
 block.__index = block
 
@@ -15280,8 +15357,7 @@ end
 
 return block
 ]===],
-    ["main.ir.build"] = [===[
-local graph = require("main.analysis.graph")
+    ["main.ir.build"] = [===[local graph = require("main.analysis.graph")
 local ssa = require("main.analysis.ssa")
 local regs = require("main.analysis.registers")
 local ins = require("main.bytecode.instructions")
@@ -15322,7 +15398,7 @@ local function stateeq(a, b)
 end
 
 
-local function analyzecells(out)
+local function analyzecells(out, check)
     local capturecell, capturereg, nextcell = {}, {}, 1
     for _, n in ipairs(out.ops) do
         if n.name == "CAPTURE" and n.op.A == 1 then
@@ -15370,6 +15446,7 @@ local function analyzecells(out)
     local changed, iterations = true, 0
     local limit = math.max(32, #out.cfg.blocks * (nextcell + 8) * 4)
     while changed do
+        if check then check() end
         iterations += 1
         if iterations > limit then error("LumenV4: CellId dataflow failed to converge", 2) end
         changed = false
@@ -15475,7 +15552,7 @@ local function analyzecells(out)
     return out
 end
 
-local function analyzeobjects(out)
+local function analyzeobjects(out, check)
     local sets, objects, nextobject = {}, {}, 1
     local function def(pc, reg)
         local d = out.ssa.defsByPC[pc]; return d and d[reg] or nil
@@ -15503,6 +15580,7 @@ local function analyzeobjects(out)
     local changed, iterations = true, 0
     local limit = math.max(32, #out.ops * 8 + 32)
     while changed do
+        if check then check() end
         iterations += 1; if iterations > limit then error("LumenV4: ObjectId propagation failed to converge", 2) end
         changed = false
         for _, n in ipairs(out.ops) do
@@ -15568,9 +15646,9 @@ local function analyzeobjects(out)
     return out
 end
 
-function build.run(proto)
-    local cfg = graph.build(proto)
-    local flow = ssa.build(proto, cfg)
+function build.run(proto, check, limits)
+    local cfg = graph.build(proto, check, limits)
+    local flow = ssa.build(proto, cfg, check, limits)
     assert(flow.converged, "LumenV4: refusing non-converged SSA")
     local out = fn.new(proto, cfg, flow)
     for id, src in ipairs(flow.versions) do
@@ -15596,14 +15674,13 @@ function build.run(proto)
         end
     end
     out:reindex()
-    analyzecells(out)
-    analyzeobjects(out)
+    analyzecells(out, check)
+    analyzeobjects(out, check)
     return out
 end
 return build
 ]===],
     ["main.ir.effects"] = [===[
-
 local fx = {}
 
 local relocatable = {
@@ -15665,7 +15742,6 @@ function fx.canRelocate(name) return relocatable[name] == true end
 return fx
 ]===],
     ["main.ir.function"] = [===[
-
 local fn = {}
 fn.__index = fn
 
@@ -15762,7 +15838,6 @@ end
 return fn
 ]===],
     ["main.ir.value"] = [===[
-
 local val = {}
 val.__index = val
 
@@ -15784,7 +15859,6 @@ end
 return val
 ]===],
     ["main.naming.debug_names"] = [===[
-
 local id = require("main.naming.identifiers")
 
 local dbg = {}
@@ -15833,7 +15907,6 @@ end
 return dbg
 ]===],
     ["main.naming.identifiers"] = [===[
-
 local id = {}
 
 local kw = {
@@ -15879,7 +15952,6 @@ end
 return id
 ]===],
     ["main.naming.resolver"] = [===[
-
 local id = require("main.naming.identifiers")
 local rbx = require("main.naming.roblox")
 local dbg = require("main.naming.debug_names")
@@ -15997,7 +16069,6 @@ names.fromCall = rbx.fromCall
 return names
 ]===],
     ["main.naming.roblox"] = [===[
-
 local id = require("main.naming.identifiers")
 local words = require("main.naming.words")
 
@@ -16087,7 +16158,6 @@ end
 return rbx
 ]===],
     ["main.naming.types"] = [===[
-
 local id = require("main.naming.identifiers")
 
 local types = {}
@@ -16164,7 +16234,6 @@ end
 return types
 ]===],
     ["main.naming.words"] = [===[
-
 local id = require("main.naming.identifiers")
 
 local w = {}
@@ -16248,7 +16317,6 @@ end
 return w
 ]===],
     ["main.output.expr"] = [===[
-
 local expr = {}
 
 local prec = {
@@ -16332,7 +16400,6 @@ end
 return expr
 ]===],
     ["main.output.literals"] = [===[
-
 local id = require("main.naming.identifiers")
 
 local lit = {}
@@ -16435,7 +16502,6 @@ end
 return lit
 ]===],
     ["main.passes.conditions"] = [===[
-
 local ins = require("main.bytecode.instructions")
 
 local pass = {}
@@ -16459,7 +16525,6 @@ end
 return pass
 ]===],
     ["main.passes.constants"] = [===[
-
 local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 
@@ -16589,10 +16654,9 @@ end
 return pass
 ]===],
     ["main.passes.deadcode"] = [===[
-
 local pass = {}
 
-function pass.run(ir)
+function pass.run(ir, check)
     local memo = {}
     local function live(id, seen)
         id = ir:resolve(id)
@@ -16618,6 +16682,7 @@ function pass.run(ir)
     end
 
     for id, v in pairs(ir.vals) do
+        if check then check() end
         id = ir:resolve(id)
         if id and not ir.dead[id] and not live(id) then
             local pc = v.pc
@@ -16631,7 +16696,6 @@ end
 return pass
 ]===],
     ["main.passes.flow"] = [===[
-
 local pass = {}
 
 function pass.run(ir)
@@ -16645,8 +16709,7 @@ end
 
 return pass
 ]===],
-    ["main.passes.inline"] = [===[
-local ins = require("main.bytecode.instructions")
+    ["main.passes.inline"] = [===[local ins = require("main.bytecode.instructions")
 
 local pass = {}
 
@@ -16660,7 +16723,7 @@ local function quiet(ir, a, b)
     return true
 end
 
-local function mutablevalues(ir)
+local function mutablevalues(ir, check)
     local mutable = {}
     local changed = true
 
@@ -16681,6 +16744,7 @@ local function mutablevalues(ir)
     end
 
     while changed do
+        if check then check() end
         changed = false
         for _, n in ipairs(ir.ops) do
             if n.name == "MOVE" then
@@ -16706,11 +16770,12 @@ local function mutablevalues(ir)
     return mutable
 end
 
-function pass.run(ir)
-    local mutable = mutablevalues(ir)
+function pass.run(ir, check)
+    local mutable = mutablevalues(ir, check)
     ir.mutableObjects = mutable
 
     for id, v in pairs(ir.vals) do
+        if check then check() end
         id = ir:resolve(id)
         if id and not ir.dead[id] and v.kind == "def" and not mutable[id] then
             local u = ir:only(id)
@@ -16744,7 +16809,6 @@ end
 return pass
 ]===],
     ["main.passes.names"] = [===[
-
 local pass = {}
 
 function pass.run(ir)
@@ -16785,7 +16849,6 @@ return pass
 ]===],
     ["main.passes.pipeline"] = [===[
 
-
 local dead = require("main.passes.deadcode")
 local names = require("main.passes.names")
 local prov = require("main.passes.provenance")
@@ -16795,30 +16858,36 @@ local flow = require("main.passes.flow")
 
 local pipe = {}
 
-function pipe.run(ir, opt)
+function pipe.run(ir, opt, check)
     opt = opt or {}
 
 
-    if opt.dce ~= false then dead.run(ir) end
+    if check then check() end
+    if opt.dce ~= false then dead.run(ir, check) end
+    if check then check() end
 
 
     names.run(ir)
+    if check then check() end
     if opt.smartnames ~= false then
         prov.run(ir)
+        if check then check() end
     else
         ir.bestname, ir.namescore, ir.hints, ir.origin = {}, {}, {}, {}
     end
 
-    if opt.inline ~= false then inline.run(ir) end
+    if opt.inline ~= false then inline.run(ir, check) end
+    if check then check() end
     cond.run(ir)
+    if check then check() end
     flow.run(ir)
+    if check then check() end
     return ir
 end
 
 return pipe
 ]===],
     ["main.passes.provenance"] = [===[
-
 local lit = require("main.output.literals")
 local id = require("main.naming.identifiers")
 local rbx = require("main.naming.roblox")
@@ -17162,7 +17231,6 @@ end
 return pass
 ]===],
     ["main.passes.simplify"] = [===[
-
 local pass = {}
 
 function pass.run(ir)
@@ -17197,8 +17265,7 @@ end
 
 return pass
 ]===],
-    ["main.recover.branches"] = [===[
-local ins = require("main.bytecode.instructions")
+    ["main.recover.branches"] = [===[local ins = require("main.bytecode.instructions")
 local cond = require("main.recover.conditions")
 
 local branch = {}
@@ -17228,7 +17295,6 @@ end
 return branch
 ]===],
     ["main.recover.conditions"] = [===[
-
 local ins = require("main.bytecode.instructions")
 local ex = require("main.output.expr")
 local lit = require("main.output.literals")
@@ -17387,8 +17453,7 @@ end
 
 return cond
 ]===],
-    ["main.recover.functions"] = [===[
-local ins = require("main.bytecode.instructions")
+    ["main.recover.functions"] = [===[local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 
 local fn = {}
@@ -17528,7 +17593,6 @@ end
 return fn
 ]===],
     ["main.recover.guards"] = [===[
-
 local pass = {}
 
 local function term(block)
@@ -17567,7 +17631,6 @@ end
 return pass
 ]===],
     ["main.recover.loops"] = [===[
-
 local ins = require("main.bytecode.instructions")
 local cond = require("main.recover.conditions")
 
@@ -17636,7 +17699,6 @@ end
 return loops
 ]===],
     ["main.recover.tables"] = [===[
-
 local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 local ex = require("main.output.expr")
@@ -17733,7 +17795,6 @@ end
 return tab
 ]===],
     ["main.runtime.environment"] = [===[
-
 local env = {}
 
 function env.get()
@@ -17765,7 +17826,6 @@ end
 return env
 ]===],
     ["main.runtime.http"] = [===[
-
 local env = require("main.runtime.environment")
 
 local http = {}
@@ -17804,7 +17864,6 @@ end
 return http
 ]===],
     ["main.runtime.iridium"] = [===[
-
 local env = require("main.runtime.environment")
 local http = require("main.runtime.http")
 local patch = require("main.runtime.iridium_patch")
@@ -18035,7 +18094,6 @@ end
 return iri
 ]===],
     ["main.runtime.iridium_patch"] = [===[
-
 local patch = {}
 
 local rev = "v13-3"
@@ -18184,7 +18242,6 @@ end
 return patch
 ]===],
     ["main.worker"] = [===[
-
 local cfg = require("main.config")
 local iri = require("main.runtime.iridium")
 local decomp = require("main.decompiler.engine")

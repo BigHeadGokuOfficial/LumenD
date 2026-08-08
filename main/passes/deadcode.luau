@@ -1,7 +1,7 @@
 
 local pass = {}
 
-function pass.run(ir)
+function pass.run(ir, check)
     local memo = {}
     local function live(id, seen)
         id = ir:resolve(id)
@@ -27,6 +27,7 @@ function pass.run(ir)
     end
 
     for id, v in pairs(ir.vals) do
+        if check then check() end
         id = ir:resolve(id)
         if id and not ir.dead[id] and not live(id) then
             local pc = v.pc

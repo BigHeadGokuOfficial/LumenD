@@ -12,7 +12,7 @@ local function quiet(ir, a, b)
     return true
 end
 
-local function mutablevalues(ir)
+local function mutablevalues(ir, check)
     local mutable = {}
     local changed = true
 
@@ -33,6 +33,7 @@ local function mutablevalues(ir)
     end
 
     while changed do
+        if check then check() end
         changed = false
         for _, n in ipairs(ir.ops) do
             if n.name == "MOVE" then
@@ -58,11 +59,12 @@ local function mutablevalues(ir)
     return mutable
 end
 
-function pass.run(ir)
-    local mutable = mutablevalues(ir)
+function pass.run(ir, check)
+    local mutable = mutablevalues(ir, check)
     ir.mutableObjects = mutable
 
     for id, v in pairs(ir.vals) do
+        if check then check() end
         id = ir:resolve(id)
         if id and not ir.dead[id] and v.kind == "def" and not mutable[id] then
             local u = ir:only(id)

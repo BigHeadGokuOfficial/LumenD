@@ -7,7 +7,7 @@ local function equal(a, b)
     return true
 end
 
-function dom.compute(blocks)
+function dom.compute(blocks, check)
     local all = {}
     for _, block in ipairs(blocks) do all[block.id] = true end
 
@@ -26,9 +26,11 @@ function dom.compute(blocks)
 
     local chg = true
     while chg do
+        if check then check() end
         chg = false
 
         for _, block in ipairs(blocks) do
+            if check then check() end
             if block.id ~= 1 then
                 local set = nil
 
