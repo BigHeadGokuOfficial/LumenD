@@ -830,7 +830,6 @@ Serializer = (function()
 		end,
 	}
 
-	-- Lumen compatibility: newer API dumps may call the string-backed type Content.
 	binaryPropHandlers.Content = binaryPropHandlers.ContentId
 
 	local specialProps = {
@@ -1053,7 +1052,6 @@ Serializer = (function()
 			return decompile(scr,nil,saveSettings.DecompileTimeout)
 		end
 
-		-- Compatibility timeout for legacy callback-style decompilers.
 		task.spawn(function()
 			task.wait(saveSettings.DecompileTimeout + 1)
 			if not finished then
@@ -2020,9 +2018,6 @@ Main = (function()
 		local api = service.HttpService:JSONDecode(rawAPI)
 		local classes,enums = {},{}
 
-		-- Lumen patch: create every class shell first. The original serializer
-		-- linked Superclass while iterating the dump, which implicitly depended
-		-- on parent classes appearing before subclasses.
 		for _,class in pairs(api.Classes) do
 			classes[class.Name] = {
 				Name = class.Name,

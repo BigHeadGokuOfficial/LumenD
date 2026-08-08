@@ -22,6 +22,19 @@ function types.hint(info)
     return map[name] or id.lowerCamel(name:gsub("^userdata#", "obj"))
 end
 
+function types.text(info)
+    if not info then return nil end
+    local name = info.UserdataName or info.Name
+    if not name then return nil end
+    local safe = { boolean = true, number = true, string = true, buffer = true, integer = true, any = true }
+    local out
+    if info.UserdataName and id.valid(info.UserdataName) then out = info.UserdataName
+    elseif safe[name] then out = name end
+    if not out then return nil end
+    if info.IsOptional and out ~= "any" then out = out .. "?" end
+    return out
+end
+
 function types.ranges(proto)
     local out = {}
     for _, info in ipairs(proto and proto.LocalTypes or {}) do

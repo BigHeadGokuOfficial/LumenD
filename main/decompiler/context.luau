@@ -2,6 +2,7 @@ local ins = require("main.bytecode.instructions")
 local ex = require("main.output.expr")
 local lit = require("main.output.literals")
 local tab = require("main.recover.tables")
+local ty = require("main.naming.types")
 
 local ctx = {}
 ctx.__index = ctx
@@ -35,7 +36,8 @@ function ctx.new(proto, ir, naming, up, ast, opt)
 
     for _, name in ipairs(self.up) do naming:reserve(name) end
     for r = 0, (proto.ParameterCount or 0) - 1 do
-        local name = naming:nameAt(r, 1, nil)
+        local v = ir.ssa.params[r]
+        local name = self:vname(v, r, nil, 1)
         self.declared[name] = 0
     end
     return self
@@ -49,6 +51,16 @@ function ctx:trim(depth)
     for name, d in pairs(self.declared) do
         if d >= depth then self.declared[name] = nil end
     end
+end
+
+function ctx:ann(r, pc)
+    if self.opt.types == false then return nil end
+    return ty.text(self.naming:typeAt(r, pc))
+end
+
+function ctx:paramann(r)
+    if self.opt.types == false then return nil end
+    return ty.text(ty.param(self.proto, r))
 end
 
 function ctx:badpc(pc, msg)
@@ -68,22 +80,33 @@ function ctx:quiet(a, b)
 end
 
 function ctx:vname(v, r, hint, pc)
-    v = self.ir:nameid(v)
+    local raw = self.ir:resolve(v)
+    v = self.ir:nameid(raw)
     if not v then return self.naming:nameAt(r, pc or 1, hint) end
     local old = self.vnames[v]
     if old then return old end
 
-    local dbg = pc and self.naming:debugAt(r, pc) or nil
-    local typed = pc and self.naming:typeAt(r, pc) or nil
-    local src = self.ir.vals[self.ir:resolve(v)]
+    local di = pc and self.naming:debugAt(r, pc) or nil
+    local ti = pc and self.naming:typeAt(r, pc) or nil
+    local src = raw and self.ir.vals[raw] or nil
+    local best = self.ir.bestname and self.ir.bestname[v] or nil
+    local score = self.ir.namescore and self.ir.namescore[v] or 0
     local name
 
-    if dbg or typed then
-        name = self.naming:nameAt(r, pc, hint)
+    if di then
+        name = self.naming:nameAt(r, pc, nil)
+    elseif best and score >= 80 then
+        name = self.naming:unique(best)
+    elseif ti then
+        name = self.naming:nameAt(r, pc, hint or best)
+    elseif best and score >= 55 then
+        name = self.naming:unique(best)
     elseif src and src.kind == "param" then
-        name = self.naming:nameAt(r, 1, hint)
+        name = self.naming:unique(hint or (score >= 55 and best or nil) or ("arg" .. tostring(src.reg + 1)))
     elseif hint then
         name = self.naming:unique(hint)
+    elseif best then
+        name = self.naming:unique(best)
     else
         repeat
             name = "v" .. tostring(self.nexttmp)
@@ -162,6 +185,12 @@ function ctx:inline(pc, r, node)
     local u = self.ir:only(v)
     if not u or not u.pc then return false end
     if node.stable then return true end
+    local defop = self.ir.bypc[pc]
+    local useop = self.ir.bypc[u.pc]
+    if defop and useop and (defop.name == "GETGLOBAL" or defop.name == "GETIMPORT")
+        and (useop.name == "CALL" or useop.name == "CALLFB") and useop.op.A == r then
+        return true
+    end
     if u.pc == self:next(pc) then return true end
     return self:quiet(pc, u.pc)
 end
@@ -172,12 +201,12 @@ function ctx:set(pc, r, node, hint, raw)
     if v and self.ir.dead[v] then
         self.vals[v] = node
         if raw ~= nil then self.str[v] = raw end
-        return self:defName(pc, r, hint)
+        return nil
     end
     if v and self:inline(pc, r, node) then
         self.vals[v] = node
         if raw ~= nil then self.str[v] = raw end
-        return self:defName(pc, r, hint)
+        return nil
     end
 
     local name = self:defName(pc, r, hint)
@@ -186,7 +215,8 @@ function ctx:set(pc, r, node, hint, raw)
     local stmt
     if fresh then
         self.declared[name] = self.indent
-        stmt = self:out("local " .. name .. " = " .. ex.str(node))
+        local an = self:ann(r, pc)
+        stmt = self:out("local " .. name .. (an and (": " .. an) or "") .. " = " .. ex.str(node))
     else
         stmt = self:out(name .. " = " .. ex.str(node))
     end
@@ -202,7 +232,8 @@ function ctx:decl(r, hint, pc)
     local depth = self.declared[name]
     if depth == nil or depth > self.indent then
         self.declared[name] = self.indent
-        self:out("local " .. name)
+        local an = self:ann(r, pc)
+        self:out("local " .. name .. (an and (": " .. an) or ""))
     end
     return name
 end
@@ -222,8 +253,13 @@ function ctx:multi(pc, regs, rhs, hints, node)
         end
     end
     if fresh == #list then
-        for _, name in ipairs(list) do self.declared[name] = self.indent end
-        nodes[#nodes + 1] = self:out("local " .. table.concat(list, ", ") .. " = " .. rhs)
+        local typed = {}
+        for i, name in ipairs(list) do
+            self.declared[name] = self.indent
+            local an = self:ann(regs[i], pc)
+            typed[i] = name .. (an and (": " .. an) or "")
+        end
+        nodes[#nodes + 1] = self:out("local " .. table.concat(typed, ", ") .. " = " .. rhs)
     else
         if fresh > 0 then
             for _, name in ipairs(list) do
@@ -267,6 +303,7 @@ function ctx:hide(v)
     if not e or not e.fresh or not e.node then return false end
     e.node.dead = true
     if self.declared[e.name] == e.depth then self.declared[e.name] = nil end
+    self.naming:release(e.name)
     return true
 end
 
@@ -289,6 +326,7 @@ function ctx:hidegroup(g, pc, loop, regs)
     for _, node in ipairs(g.nodes) do if node then node.dead = true end end
     for _, name in ipairs(g.new) do
         if self.declared[name] == g.depth then self.declared[name] = nil end
+        self.naming:release(name)
     end
     return true
 end

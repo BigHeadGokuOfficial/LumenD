@@ -14,11 +14,11 @@ local function walk(block)
 
         local nextn = block.body[i + 1]
         if node.kind == "raw" and nextn and nextn.kind == "raw" then
-            local name = node.text:match("^local%s+([%a_][%w_]*)$")
+            local name = node.text:match("^local%s+([%a_][%w_]*)%s*:%s*[%w_?%.]+$") or node.text:match("^local%s+([%a_][%w_]*)$")
             if name then
                 local lhs, rhs = nextn.text:match("^([%a_][%w_]*)%s*=%s*(.+)$")
                 if lhs == name then
-                    node.text = "local " .. name .. " = " .. rhs
+                    node.text = node.text .. " = " .. rhs
                     i += 1
                 end
             end

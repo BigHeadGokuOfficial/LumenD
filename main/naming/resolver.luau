@@ -98,6 +98,10 @@ function names:reserve(name)
     return name
 end
 
+function names:release(name)
+    if name then self.used[name] = nil end
+end
+
 names.fromImport = rbx.fromImport
 names.fromField = rbx.fromField
 names.fromMethod = rbx.fromMethod

@@ -1,5 +1,6 @@
 local env = require("main.runtime.environment")
 local http = require("main.runtime.http")
+local patch = require("main.runtime.iridium_patch")
 
 local iri = {}
 
@@ -41,6 +42,7 @@ req = function(name)
     cache[path] = LOADING
 
     local src = http.get(rawBase .. path)
+    src = patch.apply(path, src)
     src = "local require = __LUMEN_IRIDIUM_REQUIRE\n" .. src
 
     local chunk, err = loadstring(src, "@Iridium/" .. path)
@@ -92,10 +94,15 @@ function iri.get()
 end
 
 function iri.info()
+    local pi = patch.info()
     return {
         owner = owner,
         repo = repo,
         commit = commit,
+        patch = pi.rev,
+        patchedMax = pi.max,
+        target = pi.target,
+        classes = pi.classes,
         loaded = root ~= nil,
     }
 end

@@ -25,7 +25,8 @@ local function text(v)
     local t = type(v)
     if v == nil then return "nil" end
     if t == "string" then return lit.string(v) end
-    if t == "boolean" or t == "number" then return tostring(v) end
+    if t == "boolean" then return tostring(v) end
+    if t == "number" then return lit.number(v) end
     return nil
 end
 
@@ -78,6 +79,16 @@ function pass.run(ir)
                 elseif name == "MINUS" and type(a) == "number" then v, known = -a, true
                 elseif name == "LENGTH" and type(a) == "string" then v, known = #a, true end
             end
+        elseif name == "CONCAT" then
+            local out = {}
+            known = true
+            for r = op.B, op.C do
+                local cv = ir.constval[ir:use(n.pc, r)]
+                local x = cv and not cv.nilv and cv.v or nil
+                if not cv or (type(x) ~= "string" and type(x) ~= "number") then known = false break end
+                out[#out + 1] = tostring(x)
+            end
+            if known then v = table.concat(out) end
         else
             local rr = {
                 ADD = true, SUB = true, MUL = true, DIV = true, MOD = true, POW = true, IDIV = true,

@@ -2,6 +2,7 @@ local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 local ex = require("main.output.expr")
 local func = require("main.recover.functions")
+local tab = require("main.recover.tables")
 
 local ops = {}
 
@@ -124,7 +125,7 @@ function ops.run(d, st, pc)
         local t = tv and st.tbl[tv]
         local sv = st:veruse(pc, a)
         if t and not t.done and lit.identifier(f) and sv ~= tv then
-            t.entries[#t.entries + 1] = { kind = "field", key = f, val = st:usex(pc, a) }
+            tab.put(t, "field", f, st:usex(pc, a))
         else
             st:out(lit.property(st:use(pc, b), f) .. " = " .. st:use(pc, a))
         end
@@ -177,7 +178,22 @@ function ops.run(d, st, pc)
         if safe then st.tbl[v] = { reg = a, entries = {}, real = real, done = false }
         else st:set(pc, a, ex.atom("{}", false)) end
     elseif name == "DUPTABLE" then
-        st:set(pc, a, ex.atom(lit.constant(getk(st.proto, dd)), false))
+        local v = st:verdef(pc, a)
+        local safe = v ~= nil and not st.naming:isDebugAt(a, pc)
+        local real = 0
+        if safe then
+            local block = st.cfg.blockmap[pc]
+            for _, u in ipairs(st.ir:uses(v) or {}) do
+                if not u.pc or st.cfg.blockmap[u.pc] ~= block then safe = false break end
+                if not st:tblmut(u, a) then real += 1 end
+            end
+        end
+        if safe then
+            local entries, slots = tab.seed(getk(st.proto, dd))
+            st.tbl[v] = { reg = a, entries = entries, slots = slots, real = real, done = false }
+        else
+            st:set(pc, a, ex.atom(lit.constant(getk(st.proto, dd)), false))
+        end
     elseif name == "SETLIST" then
         local start = aux
         local tv = st:veruse(pc, a)
@@ -226,13 +242,13 @@ function ops.run(d, st, pc)
         end
     elseif name == "NEWCLOSURE" then
         local child = st.proto.Protos and st.proto.Protos[dd + 1]
-        if child then func.emit(d, st, pc, a, child, func.caps(st, pc, child))
+        if child then local caps, nx = func.caps(st, pc, child); func.emit(d, st, pc, a, child, caps, nx)
         else st:badpc(pc, "missing NEWCLOSURE child proto"); st:set(pc, a, ex.atom("function(...) end", false)) end
     elseif name == "DUPCLOSURE" then
         local ck = getk(st.proto, dd)
         local child
         if d.parsed and ck and ck.__type == "Closure" then child = d.parsed.Protos[(ck.Value or 0) + 1] end
-        if child then func.emit(d, st, pc, a, child, {})
+        if child then func.emit(d, st, pc, a, child, {}, st:next(pc))
         else st:badpc(pc, "missing DUPCLOSURE proto"); st:set(pc, a, ex.atom("function(...) end", false)) end
     elseif name == "ADD" or name == "SUB" or name == "MUL" or name == "DIV" or name == "MOD" or name == "POW" or name == "IDIV" or name == "AND" or name == "OR" then
         local map = { ADD = "+", SUB = "-", MUL = "*", DIV = "/", MOD = "%", POW = "^", IDIV = "//", AND = "and", OR = "or" }

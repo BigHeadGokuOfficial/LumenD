@@ -934,8 +934,234 @@ end
 
 return api
 ]===],
+    ["main.ast.booleans"] = [===[
+local pass = {}
+
+local function val(n)
+    if not n or n.kind ~= "return" then return nil end
+    local v = n.text:match("^return%s+(.+)$")
+    if not v or v:find(",", 1, true) or v == "..." or v:match("%)%s*$") then return nil end
+    return v
+end
+
+local function neg(s)
+    local x = s:match("^not%s+%((.*)%)$") or s:match("^not%s+(.+)$")
+    if x then return x end
+    return "not (" .. s .. ")"
+end
+
+local function walk(block)
+    for _, n in ipairs(block.body) do
+        if n.kind == "if" then
+            for _, b in ipairs(n.branches) do walk(b.body) end
+            if n.elsebody then walk(n.elsebody) end
+        elseif n.body then
+            walk(n.body)
+        end
+    end
+
+    local out = {}
+    local i = 1
+    while i <= #block.body do
+        local cur = block.body[i]
+        local nxt = block.body[i + 1]
+        local done = false
+        if cur and cur.kind == "if" and #cur.branches == 1 and not cur.elsebody and nxt and nxt.kind == "return" then
+            local body = cur.branches[1].body
+            if #body.body == 1 then
+                local a = val(body.body[1])
+                local b = val(nxt)
+                if a and b then
+                    local x
+                    if a == "true" and b == "false" then x = cur.branches[1].cond
+                    elseif a == "false" and b == "true" then x = neg(cur.branches[1].cond)
+                    elseif a == b then x = a
+                    else x = "if " .. cur.branches[1].cond .. " then " .. a .. " else " .. b end
+                    out[#out + 1] = { kind = "return", text = "return " .. x }
+                    i += 2
+                    done = true
+                end
+            end
+        end
+        if not done then
+            out[#out + 1] = cur
+            i += 1
+        end
+    end
+    block.body = out
+end
+
+function pass.run(root)
+    walk(root)
+    return root
+end
+
+return pass
+]===],
+    ["main.ast.callbacks"] = [===[
+local pass = {}
+
+local function esc(s)
+    return (s:gsub("([^%w])", "%%%1"))
+end
+
+local function hits(s, name)
+    local n = 0
+    local pat = "%f[%w_]" .. esc(name) .. "%f[^%w_]"
+    local at = 1
+    while true do
+        local a, b = s:find(pat, at)
+        if not a then break end
+        n += 1
+        at = b + 1
+    end
+    return n
+end
+
+local function count(node, name)
+    if not node or node.dead then return 0 end
+    local n = 0
+    if node.text then n += hits(node.text, name) end
+    if node.cond then n += hits(node.cond, name) end
+    if node.head then n += hits(node.head, name) end
+    if node.args then n += hits(node.args, name) end
+    if node.kind == "if" then
+        for _, b in ipairs(node.branches) do
+            n += hits(b.cond, name)
+            for _, x in ipairs(b.body.body) do n += count(x, name) end
+        end
+        if node.elsebody then for _, x in ipairs(node.elsebody.body) do n += count(x, name) end end
+    elseif node.body then
+        for _, x in ipairs(node.body.body) do n += count(x, name) end
+    end
+    return n
+end
+
+local function rest(body, at, name)
+    local n = 0
+    for i = at, #body do n += count(body[i], name) end
+    return n
+end
+
+local function split(text, name)
+    local pat = "%f[%w_]" .. esc(name) .. "%f[^%w_]"
+    local a, b = text:find(pat)
+    if not a then return nil end
+    if text:find(pat, b + 1) then return nil end
+    local pre = text:sub(1, a - 1)
+    if not pre:find("%(") then return nil end
+    return pre, text:sub(b + 1)
+end
+
+local function walk(block)
+    for _, n in ipairs(block.body) do
+        if n.kind == "if" then
+            for _, b in ipairs(n.branches) do walk(b.body) end
+            if n.elsebody then walk(n.elsebody) end
+        elseif n.body then
+            walk(n.body)
+        end
+    end
+
+    local out = {}
+    local i = 1
+    while i <= #block.body do
+        local cur = block.body[i]
+        local nxt = block.body[i + 1]
+        if cur and cur.kind == "function" and cur.localfn and nxt and nxt.kind == "raw"
+            and count(cur, cur.name) == 0 and rest(block.body, i + 1, cur.name) == 1 then
+            local pre, post = split(nxt.text, cur.name)
+            if pre then
+                out[#out + 1] = { kind = "callback", pre = pre, post = post, args = cur.args, body = cur.body }
+                i += 2
+            else
+                out[#out + 1] = cur
+                i += 1
+            end
+        else
+            out[#out + 1] = cur
+            i += 1
+        end
+    end
+    block.body = out
+end
+
+function pass.run(root)
+    walk(root)
+    return root
+end
+
+return pass
+]===],
+    ["main.ast.compound"] = [===[
+local pass = {}
+
+local list = {
+    { "//", "//=" }, { "..", "..=" }, { "+", "+=" }, { "-", "-=" },
+    { "*", "*=" }, { "/", "/=" }, { "%", "%=" }, { "^", "^=" },
+}
+
+local function pesc(s)
+    return (s:gsub("([^%w])", "%%%1"))
+end
+
+local function one(s)
+    local name, rhs = s:match("^([%a_][%w_]*)%s*=%s*(.+)$")
+    if not name then return s end
+    local pre = "^" .. pesc(name) .. "%s*"
+    for _, x in ipairs(list) do
+        local tail = rhs:match(pre .. pesc(x[1]) .. "%s*(.+)$")
+        if tail and tail ~= "" then return name .. " " .. x[2] .. " " .. tail end
+    end
+    return s
+end
+
+local function walk(block)
+    for _, node in ipairs(block.body) do
+        if node.kind == "raw" then node.text = one(node.text)
+        elseif node.kind == "if" then
+            for _, b in ipairs(node.branches) do walk(b.body) end
+            if node.elsebody then walk(node.elsebody) end
+        elseif node.body then
+            walk(node.body)
+        end
+    end
+end
+
+function pass.run(root)
+    walk(root)
+    return root
+end
+
+return pass
+]===],
     ["main.ast.conditions"] = [===[
 local pass = {}
+
+local function same(a, b)
+    if a == b then return true end
+    if type(a) ~= type(b) or type(a) ~= "table" then return false end
+    for k, v in pairs(a) do
+        if k ~= "dead" and not same(v, b[k]) then return false end
+    end
+    for k, v in pairs(b) do
+        if k ~= "dead" and a[k] == nil and v ~= nil then return false end
+    end
+    return true
+end
+
+local function merge(node)
+    local out = {}
+    for _, b in ipairs(node.branches) do
+        local prev = out[#out]
+        if prev and same(prev.body, b.body) then
+            prev.cond = "(" .. prev.cond .. ") or (" .. b.cond .. ")"
+        else
+            out[#out + 1] = b
+        end
+    end
+    node.branches = out
+end
 
 local function walk(block)
     for _, node in ipairs(block.body) do
@@ -950,10 +1176,12 @@ local function walk(block)
                 end
             end
             if node.elsebody then walk(node.elsebody) end
+            merge(node)
         elseif node.body then
             walk(node.body)
         end
     end
+
 end
 
 function pass.run(root)
@@ -1055,6 +1283,165 @@ end
 
 return pass
 ]===],
+    ["main.ast.guards2"] = [===[
+local pass = {}
+
+local inv = {
+    ["=="] = "~=", ["~="] = "==", ["<"] = ">=", ["<="] = ">",
+    [">"] = "<=", [">="] = "<",
+}
+
+local cmp = { " ~= ", " == ", " <= ", " >= ", " < ", " > " }
+
+local function neg(s)
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    for _, mid in ipairs(cmp) do
+        local p = s:find(mid, 1, true)
+        if p then
+            local op = mid:sub(2, -2)
+            local a = s:sub(1, p - 1)
+            local b = s:sub(p + #mid)
+            return a .. " " .. inv[op] .. " " .. b
+        end
+    end
+    local x = s:match("^not%s+(.+)$")
+    if x then return x end
+    return "not (" .. s .. ")"
+end
+
+local function term(b)
+    local x = b and b.body and b.body[#b.body]
+    return x and (x.kind == "return" or x.kind == "break" or x.kind == "continue")
+end
+
+local function walk(block)
+    local out = {}
+    for _, node in ipairs(block.body) do
+        if node.kind == "if" then
+            for _, b in ipairs(node.branches) do walk(b.body) end
+            if node.elsebody then walk(node.elsebody) end
+            if #node.branches == 1 and node.elsebody and term(node.elsebody) and not term(node.branches[1].body) then
+                out[#out + 1] = {
+                    kind = "if",
+                    branches = { { cond = neg(node.branches[1].cond), body = node.elsebody } },
+                    elsebody = nil,
+                }
+                for _, x in ipairs(node.branches[1].body.body) do out[#out + 1] = x end
+            else
+                out[#out + 1] = node
+            end
+        else
+            if node.body then walk(node.body) end
+            out[#out + 1] = node
+        end
+    end
+    block.body = out
+end
+
+function pass.run(root)
+    walk(root)
+    return root
+end
+
+return pass
+]===],
+    ["main.ast.inline"] = [===[
+local pass = {}
+
+local function init(n)
+    if not n or n.kind ~= "raw" then return nil end
+    local a, b = n.text:match("^local%s+([%a_][%w_]*)%s*:%s*[%w_?%.]+%s*=%s*(.+)$")
+    if a then return a, b end
+    return n.text:match("^local%s+([%a_][%w_]*)%s*=%s*(.+)$")
+end
+
+local function simple(s)
+    if s == "..." or s:find("%(") then return false end
+    return true
+end
+
+local function word(s, name)
+    local n = 0
+    for x in s:gmatch("[%a_][%w_]*") do
+        if x == name then n += 1 end
+    end
+    return n
+end
+
+local function count(n, name)
+    if not n or n.dead then return 0 end
+    local out = 0
+    if n.text then out += word(n.text, name) end
+    if n.cond then out += word(n.cond, name) end
+    if n.head then out += word(n.head, name) end
+    if n.args then out += word(n.args, name) end
+    if n.kind == "if" then
+        for _, b in ipairs(n.branches) do
+            out += word(b.cond, name)
+            for _, x in ipairs(b.body.body) do out += count(x, name) end
+        end
+        if n.elsebody then for _, x in ipairs(n.elsebody.body) do out += count(x, name) end end
+    elseif n.body then
+        for _, x in ipairs(n.body.body) do out += count(x, name) end
+    end
+    return out
+end
+
+local function rest(body, at, name)
+    local n = 0
+    for i = at, #body do n += count(body[i], name) end
+    return n
+end
+
+local function walk(block)
+    for _, n in ipairs(block.body) do
+        if n.kind == "if" then
+            for _, b in ipairs(n.branches) do walk(b.body) end
+            if n.elsebody then walk(n.elsebody) end
+        elseif n.body then
+            walk(n.body)
+        end
+    end
+
+    local out = {}
+    local i = 1
+    while i <= #block.body do
+        local cur = block.body[i]
+        local nxt = block.body[i + 1]
+        local name, rhs = init(cur)
+        local used = name and rest(block.body, i + 1, name) or 0
+        if name and nxt and used == 1 and simple(rhs) and nxt.kind == "return" and nxt.text == "return " .. name then
+            out[#out + 1] = { kind = "return", text = "return " .. rhs }
+            i += 2
+        elseif name and nxt and used == 1 and simple(rhs) and nxt.kind == "if" and #nxt.branches > 0 then
+            local c = nxt.branches[1].cond
+            if c == name then
+                nxt.branches[1].cond = rhs
+                out[#out + 1] = nxt
+                i += 2
+            elseif c == "not " .. name or c == "not (" .. name .. ")" then
+                nxt.branches[1].cond = "not (" .. rhs .. ")"
+                out[#out + 1] = nxt
+                i += 2
+            else
+                out[#out + 1] = cur
+                i += 1
+            end
+        else
+            out[#out + 1] = cur
+            i += 1
+        end
+    end
+    block.body = out
+end
+
+function pass.run(root)
+    walk(root)
+    return root
+end
+
+return pass
+]===],
     ["main.ast.locals"] = [===[
 local pass = {}
 
@@ -1072,11 +1459,11 @@ local function walk(block)
 
         local nextn = block.body[i + 1]
         if node.kind == "raw" and nextn and nextn.kind == "raw" then
-            local name = node.text:match("^local%s+([%a_][%w_]*)$")
+            local name = node.text:match("^local%s+([%a_][%w_]*)%s*:%s*[%w_?%.]+$") or node.text:match("^local%s+([%a_][%w_]*)$")
             if name then
                 local lhs, rhs = nextn.text:match("^([%a_][%w_]*)%s*=%s*(.+)$")
                 if lhs == name then
-                    node.text = "local " .. name .. " = " .. rhs
+                    node.text = node.text .. " = " .. rhs
                     i += 1
                 end
             end
@@ -1085,6 +1472,56 @@ local function walk(block)
         i += 1
     end
     block.body = out
+end
+
+function pass.run(root)
+    walk(root)
+    return root
+end
+
+return pass
+]===],
+    ["main.ast.logic"] = [===[
+local pass = {}
+
+local inv = {
+    ["=="] = "~=", ["~="] = "==", ["<"] = ">=", ["<="] = ">",
+    [">"] = "<=", [">="] = "<",
+}
+
+local function trim(s)
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function neg(s)
+    s = trim(s)
+    local x = s:match("^not%s+%((.+)%)$") or s:match("^not%s+(.+)$")
+    if not x then return s end
+    x = trim(x)
+    local y = x:match("^not%s+%((.+)%)$") or x:match("^not%s+([%a_][%w_%.]*)$")
+    if y then return trim(y) end
+    for _, op in ipairs({ "~=", "==", "<=", ">=", "<", ">" }) do
+        local a, b = x:match("^(.-)%s+" .. op:gsub("([^%w])", "%%%1") .. "%s+(.+)$")
+        if a and b then return trim(a) .. " " .. inv[op] .. " " .. trim(b) end
+    end
+    return s
+end
+
+local function walk(b)
+    for _, n in ipairs(b.body) do
+        if n.kind == "if" then
+            for _, x in ipairs(n.branches) do
+                x.cond = neg(x.cond)
+                walk(x.body)
+            end
+            if n.elsebody then walk(n.elsebody) end
+        elseif n.kind == "while" or n.kind == "repeat" then
+            n.cond = neg(n.cond)
+            walk(n.body)
+        elseif n.body then
+            walk(n.body)
+        end
+    end
 end
 
 function pass.run(root)
@@ -1277,7 +1714,15 @@ return n
     ["main.ast.pipeline"] = [===[
 local fold = require("main.ast.fold")
 local cond = require("main.ast.conditions")
+local logic = require("main.ast.logic")
 local guards = require("main.recover.guards")
+local guards2 = require("main.ast.guards2")
+local selectp = require("main.ast.selects")
+local ret = require("main.ast.returns")
+local inline = require("main.ast.inline")
+local callbacks = require("main.ast.callbacks")
+local bools = require("main.ast.booleans")
+local comp = require("main.ast.compound")
 local locals = require("main.ast.locals")
 local dead = require("main.ast.deadcode")
 
@@ -1285,10 +1730,22 @@ local pass = {}
 
 function pass.run(root, opt)
     opt = opt or {}
+    if opt.dce ~= false then dead.run(root) end
     if opt.fold ~= false then fold.run(root) end
     if opt.conditions ~= false then cond.run(root) end
-    if opt.guards ~= false then guards.run(root) end
+    if opt.selects ~= false then selectp.run(root) end
+    if opt.returns ~= false then ret.run(root) end
+    if opt.inlineast ~= false then inline.run(root) end
+    if opt.callbacks ~= false then callbacks.run(root) end
+    if opt.booleans ~= false then bools.run(root) end
+    if opt.guards ~= false then
+        guards2.run(root)
+        guards.run(root)
+    end
     locals.run(root)
+    if opt.compound ~= false then comp.run(root) end
+    logic.run(root)
+    if opt.conditions ~= false then cond.run(root) end
     if opt.dce ~= false then dead.run(root) end
     return root
 end
@@ -1334,6 +1791,10 @@ local function block(out, b, depth)
                 line(out, depth, "do")
                 block(out, node.body, depth + 1)
                 line(out, depth, "end")
+            elseif k == "callback" then
+                line(out, depth, node.pre .. "function(" .. node.args .. ")")
+                block(out, node.body, depth + 1)
+                line(out, depth, "end" .. node.post)
             elseif k == "function" then
                 if node.localfn then
                     line(out, depth, "local function " .. node.name .. "(" .. node.args .. ")")
@@ -1356,6 +1817,140 @@ function printast.run(root)
 end
 
 return printast
+]===],
+    ["main.ast.returns"] = [===[
+local pass = {}
+
+local function ret(b)
+    if not b or #b.body ~= 1 then return nil end
+    local n = b.body[1]
+    if n.kind ~= "return" then return nil end
+    local v = n.text:match("^return%s+(.+)$")
+    if not v or v:find(",", 1, true) then return nil end
+    if v == "..." or v:match("%)%s*$") then return nil end
+    return v
+end
+
+local function expr(n)
+    if n.kind ~= "if" or not n.elsebody or #n.branches == 0 then return nil end
+    local vals = {}
+    for _, b in ipairs(n.branches) do
+        local v = ret(b.body)
+        if not v then return nil end
+        vals[#vals + 1] = { cond = b.cond, val = v }
+    end
+    local last = ret(n.elsebody)
+    if not last then return nil end
+    if #vals == 1 then
+        if vals[1].val == last then return vals[1].val end
+        if vals[1].val == "true" and last == "false" then return vals[1].cond end
+        if vals[1].val == "false" and last == "true" then return "not (" .. vals[1].cond .. ")" end
+    end
+    local out = "if " .. vals[1].cond .. " then " .. vals[1].val
+    for i = 2, #vals do out = out .. " elseif " .. vals[i].cond .. " then " .. vals[i].val end
+    return out .. " else " .. last
+end
+
+local function walk(b)
+    for _, n in ipairs(b.body) do
+        if n.kind == "if" then
+            for _, x in ipairs(n.branches) do walk(x.body) end
+            if n.elsebody then walk(n.elsebody) end
+        elseif n.body then
+            walk(n.body)
+        end
+    end
+    local out = {}
+    for _, n in ipairs(b.body) do
+        local x = expr(n)
+        if x then out[#out + 1] = { kind = "return", text = "return " .. x }
+        else out[#out + 1] = n end
+    end
+    b.body = out
+end
+
+function pass.run(root)
+    walk(root)
+    return root
+end
+
+return pass
+]===],
+    ["main.ast.selects"] = [===[
+local pass = {}
+
+local function asn(node)
+    if not node or node.kind ~= "raw" then return nil end
+    local a, b = node.text:match("^([%a_][%w_]*)%s*=%s*(.+)$")
+    if a then return a, b end
+end
+
+local function decl(node)
+    if not node or node.kind ~= "raw" then return nil end
+    local name = node.text:match("^local%s+([%a_][%w_]*)%s*:%s*[%w_?%.]+$") or node.text:match("^local%s+([%a_][%w_]*)$")
+    return name, name and node.text or nil
+end
+
+local function pick(node)
+    if node.kind ~= "if" or not node.elsebody or #node.branches == 0 then return nil end
+    local name
+    local parts = {}
+    for _, b in ipairs(node.branches) do
+        if #b.body.body ~= 1 then return nil end
+        local n, v = asn(b.body.body[1])
+        if not n or (name and name ~= n) then return nil end
+        name = n
+        parts[#parts + 1] = { cond = b.cond, val = v }
+    end
+    if #node.elsebody.body ~= 1 then return nil end
+    local n, v = asn(node.elsebody.body[1])
+    if not n or n ~= name then return nil end
+    if #parts == 1 then
+        if parts[1].val == v then return name, v end
+        if parts[1].val == "true" and v == "false" then return name, parts[1].cond end
+        if parts[1].val == "false" and v == "true" then return name, "not (" .. parts[1].cond .. ")" end
+    end
+    local out = "if " .. parts[1].cond .. " then " .. parts[1].val
+    for i = 2, #parts do out = out .. " elseif " .. parts[i].cond .. " then " .. parts[i].val end
+    out = out .. " else " .. v
+    return name, out
+end
+
+local function walk(block)
+    for _, node in ipairs(block.body) do
+        if node.kind == "if" then
+            for _, b in ipairs(node.branches) do walk(b.body) end
+            if node.elsebody then walk(node.elsebody) end
+        elseif node.body then
+            walk(node.body)
+        end
+    end
+
+    local out = {}
+    local i = 1
+    while i <= #block.body do
+        local node = block.body[i]
+        local name, expr = pick(node)
+        local prev = out[#out]
+        local dn, dp = decl(prev)
+        if name and dn == name then
+            prev.text = dp .. " = " .. expr
+        elseif name then
+            out[#out + 1] = { kind = "raw", text = name .. " = " .. expr }
+        else
+            out[#out + 1] = node
+        end
+        i += 1
+    end
+    block.body = out
+end
+
+function pass.run(root)
+    walk(root)
+    return root
+end
+
+return pass
 ]===],
     ["main.bytecode.instructions"] = [===[
 local ins = {}
@@ -1453,6 +2048,13 @@ local base = {
     dce = true,
     conditions = true,
     guards = true,
+    types = true,
+    selects = true,
+    returns = true,
+    compound = true,
+    inlineast = true,
+    callbacks = true,
+    booleans = true,
     iridium = nil,
 }
 
@@ -1468,6 +2070,7 @@ local ins = require("main.bytecode.instructions")
 local ex = require("main.output.expr")
 local lit = require("main.output.literals")
 local tab = require("main.recover.tables")
+local ty = require("main.naming.types")
 
 local ctx = {}
 ctx.__index = ctx
@@ -1501,7 +2104,8 @@ function ctx.new(proto, ir, naming, up, ast, opt)
 
     for _, name in ipairs(self.up) do naming:reserve(name) end
     for r = 0, (proto.ParameterCount or 0) - 1 do
-        local name = naming:nameAt(r, 1, nil)
+        local v = ir.ssa.params[r]
+        local name = self:vname(v, r, nil, 1)
         self.declared[name] = 0
     end
     return self
@@ -1515,6 +2119,16 @@ function ctx:trim(depth)
     for name, d in pairs(self.declared) do
         if d >= depth then self.declared[name] = nil end
     end
+end
+
+function ctx:ann(r, pc)
+    if self.opt.types == false then return nil end
+    return ty.text(self.naming:typeAt(r, pc))
+end
+
+function ctx:paramann(r)
+    if self.opt.types == false then return nil end
+    return ty.text(ty.param(self.proto, r))
 end
 
 function ctx:badpc(pc, msg)
@@ -1534,22 +2148,33 @@ function ctx:quiet(a, b)
 end
 
 function ctx:vname(v, r, hint, pc)
-    v = self.ir:nameid(v)
+    local raw = self.ir:resolve(v)
+    v = self.ir:nameid(raw)
     if not v then return self.naming:nameAt(r, pc or 1, hint) end
     local old = self.vnames[v]
     if old then return old end
 
-    local dbg = pc and self.naming:debugAt(r, pc) or nil
-    local typed = pc and self.naming:typeAt(r, pc) or nil
-    local src = self.ir.vals[self.ir:resolve(v)]
+    local di = pc and self.naming:debugAt(r, pc) or nil
+    local ti = pc and self.naming:typeAt(r, pc) or nil
+    local src = raw and self.ir.vals[raw] or nil
+    local best = self.ir.bestname and self.ir.bestname[v] or nil
+    local score = self.ir.namescore and self.ir.namescore[v] or 0
     local name
 
-    if dbg or typed then
-        name = self.naming:nameAt(r, pc, hint)
+    if di then
+        name = self.naming:nameAt(r, pc, nil)
+    elseif best and score >= 80 then
+        name = self.naming:unique(best)
+    elseif ti then
+        name = self.naming:nameAt(r, pc, hint or best)
+    elseif best and score >= 55 then
+        name = self.naming:unique(best)
     elseif src and src.kind == "param" then
-        name = self.naming:nameAt(r, 1, hint)
+        name = self.naming:unique(hint or (score >= 55 and best or nil) or ("arg" .. tostring(src.reg + 1)))
     elseif hint then
         name = self.naming:unique(hint)
+    elseif best then
+        name = self.naming:unique(best)
     else
         repeat
             name = "v" .. tostring(self.nexttmp)
@@ -1628,6 +2253,12 @@ function ctx:inline(pc, r, node)
     local u = self.ir:only(v)
     if not u or not u.pc then return false end
     if node.stable then return true end
+    local defop = self.ir.bypc[pc]
+    local useop = self.ir.bypc[u.pc]
+    if defop and useop and (defop.name == "GETGLOBAL" or defop.name == "GETIMPORT")
+        and (useop.name == "CALL" or useop.name == "CALLFB") and useop.op.A == r then
+        return true
+    end
     if u.pc == self:next(pc) then return true end
     return self:quiet(pc, u.pc)
 end
@@ -1638,12 +2269,12 @@ function ctx:set(pc, r, node, hint, raw)
     if v and self.ir.dead[v] then
         self.vals[v] = node
         if raw ~= nil then self.str[v] = raw end
-        return self:defName(pc, r, hint)
+        return nil
     end
     if v and self:inline(pc, r, node) then
         self.vals[v] = node
         if raw ~= nil then self.str[v] = raw end
-        return self:defName(pc, r, hint)
+        return nil
     end
 
     local name = self:defName(pc, r, hint)
@@ -1652,7 +2283,8 @@ function ctx:set(pc, r, node, hint, raw)
     local stmt
     if fresh then
         self.declared[name] = self.indent
-        stmt = self:out("local " .. name .. " = " .. ex.str(node))
+        local an = self:ann(r, pc)
+        stmt = self:out("local " .. name .. (an and (": " .. an) or "") .. " = " .. ex.str(node))
     else
         stmt = self:out(name .. " = " .. ex.str(node))
     end
@@ -1668,7 +2300,8 @@ function ctx:decl(r, hint, pc)
     local depth = self.declared[name]
     if depth == nil or depth > self.indent then
         self.declared[name] = self.indent
-        self:out("local " .. name)
+        local an = self:ann(r, pc)
+        self:out("local " .. name .. (an and (": " .. an) or ""))
     end
     return name
 end
@@ -1688,8 +2321,13 @@ function ctx:multi(pc, regs, rhs, hints, node)
         end
     end
     if fresh == #list then
-        for _, name in ipairs(list) do self.declared[name] = self.indent end
-        nodes[#nodes + 1] = self:out("local " .. table.concat(list, ", ") .. " = " .. rhs)
+        local typed = {}
+        for i, name in ipairs(list) do
+            self.declared[name] = self.indent
+            local an = self:ann(regs[i], pc)
+            typed[i] = name .. (an and (": " .. an) or "")
+        end
+        nodes[#nodes + 1] = self:out("local " .. table.concat(typed, ", ") .. " = " .. rhs)
     else
         if fresh > 0 then
             for _, name in ipairs(list) do
@@ -1733,6 +2371,7 @@ function ctx:hide(v)
     if not e or not e.fresh or not e.node then return false end
     e.node.dead = true
     if self.declared[e.name] == e.depth then self.declared[e.name] = nil end
+    self.naming:release(e.name)
     return true
 end
 
@@ -1755,6 +2394,7 @@ function ctx:hidegroup(g, pc, loop, regs)
     for _, node in ipairs(g.nodes) do if node then node.dead = true end end
     for _, name in ipairs(g.new) do
         if self.declared[name] == g.depth then self.declared[name] = nil end
+        self.naming:release(name)
     end
     return true
 end
@@ -1827,20 +2467,36 @@ local ex = require("main.output.expr")
 local decomp = {}
 decomp.__index = decomp
 
+local function loopused(st, r, a, b)
+    local pc = a
+    while pc < b do
+        local uses = st.ssa.usesByPC[pc]
+        if uses and uses[r] then return true end
+        pc = st:next(pc)
+    end
+    return false
+end
+
 function decomp.new(opt)
     return setmetatable({ opt = opt or {} }, decomp)
 end
 
-function decomp:_state(proto, up)
-    local ir = irpass.run(irbuild.run(proto), self.opt)
+function decomp:_state(proto, up, ph)
+    local ir = irbuild.run(proto)
+    ir.paramhints = ph or {}
+    ir = irpass.run(ir, self.opt)
     local naming = names.new(ir.cfg.registerStats, self.opt, proto)
     return context.new(proto, ir, naming, up, lower.new(), self.opt)
 end
 
-function decomp:_child(proto, up)
-    local st = self:_state(proto, up)
+function decomp:_child(proto, up, ph)
+    local st = self:_state(proto, up, ph)
     local args = {}
-    for i = 0, (proto.ParameterCount or 0) - 1 do args[#args + 1] = st.naming:nameAt(i, 1, nil) end
+    for i = 0, (proto.ParameterCount or 0) - 1 do
+        local name = st:vname(st.ssa.params[i], i, nil, 1)
+        local an = st:paramann(i)
+        args[#args + 1] = name .. (an and (": " .. an) or "")
+    end
     if proto.IsVararg then args[#args + 1] = "..." end
     self:_region(st, 1, #proto.Instructions + 1, {})
     local root = astpass.run(st.ast:done(), self.opt)
@@ -1853,7 +2509,10 @@ function decomp:_numfor(st, pc, op, stop, active)
     local loop = info.loop
     local a = op.A
     local old = st.alias[a + 3]
-    local var = st.naming:unique("i")
+    local lv = st:verdef(loop, a + 3)
+    local depth = (active.loopdepth or 0) + 1
+    local fall = ({ "i", "j", "k", "n" })[depth] or ("i" .. tostring(depth))
+    local var = not loopused(st, a + 3, st:next(pc), loop) and "_" or st:vname(lv, a + 3, fall, loop)
     local limit = ex.str(st:loopx(pc, loop, a))
     local step = ex.str(st:loopx(pc, loop, a + 1))
     local init = ex.str(st:loopx(pc, loop, a + 2))
@@ -1864,9 +2523,12 @@ function decomp:_numfor(st, pc, op, stop, active)
     st.alias[a + 3] = var
     st.declared[var] = st.indent
     local prev = active.loop
+    local olddepth = active.loopdepth
     active.loop = { breakpc = info.exit, contpc = loop }
+    active.loopdepth = depth
     self:_region(st, st:next(pc), loop, active)
     active.loop = prev
+    active.loopdepth = olddepth
     st:trim(st.indent)
     st.indent -= 1
     st:out("end")
@@ -1881,11 +2543,14 @@ function decomp:_genfor(st, pc, op, stop, active)
     local lop = info.op
     local aux = lop.AuxValue and lop.AuxValue.Value or 0
     local n = math.max(1, bit32.band(aux, 0xff))
+    local depth = (active.loopdepth or 0) + 1
     local vars, old = {}, {}
     for i = 1, n do
         local r = op.A + 2 + i
         old[r] = st.alias[r]
-        vars[i] = st.naming:unique(i == 1 and "key" or (i == 2 and "value" or ("value" .. tostring(i))))
+        local hint = i == 1 and (n == 1 and "item" or "key") or (i == 2 and "value" or ("value" .. tostring(i)))
+        local v = st:verdef(loop, r)
+        vars[i] = not loopused(st, r, st:next(pc), loop) and "_" or st:vname(v, r, hint, loop)
     end
 
     local src
@@ -1910,9 +2575,12 @@ function decomp:_genfor(st, pc, op, stop, active)
         st.declared[vars[i]] = st.indent
     end
     local prev = active.loop
+    local olddepth = active.loopdepth
     active.loop = { breakpc = info.exit, contpc = loop }
+    active.loopdepth = depth
     self:_region(st, st:next(pc), loop, active)
     active.loop = prev
+    active.loopdepth = olddepth
     st:trim(st.indent)
     st.indent -= 1
     st:out("end")
@@ -1993,7 +2661,17 @@ function decomp:_region(st, start, stop, active)
                         pc = self:_numfor(st, pc, op, stop, active) or ops.run(self, st, pc)
                     elseif name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" then
                         pc = self:_genfor(st, pc, op, stop, active) or ops.run(self, st, pc)
-                    elseif ins.isConditional(op) and name ~= "FORNLOOP" and name ~= "FORGLOOP" and name ~= "CMPPROTO" then
+                    elseif name == "CMPPROTO" then
+                        local target = ins.jumpTarget(pc, op)
+                        local join = st:join(pc)
+                        if join and target > pc and target < join and join <= stop then
+                            self:_region(st, target, join, active)
+                            pc = join
+                        else
+                            st:badpc(pc, "unrecognized CMPPROTO inline guard -> " .. tostring(target))
+                            pc = st:next(pc)
+                        end
+                    elseif ins.isConditional(op) and name ~= "FORNLOOP" and name ~= "FORGLOOP" then
                         local loop = active.loop
                         local target = ins.jumpTarget(pc, op)
                         if loop and target == loop.breakpc then
@@ -2085,6 +2763,7 @@ local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 local ex = require("main.output.expr")
 local func = require("main.recover.functions")
+local tab = require("main.recover.tables")
 
 local ops = {}
 
@@ -2207,7 +2886,7 @@ function ops.run(d, st, pc)
         local t = tv and st.tbl[tv]
         local sv = st:veruse(pc, a)
         if t and not t.done and lit.identifier(f) and sv ~= tv then
-            t.entries[#t.entries + 1] = { kind = "field", key = f, val = st:usex(pc, a) }
+            tab.put(t, "field", f, st:usex(pc, a))
         else
             st:out(lit.property(st:use(pc, b), f) .. " = " .. st:use(pc, a))
         end
@@ -2260,7 +2939,22 @@ function ops.run(d, st, pc)
         if safe then st.tbl[v] = { reg = a, entries = {}, real = real, done = false }
         else st:set(pc, a, ex.atom("{}", false)) end
     elseif name == "DUPTABLE" then
-        st:set(pc, a, ex.atom(lit.constant(getk(st.proto, dd)), false))
+        local v = st:verdef(pc, a)
+        local safe = v ~= nil and not st.naming:isDebugAt(a, pc)
+        local real = 0
+        if safe then
+            local block = st.cfg.blockmap[pc]
+            for _, u in ipairs(st.ir:uses(v) or {}) do
+                if not u.pc or st.cfg.blockmap[u.pc] ~= block then safe = false break end
+                if not st:tblmut(u, a) then real += 1 end
+            end
+        end
+        if safe then
+            local entries, slots = tab.seed(getk(st.proto, dd))
+            st.tbl[v] = { reg = a, entries = entries, slots = slots, real = real, done = false }
+        else
+            st:set(pc, a, ex.atom(lit.constant(getk(st.proto, dd)), false))
+        end
     elseif name == "SETLIST" then
         local start = aux
         local tv = st:veruse(pc, a)
@@ -2309,13 +3003,13 @@ function ops.run(d, st, pc)
         end
     elseif name == "NEWCLOSURE" then
         local child = st.proto.Protos and st.proto.Protos[dd + 1]
-        if child then func.emit(d, st, pc, a, child, func.caps(st, pc, child))
+        if child then local caps, nx = func.caps(st, pc, child); func.emit(d, st, pc, a, child, caps, nx)
         else st:badpc(pc, "missing NEWCLOSURE child proto"); st:set(pc, a, ex.atom("function(...) end", false)) end
     elseif name == "DUPCLOSURE" then
         local ck = getk(st.proto, dd)
         local child
         if d.parsed and ck and ck.__type == "Closure" then child = d.parsed.Protos[(ck.Value or 0) + 1] end
-        if child then func.emit(d, st, pc, a, child, {})
+        if child then func.emit(d, st, pc, a, child, {}, st:next(pc))
         else st:badpc(pc, "missing DUPCLOSURE proto"); st:set(pc, a, ex.atom("function(...) end", false)) end
     elseif name == "ADD" or name == "SUB" or name == "MUL" or name == "DIV" or name == "MOD" or name == "POW" or name == "IDIV" or name == "AND" or name == "OR" then
         local map = { ADD = "+", SUB = "-", MUL = "*", DIV = "/", MOD = "%", POW = "^", IDIV = "//", AND = "and", OR = "or" }
@@ -2907,6 +3601,10 @@ function names:reserve(name)
     return name
 end
 
+function names:release(name)
+    if name then self.used[name] = nil end
+end
+
 names.fromImport = rbx.fromImport
 names.fromField = rbx.fromField
 names.fromMethod = rbx.fromMethod
@@ -2916,31 +3614,27 @@ return names
 ]===],
     ["main.naming.roblox"] = [===[
 local id = require("main.naming.identifiers")
+local words = require("main.naming.words")
 
 local rbx = {}
 
 local fields = {
-    LocalPlayer = "localPlayer",
-    Character = "character",
-    Humanoid = "humanoid",
-    HumanoidRootPart = "rootPart",
-    PrimaryPart = "primaryPart",
-    CurrentCamera = "camera",
-    PlayerGui = "playerGui",
-    Backpack = "backpack",
-    PlayerScripts = "playerScripts",
-    Mouse = "mouse",
+    LocalPlayer = "localPlayer", Character = "character", Humanoid = "humanoid",
+    HumanoidRootPart = "rootPart", PrimaryPart = "primaryPart", CurrentCamera = "camera",
+    PlayerGui = "playerGui", Backpack = "backpack", PlayerScripts = "playerScripts",
+    Mouse = "mouse", Parent = "parent", Position = "position", CFrame = "cframe",
+    Size = "size", Name = "name", Value = "value", Enabled = "enabled",
+    Visible = "visible", Health = "health", MaxHealth = "maxHealth", Team = "team",
+    UserId = "userId", CharacterAdded = "characterAdded", OnClientEvent = "event",
+    OnServerEvent = "event", Touched = "touched", AbsolutePosition = "position",
+    AbsoluteSize = "size", AssemblyLinearVelocity = "velocity", AssemblyAngularVelocity = "angularVelocity",
 }
 
 function rbx.fromImport(path)
     if type(path) ~= "string" then return nil end
     local tail = path:match("([A-Za-z_][A-Za-z0-9_]*)$")
     if not tail then return nil end
-
-    if path:match("^game%.") or path == tail then
-        return id.clean(tail)
-    end
-
+    if path:match("^game%.") or path == tail then return id.clean(tail) end
     return id.lowerCamel(tail)
 end
 
@@ -2949,27 +3643,60 @@ function rbx.fromField(field)
 end
 
 function rbx.fromMethod(method, arg)
-    if method == "GetService" and arg then
-        return id.clean(arg)
-    elseif (method == "WaitForChild" or method == "FindFirstChild") and arg then
-        return id.lowerCamel(arg)
-    elseif method == "FindFirstChildOfClass" and arg then
-        return id.lowerCamel(arg)
-    elseif method == "GetPlayerFromCharacter" then
-        return "player"
-    elseif method == "Clone" then
-        return "clone"
-    elseif method == "Connect" then
-        return "connection"
+    if method == "GetService" and arg then return id.lowerCamel(arg) end
+    if method == "WaitForChild" or method == "FindFirstChild" or method == "FindFirstAncestor" then
+        return arg and (fields[arg] or id.lowerCamel(arg)) or "child"
     end
+    if method == "FindFirstChildOfClass" or method == "FindFirstChildWhichIsA" or method == "FindFirstAncestorOfClass" or method == "FindFirstAncestorWhichIsA" then
+        return arg and (fields[arg] or id.lowerCamel(arg)) or "instance"
+    end
+    if method == "IsA" then
+        if arg then return "is" .. arg:gsub("^%l", string.upper) end
+        return "isType"
+    end
+    if method == "GetPlayerFromCharacter" then return "player" end
+    if method == "GetPlayers" then return "playerList" end
+    if method == "GetChildren" then return "children" end
+    if method == "GetDescendants" then return "descendants" end
+    if method == "GetMouse" then return "mouse" end
+    if method == "GetPivot" then return "pivot" end
+    if method == "GetAttribute" then return arg and id.lowerCamel(arg) or "attribute" end
+    if method == "GetAttributes" then return "attributes" end
+    if method == "GetPropertyChangedSignal" then return "signal" end
+    if method == "Clone" then return "clone" end
+    if method == "Connect" or method == "ConnectParallel" then return "connection" end
+    if method == "Raycast" then return "raycastResult" end
+    if method == "GetPartsInPart" or method == "GetPartBoundsInBox" or method == "GetPartBoundsInRadius" then return "parts" end
+    if method == "JSONDecode" then return "data" end
+    if method == "JSONEncode" then return "json" end
+    if method == "GenerateGUID" then return "guid" end
+    if method == "InvokeServer" or method == "Invoke" then return "result" end
+    return words.method(method)
 end
 
 function rbx.fromCall(callee, arg)
-    if callee == "Instance.new" and arg then
-        return id.lowerCamel(arg)
-    elseif callee == "require" then
-        return "module"
-    end
+    if callee == "Instance.new" and arg then return id.lowerCamel(arg) end
+    local ctor = {
+        ["Vector3.new"] = "vector", ["Vector2.new"] = "vector", ["CFrame.new"] = "cframe",
+        ["CFrame.lookAt"] = "cframe", ["Color3.new"] = "color", ["Color3.fromRGB"] = "color",
+        ["Color3.fromHSV"] = "color", ["UDim.new"] = "udim", ["UDim2.new"] = "udim2",
+        ["UDim2.fromScale"] = "udim2", ["UDim2.fromOffset"] = "udim2",
+        ["TweenInfo.new"] = "tweenInfo", ["RaycastParams.new"] = "raycastParams",
+        ["OverlapParams.new"] = "overlapParams", ["Random.new"] = "random",
+        ["NumberRange.new"] = "range", ["NumberSequence.new"] = "sequence",
+        ["ColorSequence.new"] = "colorSequence", ["Region3.new"] = "region",
+        ["Rect.new"] = "rect",
+    }
+    if ctor[callee] then return ctor[callee] end
+    if callee == "require" then return "module" end
+    if callee == "tonumber" then return "num" end
+    if callee == "tostring" then return "text" end
+    if callee == "typeof" or callee == "type" then return "typeName" end
+    if callee == "table.clone" then return "copy" end
+    if callee == "table.pack" then return "values" end
+    if callee == "string.split" then return "parts" end
+    if callee == "task.spawn" or callee == "task.defer" then return "thread" end
+    return words.call(callee)
 end
 
 return rbx
@@ -2997,6 +3724,19 @@ function types.hint(info)
     local name = info.UserdataName or info.Name
     if not name then return nil end
     return map[name] or id.lowerCamel(name:gsub("^userdata#", "obj"))
+end
+
+function types.text(info)
+    if not info then return nil end
+    local name = info.UserdataName or info.Name
+    if not name then return nil end
+    local safe = { boolean = true, number = true, string = true, buffer = true, integer = true, any = true }
+    local out
+    if info.UserdataName and id.valid(info.UserdataName) then out = info.UserdataName
+    elseif safe[name] then out = name end
+    if not out then return nil end
+    if info.IsOptional and out ~= "any" then out = out .. "?" end
+    return out
 end
 
 function types.ranges(proto)
@@ -3036,6 +3776,89 @@ function types.param(proto, reg)
 end
 
 return types
+]===],
+    ["main.naming.words"] = [===[
+local id = require("main.naming.identifiers")
+
+local w = {}
+
+local bad = {
+    get = true, find = true, fetch = true, load = true, read = true, make = true,
+    create = true, build = true, new = true, resolve = true, compute = true,
+    calc = true, clone = true, wait = true, require = true,
+}
+
+local keep = {
+    is = true, has = true, can = true, should = true, did = true, was = true,
+}
+
+local function tail(s)
+    if type(s) ~= "string" then return nil end
+    return s:match("([%a_][%w_]*)$")
+end
+
+function w.clean(s)
+    if type(s) ~= "string" then return nil end
+    s = s:gsub("^_+", ""):gsub("_+$", "")
+    if s == "" then return nil end
+    return id.clean(id.lowerCamel(s))
+end
+
+function w.singular(s)
+    s = w.clean(s)
+    if not s then return nil end
+    local low = s:lower()
+    if low:match("ies$") and #s > 4 then return s:sub(1, -4) .. "y" end
+    if low:match("sses$") or low:match("shes$") or low:match("ches$") or low:match("xes$") or low:match("zes$") then
+        return s:sub(1, -3)
+    end
+    if low:sub(-1) == "s" and low:sub(-2) ~= "ss" and #s > 3 then return s:sub(1, -2) end
+    return s
+end
+
+function w.call(s)
+    s = tail(s)
+    if not s then return nil end
+    local lc = id.lowerCamel(s)
+    for pre in pairs(bad) do
+        local n = #pre
+        if lc:sub(1, n):lower() == pre and #lc > n then
+            local c = lc:sub(n + 1, n + 1)
+            if c:match("[A-Z]") or s:sub(n + 1, n + 1):match("[A-Z]") then
+                return w.clean(s:sub(n + 1))
+            end
+        end
+    end
+    for pre in pairs(keep) do
+        local n = #pre
+        if lc:sub(1, n):lower() == pre and #lc > n then return w.clean(s) end
+    end
+    return w.clean(s)
+end
+
+function w.method(s)
+    if type(s) ~= "string" then return nil end
+    if s == "Connect" then return "connection" end
+    if s == "Clone" then return "clone" end
+    if s == "GetChildren" then return "children" end
+    if s == "GetDescendants" then return "descendants" end
+    if s == "GetAttributes" then return "attributes" end
+    if s == "GetAttribute" then return "attribute" end
+    if s == "GetPropertyChangedSignal" then return "signal" end
+    return w.call(s)
+end
+
+function w.field(s)
+    return w.clean(s)
+end
+
+function w.iter(s)
+    local x = w.singular(s)
+    if not x or x == s and (s == "data" or s == "list" or s == "array" or s == "items") then return "item" end
+    return x or "item"
+end
+
+return w
 ]===],
     ["main.output.expr"] = [===[
 local expr = {}
@@ -3129,6 +3952,14 @@ function lit.identifier(value)
     return id.valid(value)
 end
 
+function lit.number(value)
+    if value ~= value then return "(0 / 0)" end
+    if value == math.huge then return "math.huge" end
+    if value == -math.huge then return "-math.huge" end
+    if value == 0 and 1 / value == -math.huge then return "-0.0" end
+    return tostring(value)
+end
+
 function lit.string(value)
     return string.format("%q", value)
 end
@@ -3173,19 +4004,19 @@ function lit.constant(constant)
     elseif kind == "Boolean" then
         return tostring(constant.Value)
     elseif kind == "Number" then
-        return tostring(constant.Value)
+        return lit.number(constant.Value)
     elseif kind == "Integer" then
         local value = constant.Value
         if constant.IsNegative and type(value) == "number" and value > 0 then
             value = -value
         end
-        return tostring(value)
+        return type(value) == "number" and lit.number(value) or tostring(value)
     elseif kind == "String" then
         return lit.string(lit.rawStringConstant(constant) or "")
     elseif kind == "Import" then
         return lit.rawStringConstant(constant) or "nil"
     elseif kind == "Vector" then
-        return "Vector3.new(" .. tostring(constant.X) .. ", " .. tostring(constant.Y) .. ", " .. tostring(constant.Z) .. ")"
+        return "Vector3.new(" .. lit.number(constant.X) .. ", " .. lit.number(constant.Y) .. ", " .. lit.number(constant.Z) .. ")"
     elseif kind == "Table" then
         return "{}"
     elseif kind == "TableWithConstants" then
@@ -3265,7 +4096,8 @@ local function text(v)
     local t = type(v)
     if v == nil then return "nil" end
     if t == "string" then return lit.string(v) end
-    if t == "boolean" or t == "number" then return tostring(v) end
+    if t == "boolean" then return tostring(v) end
+    if t == "number" then return lit.number(v) end
     return nil
 end
 
@@ -3318,6 +4150,16 @@ function pass.run(ir)
                 elseif name == "MINUS" and type(a) == "number" then v, known = -a, true
                 elseif name == "LENGTH" and type(a) == "string" then v, known = #a, true end
             end
+        elseif name == "CONCAT" then
+            local out = {}
+            known = true
+            for r = op.B, op.C do
+                local cv = ir.constval[ir:use(n.pc, r)]
+                local x = cv and not cv.nilv and cv.v or nil
+                if not cv or (type(x) ~= "string" and type(x) ~= "number") then known = false break end
+                out[#out + 1] = tostring(x)
+            end
+            if known then v = table.concat(out) end
         else
             local rr = {
                 ADD = true, SUB = true, MUL = true, DIV = true, MOD = true, POW = true, IDIV = true,
@@ -3498,8 +4340,9 @@ return pass
 local simp = require("main.passes.simplify")
 local konst = require("main.passes.constants")
 local dead = require("main.passes.deadcode")
-local inline = require("main.passes.inline")
 local names = require("main.passes.names")
+local prov = require("main.passes.provenance")
+local inline = require("main.passes.inline")
 local cond = require("main.passes.conditions")
 local flow = require("main.passes.flow")
 
@@ -3511,6 +4354,7 @@ function pipe.run(ir, opt)
     if opt.fold ~= false then konst.run(ir) end
     if opt.dce ~= false then dead.run(ir) end
     names.run(ir)
+    prov.run(ir)
     if opt.inline ~= false then inline.run(ir) end
     cond.run(ir)
     flow.run(ir)
@@ -3518,6 +4362,349 @@ function pipe.run(ir, opt)
 end
 
 return pipe
+]===],
+    ["main.passes.provenance"] = [===[
+local lit = require("main.output.literals")
+local id = require("main.naming.identifiers")
+local rbx = require("main.naming.roblox")
+local ty = require("main.naming.types")
+local dbg = require("main.naming.debug_names")
+local words = require("main.naming.words")
+local ins = require("main.bytecode.instructions")
+
+local pass = {}
+
+local weak = {
+    value = true, result = true, data = true, item = true, obj = true,
+    num = true, text = true, flag = true, fn = true,
+}
+
+local owner = {
+    Character = "player", Backpack = "player", PlayerGui = "player", PlayerScripts = "player",
+    UserId = "player", Team = "player", TeamColor = "player", AccountAge = "player",
+    Humanoid = "character", HumanoidRootPart = "character", PrimaryPart = "model",
+    Health = "humanoid", MaxHealth = "humanoid", WalkSpeed = "humanoid", JumpPower = "humanoid",
+    HipHeight = "humanoid", MoveDirection = "humanoid", FloorMaterial = "humanoid",
+    CFrame = "part", Position = "part", Orientation = "part", Anchored = "part",
+    CanCollide = "part", AssemblyLinearVelocity = "part", AssemblyAngularVelocity = "part",
+    CameraType = "camera", CameraSubject = "camera", ViewportSize = "camera",
+    AbsolutePosition = "gui", AbsoluteSize = "gui", BackgroundColor3 = "gui", Text = "gui",
+    UserInputType = "input", KeyCode = "input", UserInputState = "input", Delta = "input",
+    OnClientEvent = "remoteEvent", OnServerEvent = "remoteEvent",
+}
+
+local methown = {
+    Kick = "player", GetMouse = "player", LoadCharacter = "player",
+    MoveTo = "humanoid", TakeDamage = "humanoid", ChangeState = "humanoid",
+    Raycast = "workspace", GetPartsInPart = "workspace", GetPartBoundsInBox = "workspace",
+    Connect = "signal", ConnectParallel = "signal", Once = "signal", Wait = "signal",
+    FireServer = "remoteEvent", FireClient = "remoteEvent", FireAllClients = "remoteEvent",
+    InvokeServer = "remoteFunction", InvokeClient = "remoteFunction",
+    GetPlayers = "players", GetPlayerFromCharacter = "players",
+    GetTagged = "collectionService", HasTag = "collectionService", AddTag = "collectionService", RemoveTag = "collectionService",
+    JSONDecode = "httpService", JSONEncode = "httpService", GenerateGUID = "httpService",
+}
+
+local function getk(proto, n)
+    return proto.Constants and proto.Constants[(n or 0) + 1]
+end
+
+local function rawk(proto, n)
+    return lit.rawStringConstant(getk(proto, n))
+end
+
+local function cv(ir, v)
+    v = ir:resolve(v)
+    local x = v and ir.constval and ir.constval[v]
+    if not x then return nil, false end
+    return x.nilv and nil or x.v, true
+end
+
+function pass.run(ir)
+    local hints = {}
+    local origin = {}
+    local pend = {}
+    local dr = dbg.ranges(ir.proto)
+    local tr = ty.ranges(ir.proto)
+
+    local function fam(v)
+        return v and ir:nameid(v) or nil
+    end
+
+    local function add(v, name, score, why)
+        v = fam(v)
+        name = id.clean(name)
+        if not v or not name then return end
+        if weak[name] then score -= 8 end
+        local h = hints[v]
+        if not h then h = {}; hints[v] = h end
+        local old = h[name]
+        if not old then
+            h[name] = { score = score, why = why, hits = 1 }
+        else
+            old.hits = (old.hits or 1) + 1
+            if score > old.score then old.score, old.why = score, why end
+        end
+    end
+
+    local function seto(v, path, kind)
+        v = ir:resolve(v)
+        if v and path then origin[v] = { path = path, kind = kind } end
+    end
+
+    local function geto(v)
+        v = ir:resolve(v)
+        return v and origin[v] or nil
+    end
+
+    local function opname(v)
+        v = ir:resolve(v)
+        local x = v and ir.vals[v]
+        local n = x and x.pc and ir.bypc[x.pc]
+        return n and n.name or nil
+    end
+
+    for v, src in pairs(ir.vals) do
+        if src.kind == "param" and ir.paramhints then add(v, ir.paramhints[src.reg + 1], 118, "context") end
+        local p = src.kind == "param" and ty.param(ir.proto, src.reg) or nil
+        if p then add(v, ty.hint(p), 74, "ptype") end
+        local di = src.pc and dbg.at(dr, src.reg, src.pc) or nil
+        if di then add(v, di.name, 120, "debug") end
+        local ti = src.pc and ty.at(tr, src.reg, src.pc) or nil
+        if ti then add(v, ty.hint(ti), 78, "type") end
+    end
+
+    local prep = {}
+    for _, n in ipairs(ir.ops) do
+        local op = n.op
+        local name = n.name
+        local pc = n.pc
+        local defs = ir.ssa.defsByPC[pc] or {}
+        local uses = ir.ssa.usesByPC[pc] or {}
+        local function d(r) return ir:resolve(defs[r]) end
+        local function u(r) return ir:resolve(uses[r]) end
+
+        if name == "GETGLOBAL" then
+            local g = rawk(ir.proto, op.AuxValue and op.AuxValue.Value or 0)
+            add(d(op.A), g, 104, "global")
+            seto(d(op.A), g, "global")
+        elseif name == "GETIMPORT" then
+            local k = getk(ir.proto, op.D)
+            local p = lit.rawStringConstant(k) or lit.constant(k)
+            add(d(op.A), rbx.fromImport(p) or words.call(p), 108, "import")
+            seto(d(op.A), p, "import")
+        elseif name == "GETUPVAL" then
+            local up = ir.proto.Upvalues and ir.proto.Upvalues[op.B + 1]
+            local un = up and up.Name
+            add(d(op.A), un, 112, "upvalue")
+            seto(d(op.A), un, "upvalue")
+        elseif name == "MOVE" then
+            local so = geto(u(op.B))
+            if so then
+                seto(d(op.A), so.path, so.kind)
+                add(d(op.A), words.call(so.path) or words.field(so.path), 76, "move")
+            end
+        elseif name == "GETTABLEKS" or name == "GETUDATAKS" then
+            local ai = op.AuxValue and op.AuxValue.Value or 0
+            if name == "GETUDATAKS" then ai = bit32.band(ai, 0xffff) end
+            local f = rawk(ir.proto, ai)
+            add(d(op.A), rbx.fromField(f) or words.field(f), 91, "field")
+            add(u(op.B), owner[f], 70, "owner")
+            local so = geto(u(op.B))
+            if so and f then seto(d(op.A), so.path .. "." .. f, "field") else seto(d(op.A), f, "field") end
+        elseif name == "GETTABLEN" then
+            local so = geto(u(op.B))
+            if so then add(d(op.A), words.iter(words.call(so.path) or so.path), 64, "index") end
+        elseif name == "SETTABLEKS" or name == "SETUDATAKS" then
+            local ai = op.AuxValue and op.AuxValue.Value or 0
+            if name == "SETUDATAKS" then ai = bit32.band(ai, 0xffff) end
+            local f = rawk(ir.proto, ai)
+            local sc = (opname(u(op.A)) == "NEWCLOSURE" or opname(u(op.A)) == "DUPCLOSURE") and 116 or 44
+            add(u(op.A), rbx.fromField(f) or words.field(f), sc, "store")
+        elseif name == "SETGLOBAL" then
+            local g = rawk(ir.proto, op.AuxValue and op.AuxValue.Value or 0)
+            local sc = (opname(u(op.A)) == "NEWCLOSURE" or opname(u(op.A)) == "DUPCLOSURE") and 120 or 38
+            add(u(op.A), g, sc, "gstore")
+        elseif name == "NAMECALL" or name == "NAMECALLUDATA" then
+            local ai = op.AuxValue and op.AuxValue.Value or 0
+            if name == "NAMECALLUDATA" then ai = bit32.band(ai, 0xffff) end
+            local m = rawk(ir.proto, ai)
+            pend[op.A] = { method = m, obj = u(op.B), pc = pc }
+            add(u(op.B), methown[m], 72, "method-owner")
+        elseif name == "CALL" or name == "CALLFB" then
+            local p = pend[op.A]
+            local out = d(op.A)
+            local callpath
+            if p then
+                local arg
+                if (op.B or 0) == 0 or op.B > 2 then arg = select(1, cv(ir, u(op.A + 2))) end
+                local oo = geto(p.obj)
+                local base = oo and oo.path or nil
+                local h = rbx.fromMethod(p.method, arg) or words.method(p.method)
+                if p.method == "Create" and base and base:match("TweenService$") then h = "tween" end
+                if p.method == "Clone" and base then
+                    local tail = base:match("([%a_][%w_]*)$")
+                    if tail then h = words.clean(tail .. "Clone") end
+                end
+                if p.method == "Connect" or p.method == "ConnectParallel" or p.method == "Once" then h = "connection" end
+                if p.method == "Wait" and base and base:match("Signal$") then h = "value" end
+                add(out, h, 106, "method")
+                if p.method == "GetPlayerFromCharacter" then
+                    add(u(op.A + 2), "character", 88, "arg")
+                elseif p.method == "Create" and base and base:match("TweenService$") then
+                    add(u(op.A + 2), "instance", 62, "arg")
+                    add(u(op.A + 3), "tweenInfo", 78, "arg")
+                    add(u(op.A + 4), "properties", 72, "arg")
+                elseif p.method == "Raycast" then
+                    add(u(op.A + 2), "origin", 66, "arg")
+                    add(u(op.A + 3), "direction", 72, "arg")
+                    add(u(op.A + 4), "params", 58, "arg")
+                elseif p.method == "AddTag" or p.method == "RemoveTag" or p.method == "HasTag" then
+                    add(u(op.A + 2), "instance", 56, "arg")
+                    add(u(op.A + 3), "tag", 72, "arg")
+                elseif p.method == "AddItem" then
+                    add(u(op.A + 2), "instance", 56, "arg")
+                    add(u(op.A + 3), "lifetime", 68, "arg")
+                end
+                local path
+                if p.method == "GetService" and arg then
+                    path = tostring(arg)
+                elseif (p.method == "WaitForChild" or p.method == "FindFirstChild" or p.method == "FindFirstAncestor") and arg then
+                    path = base and (base .. "." .. tostring(arg)) or tostring(arg)
+                elseif (p.method == "FindFirstChildOfClass" or p.method == "FindFirstChildWhichIsA") and arg then
+                    path = tostring(arg)
+                else
+                    path = base
+                    if p.method then path = path and (path .. ":" .. p.method) or p.method end
+                end
+                callpath = path
+                seto(out, path, "call")
+                pend[op.A] = nil
+            else
+                local cal = u(op.A)
+                local co = geto(cal)
+                local arg
+                if (op.B or 0) == 0 or op.B > 1 then arg = select(1, cv(ir, u(op.A + 1))) end
+                local path = co and co.path or nil
+                local h = rbx.fromCall(path, arg) or words.call(path) or "result"
+                local first = {
+                    pcall = "success", xpcall = "success", ["coroutine.resume"] = "success",
+                    next = "key", ["string.find"] = "startPos", ["math.modf"] = "integer",
+                    ["math.frexp"] = "mantissa",
+                }
+                h = first[path] or h
+                if path == "require" then
+                    local ao = geto(u(op.A + 1))
+                    local tail = ao and ao.path and ao.path:match("([%a_][%w_]*)$")
+                    if tail and tail ~= "Parent" then h = words.clean(tail) end
+                end
+                callpath = path
+                add(out, h, path == "require" and 112 or 98, "call")
+                add(cal, "fn", 48, "callee")
+                seto(out, path, "call")
+                if path == "table.insert" then
+                    add(u(op.A + 1), "list", 52, "arg")
+                    add(u(op.A + 2), "item", 46, "arg")
+                elseif path == "pairs" or path == "ipairs" or path == "next" then
+                    add(u(op.A + 1), "items", 44, "arg")
+                elseif path == "pcall" or path == "xpcall" then
+                    add(u(op.A + 1), "fn", 66, "arg")
+                elseif path == "task.spawn" or path == "task.defer" or path == "task.delay" then
+                    local r = path == "task.delay" and op.A + 2 or op.A + 1
+                    add(u(r), "callback", 68, "arg")
+                elseif path == "assert" then
+                    add(u(op.A + 1), "condition", 48, "arg")
+                end
+            end
+            if (op.C or 0) > 2 then
+                local multi = {
+                    pcall = { "success", "result" },
+                    xpcall = { "success", "result" },
+                    ["coroutine.resume"] = { "success", "result" },
+                    next = { "key", "value" },
+                    ["string.find"] = { "startPos", "endPos" },
+                    ["math.modf"] = { "integer", "fraction" },
+                    ["math.frexp"] = { "mantissa", "exponent" },
+                }
+                local set = multi[callpath]
+                for r = op.A, op.A + op.C - 2 do
+                    local i = r - op.A + 1
+                    local h = set and set[i] or (i == 1 and nil or ("result" .. tostring(i)))
+                    if h then add(d(r), h, set and 96 or 35, "multi") end
+                end
+            end
+        elseif name == "NEWTABLE" or name == "DUPTABLE" then
+            add(d(op.A), "data", 28, "table")
+            seto(d(op.A), "data", "table")
+        elseif name == "NEWCLOSURE" or name == "DUPCLOSURE" then
+            local child = ir.proto.Protos and ir.proto.Protos[(op.D or 0) + 1]
+            add(d(op.A), child and child.Name or "fn", 88, "closure")
+        elseif name == "NOT" then
+            local so = geto(u(op.B))
+            if so then add(d(op.A), "not" .. ((words.call(so.path) or "value"):gsub("^%l", string.upper)), 52, "bool") end
+        elseif name == "LENGTH" then
+            local so = geto(u(op.B))
+            if so then
+                local x = words.call(so.path)
+                if x then add(d(op.A), x .. "Count", 66, "len") else add(d(op.A), "count", 54, "len") end
+            else
+                add(d(op.A), "count", 48, "len")
+            end
+        elseif name == "FORGPREP" or name == "FORGPREP_NEXT" or name == "FORGPREP_INEXT" then
+            local target = ins.jumpTarget(pc, op)
+            local so = geto(u(op.A + 1)) or geto(u(op.A))
+            prep[target] = so and (words.call(so.path) or words.field(so.path)) or nil
+        elseif name == "FORGLOOP" then
+            local nvar = math.max(1, bit32.band(op.AuxValue and op.AuxValue.Value or 0, 0xff))
+            local src = prep[pc]
+            for i = 1, nvar do
+                local v = d(op.A + 2 + i)
+                if i == 1 and nvar == 1 then add(v, words.iter(src), 86, "iter")
+                elseif i == 1 then add(v, "key", 68, "iter")
+                elseif i == 2 then add(v, words.iter(src) or "value", 82, "iter")
+                else add(v, "value" .. tostring(i), 48, "iter") end
+            end
+        elseif name == "FORNLOOP" then
+            add(d(op.A + 3), "i", 62, "numfor")
+        end
+    end
+
+    for _, n in ipairs(ir.ops) do
+        local op, pc, name = n.op, n.pc, n.name
+        local uses = ir.ssa.usesByPC[pc] or {}
+        local function u(r) return ir:resolve(uses[r]) end
+        if name == "JUMPIF" or name == "JUMPIFNOT" then
+            add(u(op.A), "enabled", 38, "condition")
+        elseif name == "GETTABLE" then
+            add(u(op.C), "key", 42, "index")
+        elseif name == "SETTABLE" then
+            add(u(op.C), "key", 42, "index")
+        elseif name == "CONCAT" then
+            for r = op.B, op.C do add(u(r), "text", 30, "concat") end
+        elseif name == "ADD" or name == "SUB" or name == "MUL" or name == "DIV" or name == "MOD" or name == "POW" or name == "IDIV" then
+            add(u(op.B), "num", 24, "math")
+            add(u(op.C), "num", 24, "math")
+        end
+    end
+
+    local best, score = {}, {}
+    for v, set in pairs(hints) do
+        for name, h in pairs(set) do
+            local rank = h.score + math.min(20, math.max(0, (h.hits or 1) - 1) * 4)
+            if not score[v] or rank > score[v] or (rank == score[v] and name < best[v]) then
+                best[v], score[v] = name, rank
+            end
+        end
+    end
+
+    ir.hints = hints
+    ir.bestname = best
+    ir.namescore = score
+    ir.origin = origin
+    return ir
+end
+
+return pass
 ]===],
     ["main.passes.simplify"] = [===[
 local pass = {}
@@ -3727,7 +4914,16 @@ function cond.bool(st, pc, op)
     if join <= tp then join = st:next(tp) end
     st.consumed[fp] = true
     st.consumed[tp] = true
-    st:set(fp, fo.A, x)
+    local bid = st.cfg.blockmap[join]
+    local phis = bid and st.ir.phis[bid]
+    local phi = phis and phis[fo.A]
+    if phi and not phi.missing then
+        local id = st.ir:resolve(phi.id)
+        st.vals[id] = x
+        st.expr[id] = x
+    else
+        st:set(fp, fo.A, x)
+    end
     return join
 end
 
@@ -3735,8 +4931,51 @@ return cond
 ]===],
     ["main.recover.functions"] = [===[
 local ins = require("main.bytecode.instructions")
+local lit = require("main.output.literals")
 
 local fn = {}
+
+local evt = {
+    PlayerAdded = { "player" }, PlayerRemoving = { "player" },
+    CharacterAdded = { "character" }, CharacterRemoving = { "character" },
+    ChildAdded = { "child" }, ChildRemoved = { "child" },
+    DescendantAdded = { "descendant" }, DescendantRemoving = { "descendant" },
+    Touched = { "hit" }, TouchEnded = { "hit" },
+    InputBegan = { "input", "gameProcessed" }, InputChanged = { "input", "gameProcessed" }, InputEnded = { "input", "gameProcessed" },
+    Heartbeat = { "dt" }, RenderStepped = { "dt" }, PreRender = { "dt" }, PreSimulation = { "dt" }, PostSimulation = { "dt" },
+    Stepped = { "time", "dt" },
+    AncestryChanged = { "child", "parent" }, AttributeChanged = { "attribute" },
+    Changed = { "value" },
+}
+
+local meth = {
+    BindToRenderStep = { "dt" },
+    BindAction = { "actionName", "inputState", "input" },
+    BindActionAtPriority = { "actionName", "inputState", "input" },
+}
+
+local function cbhints(st, pc, r)
+    local v = st:verdef(pc, r)
+    if not v then return nil end
+    local call
+    for _, u in ipairs(st.ir:uses(v) or {}) do
+        if u.pc then
+            if call then return nil end
+            call = u.pc
+        end
+    end
+    if not call then return nil end
+    local op = st.proto.Instructions[call]
+    local name = ins.name(op)
+    if name ~= "CALL" and name ~= "CALLFB" then return nil end
+    local pend = st.namecall[op.A]
+    if pend and (pend.method == "Connect" or pend.method == "ConnectParallel" or pend.method == "Once") then
+        local tail = pend.obj and pend.obj:match("([%a_][%w_]*)$")
+        return tail and evt[tail] or nil
+    end
+    if pend and meth[pend.method] then return meth[pend.method] end
+    return nil
+end
 
 function fn.caps(st, pc, child)
     local out = {}
@@ -3744,30 +4983,82 @@ function fn.caps(st, pc, child)
     for i = 1, (child.UpvalueCount or 0) do
         local cp = nx
         local op = st.proto.Instructions[cp]
+        local du = child.Upvalues and child.Upvalues[i]
+        local dn = du and du.Name
         if ins.name(op) ~= "CAPTURE" then
-            out[i] = "upvalue" .. tostring(i - 1)
+            out[i] = dn or ("upvalue" .. tostring(i - 1))
         else
             local kind, src = op.A, op.B
-            if kind == 0 or kind == 1 then out[i] = st:useName(cp, src, nil)
+            if dn and dn ~= "" then out[i] = dn
+            elseif kind == 0 or kind == 1 then out[i] = st:useName(cp, src, nil)
             else out[i] = st.up[src + 1] or ("upvalue" .. tostring(src)) end
             st.consumed[cp] = true
             nx = st:next(cp)
         end
     end
-    return out
+    return out, nx
 end
 
-function fn.emit(d, st, pc, r, child, caps)
+local function direct(st, pc, r, nx)
+    local v = st:verdef(pc, r)
+    if not v then return nil end
+    local uses = st.ir:uses(v) or {}
+    local one
+    for _, u in ipairs(uses) do
+        if u.pc then
+            if one then return nil end
+            one = u
+        end
+    end
+    if not one or one.pc ~= nx then return nil end
+    local op = st.proto.Instructions[one.pc]
+    local name = ins.name(op)
+    if name == "SETGLOBAL" and op.A == r then
+        local k = op.AuxValue and op.AuxValue.Value or 0
+        local g = lit.rawStringConstant(st.proto.Constants and st.proto.Constants[k + 1])
+        if g and lit.identifier(g) then return g, false, one.pc end
+    elseif (name == "SETTABLEKS" or name == "SETUDATAKS") and op.A == r then
+        local k = op.AuxValue and op.AuxValue.Value or 0
+        if name == "SETUDATAKS" then k = bit32.band(k, 0xffff) end
+        local f = lit.rawStringConstant(st.proto.Constants and st.proto.Constants[k + 1])
+        local base = st:use(one.pc, op.B)
+        if f and lit.identifier(f) then return base .. "." .. f, false, one.pc end
+        if f then return lit.property(base, f), true, one.pc end
+    end
+end
+
+function fn.emit(d, st, pc, r, child, caps, nx)
     local hint = child.Name
+    if hint == nil or hint == "" then hint = st.ir.bestname and st.ir.bestname[st.ir:nameid(st:verdef(pc, r))] end
     if hint == nil or hint == "" then hint = "fn" .. tostring(r) end
-    local name = st:defName(pc, r, hint)
-    local root, sub, args = d:_child(child, caps)
-    local depth = st.declared[name]
-    if depth == nil or depth > st.indent then
-        st.declared[name] = st.indent
-        st.ast:add({ kind = "function", name = name, args = table.concat(args, ", "), body = root, localfn = true, assign = false })
+
+    local root, sub, args = d:_child(child, caps, cbhints(st, pc, r))
+    local target, assign, store = direct(st, pc, r, nx or st:next(pc))
+    if target then
+        st.consumed[store] = true
+        if not assign and target:find("%.") and args[1] and args[1]:match("^self%s*[:$]") then
+            local base, field = target:match("^(.*)%.([%a_][%w_]*)$")
+            if base and field then
+                target = base .. ":" .. field
+                table.remove(args, 1)
+            end
+        elseif not assign and target:find("%.") and args[1] == "self" then
+            local base, field = target:match("^(.*)%.([%a_][%w_]*)$")
+            if base and field then
+                target = base .. ":" .. field
+                table.remove(args, 1)
+            end
+        end
+        st.ast:add({ kind = "function", name = target, args = table.concat(args, ", "), body = root, localfn = false, assign = assign })
     else
-        st.ast:add({ kind = "function", name = name, args = table.concat(args, ", "), body = root, localfn = false, assign = true })
+        local name = st:defName(pc, r, hint)
+        local depth = st.declared[name]
+        if depth == nil or depth > st.indent then
+            st.declared[name] = st.indent
+            st.ast:add({ kind = "function", name = name, args = table.concat(args, ", "), body = root, localfn = true, assign = false })
+        else
+            st.ast:add({ kind = "function", name = name, args = table.concat(args, ", "), body = root, localfn = false, assign = true })
+        end
     end
     for _, issue in ipairs(sub.bad) do st.bad[#st.bad + 1] = issue end
 end
@@ -3882,9 +5173,52 @@ return loops
 ]===],
     ["main.recover.tables"] = [===[
 local ins = require("main.bytecode.instructions")
+local lit = require("main.output.literals")
 local ex = require("main.output.expr")
 
 local tab = {}
+
+local function key(k)
+    local raw = lit.rawStringConstant(k)
+    if raw then
+        if lit.identifier(raw) then return "field", raw end
+        return "key", lit.string(raw)
+    end
+    return "key", lit.constant(k)
+end
+
+function tab.seed(k)
+    local out, slots = {}, {}
+    if not k then return out, slots end
+    if k.__type == "Table" then
+        for _, x in ipairs(k.Value or {}) do
+            local kind, name = key(x)
+            local e = { kind = kind, key = name, pending = true }
+            out[#out + 1] = e
+            if kind == "field" then slots[name] = e end
+        end
+    elseif k.__type == "TableWithConstants" then
+        for _, pair in ipairs(k.Value or {}) do
+            local kind, name = key(pair.Key)
+            local e = { kind = kind, key = name, pending = pair.Value == nil }
+            if pair.Value ~= nil then e.val = ex.atom(lit.constant(pair.Value), true) end
+            out[#out + 1] = e
+            if kind == "field" then slots[name] = e end
+        end
+    end
+    return out, slots
+end
+
+function tab.put(t, kind, name, val)
+    local e = kind == "field" and t.slots and t.slots[name] or nil
+    if e and e.pending then
+        e.val = val
+        e.pending = false
+        return true
+    end
+    t.entries[#t.entries + 1] = { kind = kind, key = name, val = val }
+    return true
+end
 
 function tab.mut(st, use, r)
     if not use or not use.pc then return false end
@@ -3901,12 +5235,14 @@ end
 function tab.expr(t)
     local out = {}
     for _, e in ipairs(t.entries) do
-        if e.kind == "list" then
-            out[#out + 1] = ex.str(e.val)
-        elseif e.kind == "field" then
-            out[#out + 1] = e.key .. " = " .. ex.str(e.val)
-        else
-            out[#out + 1] = "[" .. e.key .. "] = " .. ex.str(e.val)
+        if not e.pending and e.val then
+            if e.kind == "list" then
+                out[#out + 1] = ex.str(e.val)
+            elseif e.kind == "field" then
+                out[#out + 1] = e.key .. " = " .. ex.str(e.val)
+            else
+                out[#out + 1] = "[" .. e.key .. "] = " .. ex.str(e.val)
+            end
         end
     end
     return ex.atom(#out == 0 and "{}" or ("{ " .. table.concat(out, ", ") .. " }"), false)
@@ -4025,6 +5361,7 @@ return http
     ["main.runtime.iridium"] = [===[
 local env = require("main.runtime.environment")
 local http = require("main.runtime.http")
+local patch = require("main.runtime.iridium_patch")
 
 local iri = {}
 
@@ -4066,6 +5403,7 @@ req = function(name)
     cache[path] = LOADING
 
     local src = http.get(rawBase .. path)
+    src = patch.apply(path, src)
     src = "local require = __LUMEN_IRIDIUM_REQUIRE\n" .. src
 
     local chunk, err = loadstring(src, "@Iridium/" .. path)
@@ -4117,15 +5455,187 @@ function iri.get()
 end
 
 function iri.info()
+    local pi = patch.info()
     return {
         owner = owner,
         repo = repo,
         commit = commit,
+        patch = pi.rev,
+        patchedMax = pi.max,
+        target = pi.target,
+        classes = pi.classes,
         loaded = root ~= nil,
     }
 end
 
 return iri
+]===],
+    ["main.runtime.iridium_patch"] = [===[
+local patch = {}
+
+local rev = "v13-2"
+
+local function rep(s, a, b, tag)
+    local p = s:find(a, 1, true)
+    if not p then error("LumenDecomp: Iridium patch mismatch: " .. tag, 3) end
+    return s:sub(1, p - 1) .. b .. s:sub(p + #a)
+end
+
+function patch.apply(path, src)
+    if path == "Src/Luau/Spec.luau" then
+        src = rep(src, "LBC_VERSION_MAX = 11", "LBC_VERSION_MAX = 13", "spec.max")
+        src = rep(src, "LBC_VERSION_TARGET = 6", "LBC_VERSION_TARGET = 9", "spec.target")
+        src = rep(src, "    LBC_VERSION_TARGET = 9,\n", "    LBC_VERSION_TARGET = 9,\n    LBC_VERSION_CLASSES = 100,\n", "spec.classes")
+        src = rep(src, "    LBC_CONSTANT_CLASS_SHAPE = 10,\n", "    LBC_CONSTANT_CLASS_SHAPE = 10,\n    LBC_CONSTANT_VECTORD = 11,\n", "spec.vectord")
+        src = rep(src, [[    LOP__COUNT = { Index = 88, Name = "_COUNT", HasAux = false },]], [[    LOP_CMPPROTO = { Index = 88, Name = "CMPPROTO", HasAux = true },
+    LOP_NEWCLASS = { Index = 89, Name = "NEWCLASS", HasAux = true },
+    LOP__COUNT = { Index = 90, Name = "_COUNT", HasAux = false },]], "spec.v12ops")
+        return src
+    end
+
+    if path == "Src/init.luau" then
+        src = rep(src, [[    if self.BytecodeVersion < LuauSpec.LuauBytecodeTag.LBC_VERSION_MIN or self.BytecodeVersion > LuauSpec.LuauBytecodeTag.LBC_VERSION_MAX then
+        error(`Invalid bytecode version (expected {LuauSpec.LuauBytecodeTag.LBC_VERSION_MIN}-{LuauSpec.LuauBytecodeTag.LBC_VERSION_MAX}, got {self.BytecodeVersion})`)
+    end]], [[    if self.BytecodeVersion < LuauSpec.LuauBytecodeTag.LBC_VERSION_MIN or (self.BytecodeVersion > LuauSpec.LuauBytecodeTag.LBC_VERSION_MAX and self.BytecodeVersion ~= LuauSpec.LuauBytecodeTag.LBC_VERSION_CLASSES) then
+        error(`Invalid bytecode version (expected {LuauSpec.LuauBytecodeTag.LBC_VERSION_MIN}-{LuauSpec.LuauBytecodeTag.LBC_VERSION_MAX} or classes, got {self.BytecodeVersion})`)
+    end]], "init.classes")
+
+        src = rep(src, [[    for i = 1, self.ProtoCount do
+        self.Protos[i] = Proto.new(Bytecode, self, Config.EncodingKey)
+    end]], [[    self.ProtoSizes = {}
+    for i = 1, self.ProtoCount do
+        if self.BytecodeVersion >= 12 then
+            self.ProtoSizes[i] = Bytecode:ReadVarInt()
+        end
+        self.Protos[i] = Proto.new(Bytecode, self, Config.EncodingKey)
+    end]], "init.sizes")
+
+        src = rep(src, [[local function SkipProto(Bytecode: Buffer.BufferReader, Version: number)
+    Bytecode:seek(4)
+
+    if Version >= 4 then
+        Bytecode:seek(1)
+        Bytecode:seek(Bytecode:ReadVarInt())
+    end]], [[local function SkipProto(Bytecode: Buffer.BufferReader, Version: number)
+    if Version >= 12 then
+        Bytecode:ReadVarInt()
+    end
+
+    Bytecode:seek(4)
+
+    local Flags = 0
+    if Version >= 4 then
+        Flags = Bytecode:readu8()
+        Bytecode:seek(Bytecode:ReadVarInt())
+    end]], "init.skiphead")
+
+        src = rep(src, [[        elseif Kind == 10 then
+            Bytecode:ReadVarInt()
+
+            local Members = Bytecode:ReadVarInt() + Bytecode:ReadVarInt()
+
+            for _ = 1, Members do
+                Bytecode:ReadVarInt()
+            end
+        end]], [[        elseif Kind == 10 then
+            Bytecode:ReadVarInt()
+
+            local Members = Bytecode:ReadVarInt() + Bytecode:ReadVarInt()
+
+            for _ = 1, Members do
+                Bytecode:ReadVarInt()
+            end
+        elseif Kind == 11 then
+            Bytecode:seek(32)
+        end]], "init.vectord")
+
+        src = rep(src, [[    if Version >= 11 then
+        for _ = 1, Bytecode:ReadVarInt() do
+            Bytecode:seek(1)
+            Bytecode:ReadVarInt()
+        end
+    end
+end]], [[    if Version >= 11 then
+        for _ = 1, Bytecode:ReadVarInt() do
+            Bytecode:seek(1)
+            Bytecode:ReadVarInt()
+        end
+    end
+
+    if Version >= 12 and bit32.band(Flags, 8) ~= 0 then
+        Bytecode:ReadVarInt()
+    end
+end]], "init.cost")
+
+        src = rep(src, [[        if Version < LuauSpec.LuauBytecodeTag.LBC_VERSION_MIN or Version > LuauSpec.LuauBytecodeTag.LBC_VERSION_MAX then
+            return nil
+        end]], [[        if Version < LuauSpec.LuauBytecodeTag.LBC_VERSION_MIN or (Version > LuauSpec.LuauBytecodeTag.LBC_VERSION_MAX and Version ~= LuauSpec.LuauBytecodeTag.LBC_VERSION_CLASSES) then
+            return nil
+        end]], "init.probeclasses")
+
+        src = rep(src, [[        Bytecode:seek(Starts[MainId + 1] - Bytecode.Offset)
+
+        Bytecode:seek(4)]], [[        Bytecode:seek(Starts[MainId + 1] - Bytecode.Offset)
+
+        if Version >= 12 then
+            Bytecode:ReadVarInt()
+        end
+
+        Bytecode:seek(4)]], "init.probe")
+        return src
+    end
+
+    if path == "Src/Classes/Proto.luau" then
+        src = rep(src, [[        else
+            error(`Unexpected constant kind ({ConstantType})`)
+        end]], [[        elseif ConstantType == LuauSpec.LuauBytecodeConstants.LBC_CONSTANT_VECTORD then
+            local x, y, z, w =
+                Bytecode:readf64(), Bytecode:readf64(), Bytecode:readf64(), Bytecode:readf64()
+            self.Constants[ConstantIndex] = Vector.new(x, y, z, w)
+        else
+            error(`Unexpected constant kind ({ConstantType})`)
+        end]], "proto.vectord")
+
+        src = rep(src, [[    if Deserializer.BytecodeVersion >= 11 then
+        local FeedbackSlotCount = Bytecode:ReadVarInt()
+        self.FeedbackSlots = table.create(FeedbackSlotCount)
+
+        for i = 1, FeedbackSlotCount do
+            self.FeedbackSlots[i] = {
+                Type = Bytecode:readu8(),
+                Pc = Bytecode:ReadVarInt()
+            }
+        end
+    end
+
+\treturn self]], [[    if Deserializer.BytecodeVersion >= 11 then
+        local FeedbackSlotCount = Bytecode:ReadVarInt()
+        self.FeedbackSlots = table.create(FeedbackSlotCount)
+
+        for i = 1, FeedbackSlotCount do
+            self.FeedbackSlots[i] = {
+                Type = Bytecode:readu8(),
+                Pc = Bytecode:ReadVarInt()
+            }
+        end
+    end
+
+    if Deserializer.BytecodeVersion >= 12 and bit32.band(self.Flags or 0, 8) ~= 0 then
+        self.Cost = Bytecode:ReadVarInt()
+    end
+
+\treturn self]], "proto.cost")
+        return src
+    end
+
+    return src
+end
+
+function patch.info()
+    return { rev = rev, max = 13, target = 9, classes = 100 }
+end
+
+return patch
 ]===],
     ["main.serialization.dex_serializer"] = [===[
 --[[
@@ -4960,7 +6470,6 @@ Serializer = (function()
 		end,
 	}
 
-	-- Lumen compatibility: newer API dumps may call the string-backed type Content.
 	binaryPropHandlers.Content = binaryPropHandlers.ContentId
 
 	local specialProps = {
@@ -5183,7 +6692,6 @@ Serializer = (function()
 			return decompile(scr,nil,saveSettings.DecompileTimeout)
 		end
 
-		-- Compatibility timeout for legacy callback-style decompilers.
 		task.spawn(function()
 			task.wait(saveSettings.DecompileTimeout + 1)
 			if not finished then
@@ -6150,9 +7658,6 @@ Main = (function()
 		local api = service.HttpService:JSONDecode(rawAPI)
 		local classes,enums = {},{}
 
-		-- Lumen patch: create every class shell first. The original serializer
-		-- linked Superclass while iterating the dump, which implicitly depended
-		-- on parent classes appearing before subclasses.
 		for _,class in pairs(api.Classes) do
 			classes[class.Name] = {
 				Name = class.Name,
@@ -6387,7 +7892,7 @@ end
 return save
 ]===],
     ["main.version"] = [===[
-return { name = "LumenDecomp", version = "2.0.0" }
+return { name = "LumenDecomp", version = "3.0.0" }
 ]===],
 }
 

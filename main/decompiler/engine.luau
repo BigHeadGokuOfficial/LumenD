@@ -15,20 +15,36 @@ local ex = require("main.output.expr")
 local decomp = {}
 decomp.__index = decomp
 
+local function loopused(st, r, a, b)
+    local pc = a
+    while pc < b do
+        local uses = st.ssa.usesByPC[pc]
+        if uses and uses[r] then return true end
+        pc = st:next(pc)
+    end
+    return false
+end
+
 function decomp.new(opt)
     return setmetatable({ opt = opt or {} }, decomp)
 end
 
-function decomp:_state(proto, up)
-    local ir = irpass.run(irbuild.run(proto), self.opt)
+function decomp:_state(proto, up, ph)
+    local ir = irbuild.run(proto)
+    ir.paramhints = ph or {}
+    ir = irpass.run(ir, self.opt)
     local naming = names.new(ir.cfg.registerStats, self.opt, proto)
     return context.new(proto, ir, naming, up, lower.new(), self.opt)
 end
 
-function decomp:_child(proto, up)
-    local st = self:_state(proto, up)
+function decomp:_child(proto, up, ph)
+    local st = self:_state(proto, up, ph)
     local args = {}
-    for i = 0, (proto.ParameterCount or 0) - 1 do args[#args + 1] = st.naming:nameAt(i, 1, nil) end
+    for i = 0, (proto.ParameterCount or 0) - 1 do
+        local name = st:vname(st.ssa.params[i], i, nil, 1)
+        local an = st:paramann(i)
+        args[#args + 1] = name .. (an and (": " .. an) or "")
+    end
     if proto.IsVararg then args[#args + 1] = "..." end
     self:_region(st, 1, #proto.Instructions + 1, {})
     local root = astpass.run(st.ast:done(), self.opt)
@@ -41,7 +57,10 @@ function decomp:_numfor(st, pc, op, stop, active)
     local loop = info.loop
     local a = op.A
     local old = st.alias[a + 3]
-    local var = st.naming:unique("i")
+    local lv = st:verdef(loop, a + 3)
+    local depth = (active.loopdepth or 0) + 1
+    local fall = ({ "i", "j", "k", "n" })[depth] or ("i" .. tostring(depth))
+    local var = not loopused(st, a + 3, st:next(pc), loop) and "_" or st:vname(lv, a + 3, fall, loop)
     local limit = ex.str(st:loopx(pc, loop, a))
     local step = ex.str(st:loopx(pc, loop, a + 1))
     local init = ex.str(st:loopx(pc, loop, a + 2))
@@ -52,9 +71,12 @@ function decomp:_numfor(st, pc, op, stop, active)
     st.alias[a + 3] = var
     st.declared[var] = st.indent
     local prev = active.loop
+    local olddepth = active.loopdepth
     active.loop = { breakpc = info.exit, contpc = loop }
+    active.loopdepth = depth
     self:_region(st, st:next(pc), loop, active)
     active.loop = prev
+    active.loopdepth = olddepth
     st:trim(st.indent)
     st.indent -= 1
     st:out("end")
@@ -69,11 +91,14 @@ function decomp:_genfor(st, pc, op, stop, active)
     local lop = info.op
     local aux = lop.AuxValue and lop.AuxValue.Value or 0
     local n = math.max(1, bit32.band(aux, 0xff))
+    local depth = (active.loopdepth or 0) + 1
     local vars, old = {}, {}
     for i = 1, n do
         local r = op.A + 2 + i
         old[r] = st.alias[r]
-        vars[i] = st.naming:unique(i == 1 and "key" or (i == 2 and "value" or ("value" .. tostring(i))))
+        local hint = i == 1 and (n == 1 and "item" or "key") or (i == 2 and "value" or ("value" .. tostring(i)))
+        local v = st:verdef(loop, r)
+        vars[i] = not loopused(st, r, st:next(pc), loop) and "_" or st:vname(v, r, hint, loop)
     end
 
     local src
@@ -98,9 +123,12 @@ function decomp:_genfor(st, pc, op, stop, active)
         st.declared[vars[i]] = st.indent
     end
     local prev = active.loop
+    local olddepth = active.loopdepth
     active.loop = { breakpc = info.exit, contpc = loop }
+    active.loopdepth = depth
     self:_region(st, st:next(pc), loop, active)
     active.loop = prev
+    active.loopdepth = olddepth
     st:trim(st.indent)
     st.indent -= 1
     st:out("end")
@@ -181,7 +209,17 @@ function decomp:_region(st, start, stop, active)
                         pc = self:_numfor(st, pc, op, stop, active) or ops.run(self, st, pc)
                     elseif name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" then
                         pc = self:_genfor(st, pc, op, stop, active) or ops.run(self, st, pc)
-                    elseif ins.isConditional(op) and name ~= "FORNLOOP" and name ~= "FORGLOOP" and name ~= "CMPPROTO" then
+                    elseif name == "CMPPROTO" then
+                        local target = ins.jumpTarget(pc, op)
+                        local join = st:join(pc)
+                        if join and target > pc and target < join and join <= stop then
+                            self:_region(st, target, join, active)
+                            pc = join
+                        else
+                            st:badpc(pc, "unrecognized CMPPROTO inline guard -> " .. tostring(target))
+                            pc = st:next(pc)
+                        end
+                    elseif ins.isConditional(op) and name ~= "FORNLOOP" and name ~= "FORGLOOP" then
                         local loop = active.loop
                         local target = ins.jumpTarget(pc, op)
                         if loop and target == loop.breakpc then

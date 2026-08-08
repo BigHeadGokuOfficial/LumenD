@@ -5,6 +5,13 @@ local base = {
     dce = true,
     conditions = true,
     guards = true,
+    types = true,
+    selects = true,
+    returns = true,
+    compound = true,
+    inlineast = true,
+    callbacks = true,
+    booleans = true,
     iridium = nil,
 }
 

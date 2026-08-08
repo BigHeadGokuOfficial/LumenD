@@ -1,4 +1,4 @@
-# LumenDecomp
+# LumenDecomp V3
 
 ```lua
 local lumen = loadstring(game:HttpGet("https://raw.githubusercontent.com/BigHeadGokuOfficial/LumenD/main/LumenDecomp/lumen.luau"))()
@@ -8,8 +8,4 @@ local lumen = loadstring(game:HttpGet("https://raw.githubusercontent.com/BigHead
 print(lumen:decompile(script))
 ```
 
-# Credits: 
-
-Moon / DexSerializer, 
-
-ActualMasterOogway / Iridium.
+Credits: Moon / DexSerializer, ActualMasterOogway / Iridium.

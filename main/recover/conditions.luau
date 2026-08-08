@@ -141,7 +141,16 @@ function cond.bool(st, pc, op)
     if join <= tp then join = st:next(tp) end
     st.consumed[fp] = true
     st.consumed[tp] = true
-    st:set(fp, fo.A, x)
+    local bid = st.cfg.blockmap[join]
+    local phis = bid and st.ir.phis[bid]
+    local phi = phis and phis[fo.A]
+    if phi and not phi.missing then
+        local id = st.ir:resolve(phi.id)
+        st.vals[id] = x
+        st.expr[id] = x
+    else
+        st:set(fp, fo.A, x)
+    end
     return join
 end
 

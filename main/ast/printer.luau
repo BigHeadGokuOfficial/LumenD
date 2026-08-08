@@ -36,6 +36,10 @@ local function block(out, b, depth)
                 line(out, depth, "do")
                 block(out, node.body, depth + 1)
                 line(out, depth, "end")
+            elseif k == "callback" then
+                line(out, depth, node.pre .. "function(" .. node.args .. ")")
+                block(out, node.body, depth + 1)
+                line(out, depth, "end" .. node.post)
             elseif k == "function" then
                 if node.localfn then
                     line(out, depth, "local function " .. node.name .. "(" .. node.args .. ")")
