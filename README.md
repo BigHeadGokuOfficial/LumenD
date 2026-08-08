@@ -8,7 +8,7 @@ local lumen = loadstring(game:HttpGet("https://raw.githubusercontent.com/BigHead
 print(lumen:decompile(script))
 ```
 
-#Credits: 
+# Credits: 
 
 Moon / DexSerializer, 
 
