@@ -36,4 +36,8 @@ print(lumen:decompile(script, options))
 
 `DoBlockInsertionThreshold = 0` disables scope-block insertion. Set it above zero when generating very large source that needs tighter local-variable scopes for recompilation.
 
-Credits: Moon / DexSerializer, ActualMasterOogway / Iridium.
+# Credits:
+
+Moon / DexSerializer,
+
+ActualMasterOogway / Iridium.
