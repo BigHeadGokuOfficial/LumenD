@@ -8,8 +8,8 @@ g.Decompile = true
 g.Tree = true
 g.IgnoreCoreScripts = true
 
-g.Parallel = true
-g.MaxWorkers = 4
+g.Parallel = true --disable if on potato pc
+g.MaxWorkers = 4 -- parallel can lag your pc. Set workers to low numbers, high numbers can cause instability with ur pc so be smart in what you do
 
 g.DecompilerOptions = {
     SmartVariableRenamer = true,
