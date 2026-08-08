@@ -93,6 +93,22 @@ function ctx:vname(v, r, hint, pc)
     local score = self.ir.namescore and self.ir.namescore[v] or 0
     local name
 
+    if self.opt.smartnames == false then
+        if di then
+            name = self.naming:nameAt(r, pc, nil)
+        elseif src and src.kind == "param" then
+            name = self.naming:unique("arg" .. tostring(src.reg + 1))
+        else
+            repeat
+                name = "v" .. tostring(self.nexttmp)
+                self.nexttmp += 1
+            until not self.naming.used[name]
+            name = self.naming:unique(name)
+        end
+        self.vnames[v] = name
+        return name
+    end
+
     if di then
         name = self.naming:nameAt(r, pc, nil)
     elseif best and score >= 80 then

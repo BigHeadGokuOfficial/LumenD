@@ -817,6 +817,7 @@ return ssa
     ["main.api"] = [===[
 local ver = require("main.version")
 local cfg = require("main.config")
+local options = require("main.options")
 local bc = require("main.runtime.bytecode")
 local iri = require("main.runtime.iridium")
 local decomp = require("main.decompiler.engine")
@@ -830,6 +831,8 @@ local api = {
     Version = ver.version,
     Name = ver.name,
 }
+
+api.DecompilerOptions = { new = options.new }
 
 local function parsebc(raw, opt)
     return iri.get():Deserialize(raw, opt.iridium)
@@ -1247,6 +1250,168 @@ end
 function pass.run(root)
     walk(root)
     return root
+end
+
+return pass
+]===],
+    ["main.ast.doblocks"] = [===[
+local pass = {}
+
+local function words(s, out)
+    if type(s) ~= "string" then return end
+    for x in s:gmatch("[%a_][%w_]*") do out[x] = true end
+end
+
+local function declraw(s)
+    if type(s) ~= "string" then return {} end
+    local head = s:match("^local%s+(.+)$")
+    if not head or head:match("^function%s") then return {} end
+    head = head:match("^(.-)%s*=") or head
+    local out = {}
+    for part in head:gmatch("[^,]+") do
+        local name = part:match("^%s*([%a_][%w_]*)")
+        if name then out[#out + 1] = name end
+    end
+    return out
+end
+
+local function decls(n)
+    if n.kind == "raw" then return declraw(n.text) end
+    if n.kind == "function" and n.localfn then return { n.name } end
+    return {}
+end
+
+local function scanblock(b, out)
+    for _, n in ipairs(b.body or {}) do
+        if not n.dead then
+            if n.kind == "raw" or n.kind == "return" or n.kind == "break" or n.kind == "continue" then
+                words(n.text, out)
+            elseif n.kind == "if" then
+                for _, x in ipairs(n.branches or {}) do
+                    words(x.cond, out)
+                    scanblock(x.body, out)
+                end
+                if n.elsebody then scanblock(n.elsebody, out) end
+            elseif n.kind == "while" or n.kind == "repeat" then
+                words(n.cond, out)
+                scanblock(n.body, out)
+            elseif n.kind == "for" then
+                words(n.head, out)
+                scanblock(n.body, out)
+            elseif n.kind == "do" then
+                scanblock(n.body, out)
+            elseif n.kind == "callback" then
+                words(n.pre, out)
+                words(n.args, out)
+                words(n.post, out)
+                scanblock(n.body, out)
+            elseif n.kind == "function" then
+                words(n.name, out)
+                words(n.args, out)
+                scanblock(n.body, out)
+            end
+        end
+    end
+end
+
+local function refs(n)
+    local out = {}
+    if n.kind == "raw" or n.kind == "return" or n.kind == "break" or n.kind == "continue" then
+        words(n.text, out)
+    elseif n.kind == "if" then
+        for _, x in ipairs(n.branches or {}) do
+            words(x.cond, out)
+            scanblock(x.body, out)
+        end
+        if n.elsebody then scanblock(n.elsebody, out) end
+    elseif n.kind == "while" or n.kind == "repeat" then
+        words(n.cond, out)
+        scanblock(n.body, out)
+    elseif n.kind == "for" then
+        words(n.head, out)
+        scanblock(n.body, out)
+    elseif n.kind == "do" then
+        scanblock(n.body, out)
+    elseif n.kind == "callback" then
+        words(n.pre, out)
+        words(n.args, out)
+        words(n.post, out)
+        scanblock(n.body, out)
+    elseif n.kind == "function" then
+        words(n.name, out)
+        words(n.args, out)
+        scanblock(n.body, out)
+    end
+    for _, name in ipairs(decls(n)) do out[name] = nil end
+    return out
+end
+
+local function children(n, threshold)
+    if n.kind == "if" then
+        for _, x in ipairs(n.branches or {}) do pass.run(x.body, threshold) end
+        if n.elsebody then pass.run(n.elsebody, threshold) end
+    elseif n.body then
+        pass.run(n.body, threshold)
+    end
+end
+
+function pass.run(block, threshold)
+    threshold = math.floor(tonumber(threshold) or 0)
+    for _, n in ipairs(block.body or {}) do children(n, threshold) end
+    if threshold <= 0 or #(block.body or {}) < 2 then return block end
+
+    local body = block.body
+    local used = {}
+    for i, n in ipairs(body) do used[i] = refs(n) end
+
+    local last = {}
+    for i = #body, 1, -1 do
+        for name in pairs(used[i]) do
+            if last[name] == nil then last[name] = i end
+        end
+    end
+
+    local ranges = {}
+    local start = nil
+    local count = 0
+    local finish = 0
+    for i, n in ipairs(body) do
+        local ds = decls(n)
+        if #ds > 0 then
+            if not start then start = i end
+            count += #ds
+            for _, name in ipairs(ds) do
+                local x = last[name] or i
+                if x > finish then finish = x end
+            end
+        end
+        if start and i >= finish and count >= threshold then
+            ranges[#ranges + 1] = { start, i }
+            start = nil
+            count = 0
+            finish = 0
+        end
+    end
+
+    if #ranges == 0 then return block end
+    local by = {}
+    for _, r in ipairs(ranges) do by[r[1]] = r[2] end
+    local out = {}
+    local i = 1
+    while i <= #body do
+        local e = by[i]
+        if e then
+            local sub = { kind = "block", body = {} }
+            for j = i, e do sub.body[#sub.body + 1] = body[j] end
+            out[#out + 1] = { kind = "do", body = sub }
+            i = e + 1
+        else
+            out[#out + 1] = body[i]
+            i += 1
+        end
+    end
+    block.body = out
+    return block
 end
 
 return pass
@@ -1757,6 +1922,7 @@ local bools = require("main.ast.booleans")
 local comp = require("main.ast.compound")
 local locals = require("main.ast.locals")
 local dead = require("main.ast.deadcode")
+local scopes = require("main.ast.doblocks")
 
 local pass = {}
 
@@ -1764,21 +1930,26 @@ function pass.run(root, opt)
     opt = opt or {}
     if opt.dce ~= false then dead.run(root) end
     if opt.fold ~= false then fold.run(root) end
-    if opt.conditions ~= false then cond.run(root) end
-    if opt.selects ~= false then selectp.run(root) end
-    if opt.returns ~= false then ret.run(root) end
+    if opt.conditions ~= false then
+        cond.run(root)
+        if opt.selects ~= false then selectp.run(root) end
+        if opt.returns ~= false then ret.run(root) end
+    end
     if opt.inlineast ~= false then inline.run(root) end
     if opt.callbacks ~= false then callbacks.run(root) end
-    if opt.booleans ~= false then bools.run(root) end
+    if opt.conditions ~= false and opt.booleans ~= false then bools.run(root) end
     if opt.guards ~= false then
         guards2.run(root)
         guards.run(root)
     end
     locals.run(root)
     if opt.compound ~= false then comp.run(root) end
-    logic.run(root)
-    if opt.conditions ~= false then cond.run(root) end
+    if opt.conditions ~= false then
+        logic.run(root)
+        cond.run(root)
+    end
     if opt.dce ~= false then dead.run(root) end
+    if (opt.doblocks or 0) > 0 then scopes.run(root, opt.doblocks) end
     return root
 end
 
@@ -1787,64 +1958,122 @@ return pass
     ["main.ast.printer"] = [===[
 local printast = {}
 
-local function line(out, depth, s)
-    out[#out + 1] = string.rep("    ", depth) .. s
+local function esc(s)
+    return (s:gsub("([^%w])", "%%%1"))
 end
 
-local function block(out, b, depth)
+local function hasname(node, name)
+    if not node or node.dead then return false end
+    local pat = "%f[%w_]" .. esc(name) .. "%f[^%w_]"
+    local function hit(s) return type(s) == "string" and s:find(pat) ~= nil end
+    if hit(node.text) or hit(node.cond) or hit(node.head) or hit(node.args) then return true end
+    if node.kind == "if" then
+        for _, b in ipairs(node.branches or {}) do
+            if hit(b.cond) then return true end
+            for _, x in ipairs(b.body.body or {}) do if hasname(x, name) then return true end end
+        end
+        if node.elsebody then for _, x in ipairs(node.elsebody.body or {}) do if hasname(x, name) then return true end end end
+    elseif node.body then
+        for _, x in ipairs(node.body.body or {}) do if hasname(x, name) then return true end end
+    end
+    return false
+end
+
+local function recursive(node)
+    for _, x in ipairs(node.body.body or {}) do if hasname(x, node.name) then return true end end
+    return false
+end
+
+local function indent(opt, depth)
+    local n = tonumber(opt.formatter and opt.formatter.IndentWidth) or 4
+    n = math.max(0, math.min(16, math.floor(n)))
+    return string.rep(" ", n * depth)
+end
+
+local function line(out, opt, depth, s, stmt)
+    if stmt and opt.formatter and opt.formatter.AppendSemicolons then
+        local last = s:sub(-1)
+        if last ~= ";" and last ~= ":" then s = s .. ";" end
+    end
+    out[#out + 1] = indent(opt, depth) .. s
+end
+
+local function cond(opt, s)
+    if opt.formatter and opt.formatter.ParenthesizeConditions then return "(" .. s .. ")" end
+    return s
+end
+
+local function fnhead(node, opt)
+    local args = node.args or ""
+    if opt.functions == false then
+        if node.localfn then return "local " .. node.name .. " = function(" .. args .. ")" end
+        if node.assign then return node.name .. " = function(" .. args .. ")" end
+        local base, field = node.name:match("^(.*):([%a_][%w_]*)$")
+        if base and field then
+            local a = args ~= "" and ("self, " .. args) or "self"
+            return base .. "." .. field .. " = function(" .. a .. ")"
+        end
+        return node.name .. " = function(" .. args .. ")"
+    end
+    if node.localfn then return "local function " .. node.name .. "(" .. args .. ")" end
+    if node.assign then return node.name .. " = function(" .. args .. ")" end
+    return "function " .. node.name .. "(" .. args .. ")"
+end
+
+local function block(out, b, depth, opt)
     for _, node in ipairs(b.body) do
         if not node.dead then
             local k = node.kind
             if k == "raw" or k == "return" or k == "break" or k == "continue" then
-                line(out, depth, node.text)
+                line(out, opt, depth, node.text, true)
             elseif k == "if" then
                 for i, branch in ipairs(node.branches) do
-                    line(out, depth, (i == 1 and "if " or "elseif ") .. branch.cond .. " then")
-                    block(out, branch.body, depth + 1)
+                    line(out, opt, depth, (i == 1 and "if " or "elseif ") .. cond(opt, branch.cond) .. " then")
+                    block(out, branch.body, depth + 1, opt)
                 end
                 if node.elsebody then
-                    line(out, depth, "else")
-                    block(out, node.elsebody, depth + 1)
+                    line(out, opt, depth, "else")
+                    block(out, node.elsebody, depth + 1, opt)
                 end
-                line(out, depth, "end")
+                line(out, opt, depth, "end")
             elseif k == "while" then
-                line(out, depth, "while " .. node.cond .. " do")
-                block(out, node.body, depth + 1)
-                line(out, depth, "end")
+                line(out, opt, depth, "while " .. cond(opt, node.cond) .. " do")
+                block(out, node.body, depth + 1, opt)
+                line(out, opt, depth, "end")
             elseif k == "repeat" then
-                line(out, depth, "repeat")
-                block(out, node.body, depth + 1)
-                line(out, depth, "until " .. node.cond)
+                line(out, opt, depth, "repeat")
+                block(out, node.body, depth + 1, opt)
+                line(out, opt, depth, "until " .. cond(opt, node.cond))
             elseif k == "for" then
-                line(out, depth, node.head .. " do")
-                block(out, node.body, depth + 1)
-                line(out, depth, "end")
+                line(out, opt, depth, node.head .. " do")
+                block(out, node.body, depth + 1, opt)
+                line(out, opt, depth, "end")
             elseif k == "do" then
-                line(out, depth, "do")
-                block(out, node.body, depth + 1)
-                line(out, depth, "end")
+                line(out, opt, depth, "do")
+                block(out, node.body, depth + 1, opt)
+                line(out, opt, depth, "end")
             elseif k == "callback" then
-                line(out, depth, node.pre .. "function(" .. node.args .. ")")
-                block(out, node.body, depth + 1)
-                line(out, depth, "end" .. node.post)
+                line(out, opt, depth, node.pre .. "function(" .. node.args .. ")")
+                block(out, node.body, depth + 1, opt)
+                line(out, opt, depth, "end" .. node.post, true)
             elseif k == "function" then
-                if node.localfn then
-                    line(out, depth, "local function " .. node.name .. "(" .. node.args .. ")")
-                elseif node.assign then
-                    line(out, depth, node.name .. " = function(" .. node.args .. ")")
+                if opt.functions == false and node.localfn and recursive(node) then
+                    line(out, opt, depth, "local " .. node.name, true)
+                    line(out, opt, depth, node.name .. " = function(" .. (node.args or "") .. ")")
                 else
-                    line(out, depth, "function " .. node.name .. "(" .. node.args .. ")")
+                    line(out, opt, depth, fnhead(node, opt))
                 end
-                block(out, node.body, depth + 1)
-                line(out, depth, "end")
+                block(out, node.body, depth + 1, opt)
+                line(out, opt, depth, "end", opt.functions == false or node.assign)
             end
         end
     end
 end
 
-function printast.run(root)
+function printast.run(root, opt)
+    opt = opt or {}
     local out = {}
-    block(out, root, 0)
+    block(out, root, 0, opt)
     return table.concat(out, "\n")
 end
 
@@ -2087,13 +2316,28 @@ local base = {
     inlineast = true,
     callbacks = true,
     booleans = true,
+    smartnames = true,
+    functions = true,
+    doblocks = 0,
     iridium = nil,
+}
+
+local map = {
+    SmartVariableRenamer = "smartnames",
+    FunctionDeclarations = "functions",
+    GuardClauses = "guards",
+    ConstantFolding = "fold",
+    ConditionalStructurer = "conditions",
+    DoBlockInsertionThreshold = "doblocks",
 }
 
 return function(opt)
     local out = {}
     for k, v in pairs(base) do out[k] = v end
-    if opt then for k, v in pairs(opt) do out[k] = v end end
+    if opt then
+        for k, v in pairs(opt) do out[map[k] or k] = v end
+    end
+    out.doblocks = math.max(0, math.floor(tonumber(out.doblocks) or 0))
     return out
 end
 ]===],
@@ -2192,6 +2436,22 @@ function ctx:vname(v, r, hint, pc)
     local best = self.ir.bestname and self.ir.bestname[v] or nil
     local score = self.ir.namescore and self.ir.namescore[v] or 0
     local name
+
+    if self.opt.smartnames == false then
+        if di then
+            name = self.naming:nameAt(r, pc, nil)
+        elseif src and src.kind == "param" then
+            name = self.naming:unique("arg" .. tostring(src.reg + 1))
+        else
+            repeat
+                name = "v" .. tostring(self.nexttmp)
+                self.nexttmp += 1
+            until not self.naming.used[name]
+            name = self.naming:unique(name)
+        end
+        self.vnames[v] = name
+        return name
+    end
 
     if di then
         name = self.naming:nameAt(r, pc, nil)
@@ -2770,7 +3030,7 @@ end
 
 function decomp:decompileProto(proto, up)
     local root, st = self:_child(proto, up or {})
-    return printer.run(root), {
+    return printer.run(root, self.opt), {
         cfg = st.cfg,
         ir = st.ir,
         ssa = st.ssa,
@@ -3188,6 +3448,7 @@ local st = require("main.runtime.status")
 local coref = require("main.runtime.core")
 local bc = require("main.runtime.bytecode")
 local tree = require("main.tree")
+local config = require("main.config")
 
 local dump = {}
 
@@ -3222,11 +3483,24 @@ local function unavailable(stat, cache, obj, err)
     stat.unavailableErrors[#stat.unavailableErrors + 1] = line
 end
 
-local function acquire(list, stat)
+local function acquire(list, stat, opt)
     local jobs = {}
     local cache = {}
     local started = os.clock()
-    stat.found = #list
+    local slice = started
+    local total = #list
+    local batch = tonumber(opt.AcquireBatch)
+    if not batch then
+        if total >= 500 then batch = 3
+        elseif total >= 200 then batch = 4
+        elseif total >= 80 then batch = 6
+        else batch = 12 end
+    end
+    batch = math.max(1, math.floor(batch))
+    local budget = math.max(0.001, (tonumber(opt.AcquireBudgetMs) or 3) / 1000)
+    stat.found = total
+    stat.acquireBatch = batch
+    stat.acquireBudgetMs = budget * 1000
 
     for i, obj in ipairs(list) do
         local ok, raw = bc.try(obj)
@@ -3236,8 +3510,13 @@ local function acquire(list, stat)
         else
             unavailable(stat, cache, obj, raw)
         end
-        st.progress("Acquiring bytecode", obj, i, #list)
-        if i % 64 == 0 then task.wait() end
+        st.progress("Acquiring bytecode", obj, i, total)
+        local now = os.clock()
+        if i < total and (i % batch == 0 or now - slice >= budget) then
+            stat.acquireYields += 1
+            task.wait()
+            slice = os.clock()
+        end
     end
 
     stat.available = #jobs
@@ -3290,7 +3569,7 @@ local function serial(lumen, jobs, opt, stat, cache, label)
 end
 
 local actorcode = [[
-local id, src, vendor = ...
+local id, src, vendor, smart, funcs, guards, fold, conds, blocks = ...
 local ch = get_comm_channel(id)
 local genv = type(getgenv) == "function" and getgenv() or _G
 local okv, v = pcall(function()
@@ -3319,6 +3598,14 @@ if not wok then
 end
 genv.__LUMEN_IRIDIUM_VENDOR = nil
 _G.__LUMEN_IRIDIUM_VENDOR = nil
+local dec = {
+    smartnames = smart,
+    functions = funcs,
+    guards = guards,
+    fold = fold,
+    conditions = conds,
+    doblocks = blocks,
+}
 local con
 con = ch.Event:Connect(function(kind, jid, raw)
     if kind == "stop" then
@@ -3326,7 +3613,7 @@ con = ch.Event:Connect(function(kind, jid, raw)
         return
     end
     if kind ~= "job" then return end
-    local good, out = pcall(function() return api:decompileBytecode(raw) end)
+    local good, out = pcall(function() return api:decompileBytecode(raw, dec) end)
     if good and type(out) == "string" and out ~= "" then
         ch:Fire("done", jid, true, out)
     else
@@ -3406,6 +3693,7 @@ local function actors(lumen, jobs, opt, stat, cache)
     end
 
     local ws = {}
+    local dc = config(decopt(opt))
     local q = {}
     local qhead = 1
     local qtail = 0
@@ -3431,7 +3719,7 @@ local function actors(lumen, jobs, opt, stat, cache)
             end
         end)
         ws[#ws + 1] = w
-        local rok, rerr = pcall(run_on_actor, w.actor, actorcode, id, src, vendor)
+        local rok, rerr = pcall(run_on_actor, w.actor, actorcode, id, src, vendor, dc.smartnames ~= false, dc.functions ~= false, dc.guards ~= false, dc.fold ~= false, dc.conditions ~= false, dc.doblocks or 0)
         if not rok then
             w.dead = true
             w.err = tostring(rerr)
@@ -3623,7 +3911,16 @@ local function summary(root, stat)
         "Write failures: " .. tostring(stat.writeFailed),
         "Binary: " .. tostring(stat.binary),
         "Workers: " .. tostring(stat.parallel or 1),
+        "SmartVariableRenamer: " .. tostring(stat.decompiler and stat.decompiler.smartnames ~= false),
+        "FunctionDeclarations: " .. tostring(stat.decompiler and stat.decompiler.functions ~= false),
+        "GuardClauses: " .. tostring(stat.decompiler and stat.decompiler.guards ~= false),
+        "ConstantFolding: " .. tostring(stat.decompiler and stat.decompiler.fold ~= false),
+        "ConditionalStructurer: " .. tostring(stat.decompiler and stat.decompiler.conditions ~= false),
+        "DoBlockInsertionThreshold: " .. tostring(stat.decompiler and stat.decompiler.doblocks or 0),
         "Acquire seconds: " .. string.format("%.3f", stat.acquireTime or 0),
+        "Acquire batch: " .. tostring(stat.acquireBatch or 0),
+        "Acquire budget ms: " .. string.format("%.2f", stat.acquireBudgetMs or 0),
+        "Acquire yields: " .. tostring(stat.acquireYields or 0),
         "Warmup seconds: " .. string.format("%.3f", stat.warmTime or 0),
         "Worker boot seconds: " .. string.format("%.3f", stat.parallelBootTime or 0),
         "Reconstruct seconds: " .. string.format("%.3f", stat.decompileTime or 0),
@@ -3664,6 +3961,9 @@ function dump.run(lumen, opt)
         errors = {},
         unavailableErrors = {},
         acquireTime = 0,
+        acquireBatch = 0,
+        acquireBudgetMs = 0,
+        acquireYields = 0,
         warmTime = 0,
         parallelBootTime = 0,
         decompileTime = 0,
@@ -3671,6 +3971,7 @@ function dump.run(lumen, opt)
         totalTime = 0,
         rate = 0,
         parallel = 1,
+        decompiler = config(decopt(opt)),
     }
     local made = {}
     tree.mkall(root, made)
@@ -3684,7 +3985,7 @@ function dump.run(lumen, opt)
         stat.scanFailed = #scanerr
         for _, e in ipairs(scanerr) do stat.errors[#stat.errors + 1] = "scan :: " .. tostring(e) end
         local jobs
-        jobs, cache = acquire(list, stat)
+        jobs, cache = acquire(list, stat, opt)
 
         if #jobs > 0 then
             local pok, pout, preason = pcall(actors, lumen, jobs, opt, stat, cache)
@@ -3769,10 +4070,21 @@ function dump.auto(lumen, boot)
     if parallel == nil then parallel = true else parallel = parallel == true end
     local maxworkers = tonumber(val("MaxWorkers")) or 4
     local maxpath = tonumber(val("MaxPathLength")) or 240
+    local acquirebatch = tonumber(val("AcquireBatch"))
+    local acquirebudget = tonumber(val("AcquireBudgetMs")) or 3
+    local dopt = val("DecompilerOptions")
+    if type(dopt) ~= "table" then dopt = {} end
+    local names = { "SmartVariableRenamer", "FunctionDeclarations", "GuardClauses", "ConstantFolding", "ConditionalStructurer", "DoBlockInsertionThreshold" }
+    for _, name in ipairs(names) do
+        local v = val(name)
+        if v ~= nil then dopt[name] = v end
+    end
     local flags = "Binary=" .. tostring(binary) .. " | Decompile=" .. tostring(decomp) .. " | Tree=" .. tostring(treeon) .. " | IgnoreCoreScripts=" .. tostring(ignorecore) .. " | Parallel=" .. tostring(parallel) .. " | MaxWorkers=" .. tostring(maxworkers)
 
     st.set("Loaded", "v" .. tostring(lumen.Version) .. " | " .. flags)
     print("[LumenDecomp] " .. flags)
+    local dc = config(dopt)
+    print("[LumenDecomp] SmartVariableRenamer=" .. tostring(dc.smartnames ~= false) .. " | FunctionDeclarations=" .. tostring(dc.functions ~= false) .. " | GuardClauses=" .. tostring(dc.guards ~= false) .. " | ConstantFolding=" .. tostring(dc.fold ~= false) .. " | ConditionalStructurer=" .. tostring(dc.conditions ~= false) .. " | DoBlockInsertionThreshold=" .. tostring(dc.doblocks or 0))
     if not binary and not decomp and not treeon then
         task.delay(2, function() st.done("Loaded - idle | " .. flags) end)
         return false
@@ -3786,7 +4098,7 @@ function dump.auto(lumen, boot)
     st.set("Starting dump", flags)
     task.spawn(function()
         local ok, err = pcall(function()
-            dump.run(lumen, { Binary = binary, Decompile = decomp, Tree = treeon, IgnoreCoreScripts = ignorecore, Parallel = parallel, MaxWorkers = maxworkers, MaxPathLength = maxpath })
+            dump.run(lumen, { Binary = binary, Decompile = decomp, Tree = treeon, IgnoreCoreScripts = ignorecore, Parallel = parallel, MaxWorkers = maxworkers, MaxPathLength = maxpath, AcquireBatch = acquirebatch, AcquireBudgetMs = acquirebudget, Options = dopt })
         end)
         e.__LumenDump = nil
         if not ok then
@@ -4213,6 +4525,11 @@ function names:nameAt(reg, pc, hint)
         return name
     end
 
+    if self.opt.smartnames == false then
+        if pc == 1 and reg < (self.proto.ParameterCount or 0) then return self:unique("arg" .. tostring(reg + 1)) end
+        return self:name(reg, nil)
+    end
+
     local typed = self:typeAt(reg, pc)
     if typed then
         local key = "t:" .. tostring(reg) .. ":" .. tostring(typed.StartPc) .. ":" .. tostring(typed.EndPc)
@@ -4237,7 +4554,7 @@ function names:name(reg, hint)
     local old = self.regs[reg]
     if old then return old end
     local base
-    if hint and self:stable(reg) then base = id.clean(hint) end
+    if self.opt.smartnames ~= false and hint and self:stable(reg) then base = id.clean(hint) end
     base = base or ("v" .. tostring(reg))
     local name = self:unique(base)
     self.regs[reg] = name
@@ -4508,6 +4825,22 @@ function w.iter(s)
 end
 
 return w
+]===],
+    ["main.options"] = [===[
+local opt = {}
+
+function opt.new()
+    return {
+        SmartVariableRenamer = true,
+        FunctionDeclarations = true,
+        GuardClauses = true,
+        ConstantFolding = true,
+        ConditionalStructurer = true,
+        DoBlockInsertionThreshold = 0,
+    }
+end
+
+return opt
 ]===],
     ["main.output.expr"] = [===[
 local expr = {}
@@ -5003,7 +5336,7 @@ function pipe.run(ir, opt)
     if opt.fold ~= false then konst.run(ir) end
     if opt.dce ~= false then dead.run(ir) end
     names.run(ir)
-    prov.run(ir)
+    if opt.smartnames ~= false then prov.run(ir) else ir.bestname, ir.namescore, ir.hints, ir.origin = {}, {}, {}, {} end
     if opt.inline ~= false then inline.run(ir) end
     cond.run(ir)
     flow.run(ir)
@@ -9109,7 +9442,7 @@ end
 return tree
 ]===],
     ["main.version"] = [===[
-return { name = "LumenDecomp", version = "3.2.4" }
+return { name = "LumenDecomp", version = "3.3.0" }
 ]===],
     ["main.worker"] = [===[
 local cfg = require("main.config")
@@ -10258,6 +10591,168 @@ end
 
 return pass
 ]===],
+    ["main.ast.doblocks"] = [===[
+local pass = {}
+
+local function words(s, out)
+    if type(s) ~= "string" then return end
+    for x in s:gmatch("[%a_][%w_]*") do out[x] = true end
+end
+
+local function declraw(s)
+    if type(s) ~= "string" then return {} end
+    local head = s:match("^local%s+(.+)$")
+    if not head or head:match("^function%s") then return {} end
+    head = head:match("^(.-)%s*=") or head
+    local out = {}
+    for part in head:gmatch("[^,]+") do
+        local name = part:match("^%s*([%a_][%w_]*)")
+        if name then out[#out + 1] = name end
+    end
+    return out
+end
+
+local function decls(n)
+    if n.kind == "raw" then return declraw(n.text) end
+    if n.kind == "function" and n.localfn then return { n.name } end
+    return {}
+end
+
+local function scanblock(b, out)
+    for _, n in ipairs(b.body or {}) do
+        if not n.dead then
+            if n.kind == "raw" or n.kind == "return" or n.kind == "break" or n.kind == "continue" then
+                words(n.text, out)
+            elseif n.kind == "if" then
+                for _, x in ipairs(n.branches or {}) do
+                    words(x.cond, out)
+                    scanblock(x.body, out)
+                end
+                if n.elsebody then scanblock(n.elsebody, out) end
+            elseif n.kind == "while" or n.kind == "repeat" then
+                words(n.cond, out)
+                scanblock(n.body, out)
+            elseif n.kind == "for" then
+                words(n.head, out)
+                scanblock(n.body, out)
+            elseif n.kind == "do" then
+                scanblock(n.body, out)
+            elseif n.kind == "callback" then
+                words(n.pre, out)
+                words(n.args, out)
+                words(n.post, out)
+                scanblock(n.body, out)
+            elseif n.kind == "function" then
+                words(n.name, out)
+                words(n.args, out)
+                scanblock(n.body, out)
+            end
+        end
+    end
+end
+
+local function refs(n)
+    local out = {}
+    if n.kind == "raw" or n.kind == "return" or n.kind == "break" or n.kind == "continue" then
+        words(n.text, out)
+    elseif n.kind == "if" then
+        for _, x in ipairs(n.branches or {}) do
+            words(x.cond, out)
+            scanblock(x.body, out)
+        end
+        if n.elsebody then scanblock(n.elsebody, out) end
+    elseif n.kind == "while" or n.kind == "repeat" then
+        words(n.cond, out)
+        scanblock(n.body, out)
+    elseif n.kind == "for" then
+        words(n.head, out)
+        scanblock(n.body, out)
+    elseif n.kind == "do" then
+        scanblock(n.body, out)
+    elseif n.kind == "callback" then
+        words(n.pre, out)
+        words(n.args, out)
+        words(n.post, out)
+        scanblock(n.body, out)
+    elseif n.kind == "function" then
+        words(n.name, out)
+        words(n.args, out)
+        scanblock(n.body, out)
+    end
+    for _, name in ipairs(decls(n)) do out[name] = nil end
+    return out
+end
+
+local function children(n, threshold)
+    if n.kind == "if" then
+        for _, x in ipairs(n.branches or {}) do pass.run(x.body, threshold) end
+        if n.elsebody then pass.run(n.elsebody, threshold) end
+    elseif n.body then
+        pass.run(n.body, threshold)
+    end
+end
+
+function pass.run(block, threshold)
+    threshold = math.floor(tonumber(threshold) or 0)
+    for _, n in ipairs(block.body or {}) do children(n, threshold) end
+    if threshold <= 0 or #(block.body or {}) < 2 then return block end
+
+    local body = block.body
+    local used = {}
+    for i, n in ipairs(body) do used[i] = refs(n) end
+
+    local last = {}
+    for i = #body, 1, -1 do
+        for name in pairs(used[i]) do
+            if last[name] == nil then last[name] = i end
+        end
+    end
+
+    local ranges = {}
+    local start = nil
+    local count = 0
+    local finish = 0
+    for i, n in ipairs(body) do
+        local ds = decls(n)
+        if #ds > 0 then
+            if not start then start = i end
+            count += #ds
+            for _, name in ipairs(ds) do
+                local x = last[name] or i
+                if x > finish then finish = x end
+            end
+        end
+        if start and i >= finish and count >= threshold then
+            ranges[#ranges + 1] = { start, i }
+            start = nil
+            count = 0
+            finish = 0
+        end
+    end
+
+    if #ranges == 0 then return block end
+    local by = {}
+    for _, r in ipairs(ranges) do by[r[1]] = r[2] end
+    local out = {}
+    local i = 1
+    while i <= #body do
+        local e = by[i]
+        if e then
+            local sub = { kind = "block", body = {} }
+            for j = i, e do sub.body[#sub.body + 1] = body[j] end
+            out[#out + 1] = { kind = "do", body = sub }
+            i = e + 1
+        else
+            out[#out + 1] = body[i]
+            i += 1
+        end
+    end
+    block.body = out
+    return block
+end
+
+return pass
+]===],
     ["main.ast.fold"] = [===[
 local pass = {}
 
@@ -10764,6 +11259,7 @@ local bools = require("main.ast.booleans")
 local comp = require("main.ast.compound")
 local locals = require("main.ast.locals")
 local dead = require("main.ast.deadcode")
+local scopes = require("main.ast.doblocks")
 
 local pass = {}
 
@@ -10771,21 +11267,26 @@ function pass.run(root, opt)
     opt = opt or {}
     if opt.dce ~= false then dead.run(root) end
     if opt.fold ~= false then fold.run(root) end
-    if opt.conditions ~= false then cond.run(root) end
-    if opt.selects ~= false then selectp.run(root) end
-    if opt.returns ~= false then ret.run(root) end
+    if opt.conditions ~= false then
+        cond.run(root)
+        if opt.selects ~= false then selectp.run(root) end
+        if opt.returns ~= false then ret.run(root) end
+    end
     if opt.inlineast ~= false then inline.run(root) end
     if opt.callbacks ~= false then callbacks.run(root) end
-    if opt.booleans ~= false then bools.run(root) end
+    if opt.conditions ~= false and opt.booleans ~= false then bools.run(root) end
     if opt.guards ~= false then
         guards2.run(root)
         guards.run(root)
     end
     locals.run(root)
     if opt.compound ~= false then comp.run(root) end
-    logic.run(root)
-    if opt.conditions ~= false then cond.run(root) end
+    if opt.conditions ~= false then
+        logic.run(root)
+        cond.run(root)
+    end
     if opt.dce ~= false then dead.run(root) end
+    if (opt.doblocks or 0) > 0 then scopes.run(root, opt.doblocks) end
     return root
 end
 
@@ -10794,64 +11295,122 @@ return pass
     ["main.ast.printer"] = [===[
 local printast = {}
 
-local function line(out, depth, s)
-    out[#out + 1] = string.rep("    ", depth) .. s
+local function esc(s)
+    return (s:gsub("([^%w])", "%%%1"))
 end
 
-local function block(out, b, depth)
+local function hasname(node, name)
+    if not node or node.dead then return false end
+    local pat = "%f[%w_]" .. esc(name) .. "%f[^%w_]"
+    local function hit(s) return type(s) == "string" and s:find(pat) ~= nil end
+    if hit(node.text) or hit(node.cond) or hit(node.head) or hit(node.args) then return true end
+    if node.kind == "if" then
+        for _, b in ipairs(node.branches or {}) do
+            if hit(b.cond) then return true end
+            for _, x in ipairs(b.body.body or {}) do if hasname(x, name) then return true end end
+        end
+        if node.elsebody then for _, x in ipairs(node.elsebody.body or {}) do if hasname(x, name) then return true end end end
+    elseif node.body then
+        for _, x in ipairs(node.body.body or {}) do if hasname(x, name) then return true end end
+    end
+    return false
+end
+
+local function recursive(node)
+    for _, x in ipairs(node.body.body or {}) do if hasname(x, node.name) then return true end end
+    return false
+end
+
+local function indent(opt, depth)
+    local n = tonumber(opt.formatter and opt.formatter.IndentWidth) or 4
+    n = math.max(0, math.min(16, math.floor(n)))
+    return string.rep(" ", n * depth)
+end
+
+local function line(out, opt, depth, s, stmt)
+    if stmt and opt.formatter and opt.formatter.AppendSemicolons then
+        local last = s:sub(-1)
+        if last ~= ";" and last ~= ":" then s = s .. ";" end
+    end
+    out[#out + 1] = indent(opt, depth) .. s
+end
+
+local function cond(opt, s)
+    if opt.formatter and opt.formatter.ParenthesizeConditions then return "(" .. s .. ")" end
+    return s
+end
+
+local function fnhead(node, opt)
+    local args = node.args or ""
+    if opt.functions == false then
+        if node.localfn then return "local " .. node.name .. " = function(" .. args .. ")" end
+        if node.assign then return node.name .. " = function(" .. args .. ")" end
+        local base, field = node.name:match("^(.*):([%a_][%w_]*)$")
+        if base and field then
+            local a = args ~= "" and ("self, " .. args) or "self"
+            return base .. "." .. field .. " = function(" .. a .. ")"
+        end
+        return node.name .. " = function(" .. args .. ")"
+    end
+    if node.localfn then return "local function " .. node.name .. "(" .. args .. ")" end
+    if node.assign then return node.name .. " = function(" .. args .. ")" end
+    return "function " .. node.name .. "(" .. args .. ")"
+end
+
+local function block(out, b, depth, opt)
     for _, node in ipairs(b.body) do
         if not node.dead then
             local k = node.kind
             if k == "raw" or k == "return" or k == "break" or k == "continue" then
-                line(out, depth, node.text)
+                line(out, opt, depth, node.text, true)
             elseif k == "if" then
                 for i, branch in ipairs(node.branches) do
-                    line(out, depth, (i == 1 and "if " or "elseif ") .. branch.cond .. " then")
-                    block(out, branch.body, depth + 1)
+                    line(out, opt, depth, (i == 1 and "if " or "elseif ") .. cond(opt, branch.cond) .. " then")
+                    block(out, branch.body, depth + 1, opt)
                 end
                 if node.elsebody then
-                    line(out, depth, "else")
-                    block(out, node.elsebody, depth + 1)
+                    line(out, opt, depth, "else")
+                    block(out, node.elsebody, depth + 1, opt)
                 end
-                line(out, depth, "end")
+                line(out, opt, depth, "end")
             elseif k == "while" then
-                line(out, depth, "while " .. node.cond .. " do")
-                block(out, node.body, depth + 1)
-                line(out, depth, "end")
+                line(out, opt, depth, "while " .. cond(opt, node.cond) .. " do")
+                block(out, node.body, depth + 1, opt)
+                line(out, opt, depth, "end")
             elseif k == "repeat" then
-                line(out, depth, "repeat")
-                block(out, node.body, depth + 1)
-                line(out, depth, "until " .. node.cond)
+                line(out, opt, depth, "repeat")
+                block(out, node.body, depth + 1, opt)
+                line(out, opt, depth, "until " .. cond(opt, node.cond))
             elseif k == "for" then
-                line(out, depth, node.head .. " do")
-                block(out, node.body, depth + 1)
-                line(out, depth, "end")
+                line(out, opt, depth, node.head .. " do")
+                block(out, node.body, depth + 1, opt)
+                line(out, opt, depth, "end")
             elseif k == "do" then
-                line(out, depth, "do")
-                block(out, node.body, depth + 1)
-                line(out, depth, "end")
+                line(out, opt, depth, "do")
+                block(out, node.body, depth + 1, opt)
+                line(out, opt, depth, "end")
             elseif k == "callback" then
-                line(out, depth, node.pre .. "function(" .. node.args .. ")")
-                block(out, node.body, depth + 1)
-                line(out, depth, "end" .. node.post)
+                line(out, opt, depth, node.pre .. "function(" .. node.args .. ")")
+                block(out, node.body, depth + 1, opt)
+                line(out, opt, depth, "end" .. node.post, true)
             elseif k == "function" then
-                if node.localfn then
-                    line(out, depth, "local function " .. node.name .. "(" .. node.args .. ")")
-                elseif node.assign then
-                    line(out, depth, node.name .. " = function(" .. node.args .. ")")
+                if opt.functions == false and node.localfn and recursive(node) then
+                    line(out, opt, depth, "local " .. node.name, true)
+                    line(out, opt, depth, node.name .. " = function(" .. (node.args or "") .. ")")
                 else
-                    line(out, depth, "function " .. node.name .. "(" .. node.args .. ")")
+                    line(out, opt, depth, fnhead(node, opt))
                 end
-                block(out, node.body, depth + 1)
-                line(out, depth, "end")
+                block(out, node.body, depth + 1, opt)
+                line(out, opt, depth, "end", opt.functions == false or node.assign)
             end
         end
     end
 end
 
-function printast.run(root)
+function printast.run(root, opt)
+    opt = opt or {}
     local out = {}
-    block(out, root, 0)
+    block(out, root, 0, opt)
     return table.concat(out, "\n")
 end
 
@@ -11094,13 +11653,28 @@ local base = {
     inlineast = true,
     callbacks = true,
     booleans = true,
+    smartnames = true,
+    functions = true,
+    doblocks = 0,
     iridium = nil,
+}
+
+local map = {
+    SmartVariableRenamer = "smartnames",
+    FunctionDeclarations = "functions",
+    GuardClauses = "guards",
+    ConstantFolding = "fold",
+    ConditionalStructurer = "conditions",
+    DoBlockInsertionThreshold = "doblocks",
 }
 
 return function(opt)
     local out = {}
     for k, v in pairs(base) do out[k] = v end
-    if opt then for k, v in pairs(opt) do out[k] = v end end
+    if opt then
+        for k, v in pairs(opt) do out[map[k] or k] = v end
+    end
+    out.doblocks = math.max(0, math.floor(tonumber(out.doblocks) or 0))
     return out
 end
 ]===],
@@ -11199,6 +11773,22 @@ function ctx:vname(v, r, hint, pc)
     local best = self.ir.bestname and self.ir.bestname[v] or nil
     local score = self.ir.namescore and self.ir.namescore[v] or 0
     local name
+
+    if self.opt.smartnames == false then
+        if di then
+            name = self.naming:nameAt(r, pc, nil)
+        elseif src and src.kind == "param" then
+            name = self.naming:unique("arg" .. tostring(src.reg + 1))
+        else
+            repeat
+                name = "v" .. tostring(self.nexttmp)
+                self.nexttmp += 1
+            until not self.naming.used[name]
+            name = self.naming:unique(name)
+        end
+        self.vnames[v] = name
+        return name
+    end
 
     if di then
         name = self.naming:nameAt(r, pc, nil)
@@ -11777,7 +12367,7 @@ end
 
 function decomp:decompileProto(proto, up)
     local root, st = self:_child(proto, up or {})
-    return printer.run(root), {
+    return printer.run(root, self.opt), {
         cfg = st.cfg,
         ir = st.ir,
         ssa = st.ssa,
@@ -12507,6 +13097,11 @@ function names:nameAt(reg, pc, hint)
         return name
     end
 
+    if self.opt.smartnames == false then
+        if pc == 1 and reg < (self.proto.ParameterCount or 0) then return self:unique("arg" .. tostring(reg + 1)) end
+        return self:name(reg, nil)
+    end
+
     local typed = self:typeAt(reg, pc)
     if typed then
         local key = "t:" .. tostring(reg) .. ":" .. tostring(typed.StartPc) .. ":" .. tostring(typed.EndPc)
@@ -12531,7 +13126,7 @@ function names:name(reg, hint)
     local old = self.regs[reg]
     if old then return old end
     local base
-    if hint and self:stable(reg) then base = id.clean(hint) end
+    if self.opt.smartnames ~= false and hint and self:stable(reg) then base = id.clean(hint) end
     base = base or ("v" .. tostring(reg))
     local name = self:unique(base)
     self.regs[reg] = name
@@ -13297,7 +13892,7 @@ function pipe.run(ir, opt)
     if opt.fold ~= false then konst.run(ir) end
     if opt.dce ~= false then dead.run(ir) end
     names.run(ir)
-    prov.run(ir)
+    if opt.smartnames ~= false then prov.run(ir) else ir.bestname, ir.namescore, ir.hints, ir.origin = {}, {}, {}, {} end
     if opt.inline ~= false then inline.run(ir) end
     cond.run(ir)
     flow.run(ir)
@@ -14712,11 +15307,20 @@ local boot = {
     Parallel = rawget(_G, "Parallel"),
     MaxWorkers = rawget(_G, "MaxWorkers"),
     MaxPathLength = rawget(_G, "MaxPathLength"),
+    AcquireBatch = rawget(_G, "AcquireBatch"),
+    AcquireBudgetMs = rawget(_G, "AcquireBudgetMs"),
+    DecompilerOptions = rawget(_G, "DecompilerOptions"),
+    SmartVariableRenamer = rawget(_G, "SmartVariableRenamer"),
+    FunctionDeclarations = rawget(_G, "FunctionDeclarations"),
+    GuardClauses = rawget(_G, "GuardClauses"),
+    ConstantFolding = rawget(_G, "ConstantFolding"),
+    ConditionalStructurer = rawget(_G, "ConditionalStructurer"),
+    DoBlockInsertionThreshold = rawget(_G, "DoBlockInsertionThreshold"),
 }
 if type(getgenv) == "function" then
     local ok, e = pcall(getgenv)
     if ok and type(e) == "table" then
-        for _, k in ipairs({ "Binary", "Decompile", "Tree", "IgnoreCoreScripts", "Parallel", "MaxWorkers", "MaxPathLength" }) do
+        for _, k in ipairs({ "Binary", "Decompile", "Tree", "IgnoreCoreScripts", "Parallel", "MaxWorkers", "MaxPathLength", "AcquireBatch", "AcquireBudgetMs", "DecompilerOptions", "SmartVariableRenamer", "FunctionDeclarations", "GuardClauses", "ConstantFolding", "ConditionalStructurer", "DoBlockInsertionThreshold" }) do
             if boot[k] == nil then boot[k] = rawget(e, k) end
         end
     end

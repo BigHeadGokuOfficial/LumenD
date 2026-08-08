@@ -1,1 +1,1 @@
-return { name = "LumenDecomp", version = "3.2.4" }
+return { name = "LumenDecomp", version = "3.3.0" }

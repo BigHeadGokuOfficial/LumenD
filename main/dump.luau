@@ -3,6 +3,7 @@ local st = require("main.runtime.status")
 local coref = require("main.runtime.core")
 local bc = require("main.runtime.bytecode")
 local tree = require("main.tree")
+local config = require("main.config")
 
 local dump = {}
 
@@ -37,11 +38,24 @@ local function unavailable(stat, cache, obj, err)
     stat.unavailableErrors[#stat.unavailableErrors + 1] = line
 end
 
-local function acquire(list, stat)
+local function acquire(list, stat, opt)
     local jobs = {}
     local cache = {}
     local started = os.clock()
-    stat.found = #list
+    local slice = started
+    local total = #list
+    local batch = tonumber(opt.AcquireBatch)
+    if not batch then
+        if total >= 500 then batch = 3
+        elseif total >= 200 then batch = 4
+        elseif total >= 80 then batch = 6
+        else batch = 12 end
+    end
+    batch = math.max(1, math.floor(batch))
+    local budget = math.max(0.001, (tonumber(opt.AcquireBudgetMs) or 3) / 1000)
+    stat.found = total
+    stat.acquireBatch = batch
+    stat.acquireBudgetMs = budget * 1000
 
     for i, obj in ipairs(list) do
         local ok, raw = bc.try(obj)
@@ -51,8 +65,13 @@ local function acquire(list, stat)
         else
             unavailable(stat, cache, obj, raw)
         end
-        st.progress("Acquiring bytecode", obj, i, #list)
-        if i % 64 == 0 then task.wait() end
+        st.progress("Acquiring bytecode", obj, i, total)
+        local now = os.clock()
+        if i < total and (i % batch == 0 or now - slice >= budget) then
+            stat.acquireYields += 1
+            task.wait()
+            slice = os.clock()
+        end
     end
 
     stat.available = #jobs
@@ -105,7 +124,7 @@ local function serial(lumen, jobs, opt, stat, cache, label)
 end
 
 local actorcode = [[
-local id, src, vendor = ...
+local id, src, vendor, smart, funcs, guards, fold, conds, blocks = ...
 local ch = get_comm_channel(id)
 local genv = type(getgenv) == "function" and getgenv() or _G
 local okv, v = pcall(function()
@@ -134,6 +153,14 @@ if not wok then
 end
 genv.__LUMEN_IRIDIUM_VENDOR = nil
 _G.__LUMEN_IRIDIUM_VENDOR = nil
+local dec = {
+    smartnames = smart,
+    functions = funcs,
+    guards = guards,
+    fold = fold,
+    conditions = conds,
+    doblocks = blocks,
+}
 local con
 con = ch.Event:Connect(function(kind, jid, raw)
     if kind == "stop" then
@@ -141,7 +168,7 @@ con = ch.Event:Connect(function(kind, jid, raw)
         return
     end
     if kind ~= "job" then return end
-    local good, out = pcall(function() return api:decompileBytecode(raw) end)
+    local good, out = pcall(function() return api:decompileBytecode(raw, dec) end)
     if good and type(out) == "string" and out ~= "" then
         ch:Fire("done", jid, true, out)
     else
@@ -221,6 +248,7 @@ local function actors(lumen, jobs, opt, stat, cache)
     end
 
     local ws = {}
+    local dc = config(decopt(opt))
     local q = {}
     local qhead = 1
     local qtail = 0
@@ -246,7 +274,7 @@ local function actors(lumen, jobs, opt, stat, cache)
             end
         end)
         ws[#ws + 1] = w
-        local rok, rerr = pcall(run_on_actor, w.actor, actorcode, id, src, vendor)
+        local rok, rerr = pcall(run_on_actor, w.actor, actorcode, id, src, vendor, dc.smartnames ~= false, dc.functions ~= false, dc.guards ~= false, dc.fold ~= false, dc.conditions ~= false, dc.doblocks or 0)
         if not rok then
             w.dead = true
             w.err = tostring(rerr)
@@ -438,7 +466,16 @@ local function summary(root, stat)
         "Write failures: " .. tostring(stat.writeFailed),
         "Binary: " .. tostring(stat.binary),
         "Workers: " .. tostring(stat.parallel or 1),
+        "SmartVariableRenamer: " .. tostring(stat.decompiler and stat.decompiler.smartnames ~= false),
+        "FunctionDeclarations: " .. tostring(stat.decompiler and stat.decompiler.functions ~= false),
+        "GuardClauses: " .. tostring(stat.decompiler and stat.decompiler.guards ~= false),
+        "ConstantFolding: " .. tostring(stat.decompiler and stat.decompiler.fold ~= false),
+        "ConditionalStructurer: " .. tostring(stat.decompiler and stat.decompiler.conditions ~= false),
+        "DoBlockInsertionThreshold: " .. tostring(stat.decompiler and stat.decompiler.doblocks or 0),
         "Acquire seconds: " .. string.format("%.3f", stat.acquireTime or 0),
+        "Acquire batch: " .. tostring(stat.acquireBatch or 0),
+        "Acquire budget ms: " .. string.format("%.2f", stat.acquireBudgetMs or 0),
+        "Acquire yields: " .. tostring(stat.acquireYields or 0),
         "Warmup seconds: " .. string.format("%.3f", stat.warmTime or 0),
         "Worker boot seconds: " .. string.format("%.3f", stat.parallelBootTime or 0),
         "Reconstruct seconds: " .. string.format("%.3f", stat.decompileTime or 0),
@@ -479,6 +516,9 @@ function dump.run(lumen, opt)
         errors = {},
         unavailableErrors = {},
         acquireTime = 0,
+        acquireBatch = 0,
+        acquireBudgetMs = 0,
+        acquireYields = 0,
         warmTime = 0,
         parallelBootTime = 0,
         decompileTime = 0,
@@ -486,6 +526,7 @@ function dump.run(lumen, opt)
         totalTime = 0,
         rate = 0,
         parallel = 1,
+        decompiler = config(decopt(opt)),
     }
     local made = {}
     tree.mkall(root, made)
@@ -499,7 +540,7 @@ function dump.run(lumen, opt)
         stat.scanFailed = #scanerr
         for _, e in ipairs(scanerr) do stat.errors[#stat.errors + 1] = "scan :: " .. tostring(e) end
         local jobs
-        jobs, cache = acquire(list, stat)
+        jobs, cache = acquire(list, stat, opt)
 
         if #jobs > 0 then
             local pok, pout, preason = pcall(actors, lumen, jobs, opt, stat, cache)
@@ -584,10 +625,21 @@ function dump.auto(lumen, boot)
     if parallel == nil then parallel = true else parallel = parallel == true end
     local maxworkers = tonumber(val("MaxWorkers")) or 4
     local maxpath = tonumber(val("MaxPathLength")) or 240
+    local acquirebatch = tonumber(val("AcquireBatch"))
+    local acquirebudget = tonumber(val("AcquireBudgetMs")) or 3
+    local dopt = val("DecompilerOptions")
+    if type(dopt) ~= "table" then dopt = {} end
+    local names = { "SmartVariableRenamer", "FunctionDeclarations", "GuardClauses", "ConstantFolding", "ConditionalStructurer", "DoBlockInsertionThreshold" }
+    for _, name in ipairs(names) do
+        local v = val(name)
+        if v ~= nil then dopt[name] = v end
+    end
     local flags = "Binary=" .. tostring(binary) .. " | Decompile=" .. tostring(decomp) .. " | Tree=" .. tostring(treeon) .. " | IgnoreCoreScripts=" .. tostring(ignorecore) .. " | Parallel=" .. tostring(parallel) .. " | MaxWorkers=" .. tostring(maxworkers)
 
     st.set("Loaded", "v" .. tostring(lumen.Version) .. " | " .. flags)
     print("[LumenDecomp] " .. flags)
+    local dc = config(dopt)
+    print("[LumenDecomp] SmartVariableRenamer=" .. tostring(dc.smartnames ~= false) .. " | FunctionDeclarations=" .. tostring(dc.functions ~= false) .. " | GuardClauses=" .. tostring(dc.guards ~= false) .. " | ConstantFolding=" .. tostring(dc.fold ~= false) .. " | ConditionalStructurer=" .. tostring(dc.conditions ~= false) .. " | DoBlockInsertionThreshold=" .. tostring(dc.doblocks or 0))
     if not binary and not decomp and not treeon then
         task.delay(2, function() st.done("Loaded - idle | " .. flags) end)
         return false
@@ -601,7 +653,7 @@ function dump.auto(lumen, boot)
     st.set("Starting dump", flags)
     task.spawn(function()
         local ok, err = pcall(function()
-            dump.run(lumen, { Binary = binary, Decompile = decomp, Tree = treeon, IgnoreCoreScripts = ignorecore, Parallel = parallel, MaxWorkers = maxworkers, MaxPathLength = maxpath })
+            dump.run(lumen, { Binary = binary, Decompile = decomp, Tree = treeon, IgnoreCoreScripts = ignorecore, Parallel = parallel, MaxWorkers = maxworkers, MaxPathLength = maxpath, AcquireBatch = acquirebatch, AcquireBudgetMs = acquirebudget, Options = dopt })
         end)
         e.__LumenDump = nil
         if not ok then

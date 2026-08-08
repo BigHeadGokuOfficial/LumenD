@@ -1,4 +1,4 @@
-# LumenDecomp V3.2.4
+# LumenDecomp V3.3.0
 
 ```lua
 local g = getgenv()
@@ -10,11 +10,30 @@ g.IgnoreCoreScripts = true
 g.Parallel = true
 g.MaxWorkers = 4
 
-local lumen = loadstring(game:HttpGet("https://raw.githubusercontent.com/BigHeadGokuOfficial/LumenD/main/lumen.luau"))()
+g.DecompilerOptions = {
+    SmartVariableRenamer = true,
+    FunctionDeclarations = true,
+    GuardClauses = true,
+    ConstantFolding = true,
+    ConditionalStructurer = true,
+    DoBlockInsertionThreshold = 0,
+}
+
+local lumen = loadstring(game:HttpGet("https://raw.githubusercontent.com/Floorzey/LumenD/main/lumen.luau"))()
 ```
 
-# Credits:
+```lua
+local options = lumen.DecompilerOptions.new()
+options.SmartVariableRenamer = true
+options.FunctionDeclarations = true
+options.GuardClauses = true
+options.ConstantFolding = true
+options.ConditionalStructurer = true
+options.DoBlockInsertionThreshold = 0
 
-Moon / DexSerializer,
+print(lumen:decompile(script, options))
+```
 
-ActualMasterOogway / Iridium.
+`DoBlockInsertionThreshold = 0` disables scope-block insertion. Set it above zero when generating very large source that needs tighter local-variable scopes for recompilation.
+
+Credits: Moon / DexSerializer, ActualMasterOogway / Iridium.

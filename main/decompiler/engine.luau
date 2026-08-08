@@ -286,7 +286,7 @@ end
 
 function decomp:decompileProto(proto, up)
     local root, st = self:_child(proto, up or {})
-    return printer.run(root), {
+    return printer.run(root, self.opt), {
         cfg = st.cfg,
         ir = st.ir,
         ssa = st.ssa,

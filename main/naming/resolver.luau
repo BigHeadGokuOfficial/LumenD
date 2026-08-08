@@ -61,6 +61,11 @@ function names:nameAt(reg, pc, hint)
         return name
     end
 
+    if self.opt.smartnames == false then
+        if pc == 1 and reg < (self.proto.ParameterCount or 0) then return self:unique("arg" .. tostring(reg + 1)) end
+        return self:name(reg, nil)
+    end
+
     local typed = self:typeAt(reg, pc)
     if typed then
         local key = "t:" .. tostring(reg) .. ":" .. tostring(typed.StartPc) .. ":" .. tostring(typed.EndPc)
@@ -85,7 +90,7 @@ function names:name(reg, hint)
     local old = self.regs[reg]
     if old then return old end
     local base
-    if hint and self:stable(reg) then base = id.clean(hint) end
+    if self.opt.smartnames ~= false and hint and self:stable(reg) then base = id.clean(hint) end
     base = base or ("v" .. tostring(reg))
     local name = self:unique(base)
     self.regs[reg] = name

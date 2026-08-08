@@ -1,5 +1,6 @@
 local ver = require("main.version")
 local cfg = require("main.config")
+local options = require("main.options")
 local bc = require("main.runtime.bytecode")
 local iri = require("main.runtime.iridium")
 local decomp = require("main.decompiler.engine")
@@ -13,6 +14,8 @@ local api = {
     Version = ver.version,
     Name = ver.name,
 }
+
+api.DecompilerOptions = { new = options.new }
 
 local function parsebc(raw, opt)
     return iri.get():Deserialize(raw, opt.iridium)

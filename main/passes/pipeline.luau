@@ -15,7 +15,7 @@ function pipe.run(ir, opt)
     if opt.fold ~= false then konst.run(ir) end
     if opt.dce ~= false then dead.run(ir) end
     names.run(ir)
-    prov.run(ir)
+    if opt.smartnames ~= false then prov.run(ir) else ir.bestname, ir.namescore, ir.hints, ir.origin = {}, {}, {}, {} end
     if opt.inline ~= false then inline.run(ir) end
     cond.run(ir)
     flow.run(ir)

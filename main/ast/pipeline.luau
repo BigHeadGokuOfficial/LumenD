@@ -11,6 +11,7 @@ local bools = require("main.ast.booleans")
 local comp = require("main.ast.compound")
 local locals = require("main.ast.locals")
 local dead = require("main.ast.deadcode")
+local scopes = require("main.ast.doblocks")
 
 local pass = {}
 
@@ -18,21 +19,26 @@ function pass.run(root, opt)
     opt = opt or {}
     if opt.dce ~= false then dead.run(root) end
     if opt.fold ~= false then fold.run(root) end
-    if opt.conditions ~= false then cond.run(root) end
-    if opt.selects ~= false then selectp.run(root) end
-    if opt.returns ~= false then ret.run(root) end
+    if opt.conditions ~= false then
+        cond.run(root)
+        if opt.selects ~= false then selectp.run(root) end
+        if opt.returns ~= false then ret.run(root) end
+    end
     if opt.inlineast ~= false then inline.run(root) end
     if opt.callbacks ~= false then callbacks.run(root) end
-    if opt.booleans ~= false then bools.run(root) end
+    if opt.conditions ~= false and opt.booleans ~= false then bools.run(root) end
     if opt.guards ~= false then
         guards2.run(root)
         guards.run(root)
     end
     locals.run(root)
     if opt.compound ~= false then comp.run(root) end
-    logic.run(root)
-    if opt.conditions ~= false then cond.run(root) end
+    if opt.conditions ~= false then
+        logic.run(root)
+        cond.run(root)
+    end
     if opt.dce ~= false then dead.run(root) end
+    if (opt.doblocks or 0) > 0 then scopes.run(root, opt.doblocks) end
     return root
 end
 
