@@ -41,17 +41,19 @@ req = function(name)
 
     cache[path] = LOADING
 
-    local src = http.get(rawBase .. path)
-    src = patch.apply(path, src)
-    src = "local require = __LUMEN_IRIDIUM_REQUIRE\n" .. src
+    local ok, value = pcall(function()
+        local src = http.get(rawBase .. path)
+        src = patch.apply(path, src)
+        src = "local require = __LUMEN_IRIDIUM_REQUIRE\n" .. src
 
-    local chunk, err = loadstring(src, "@Iridium/" .. path)
-    if not chunk then
-        cache[path] = nil
-        error("LumenDecomp: failed compiling Iridium/" .. path .. ": " .. tostring(err), 2)
-    end
+        local chunk, err = loadstring(src, "@Iridium/" .. path)
+        if not chunk then
+            error("LumenDecomp: failed compiling Iridium/" .. path .. ": " .. tostring(err), 0)
+        end
 
-    local ok, value = pcall(chunk)
+        return chunk()
+    end)
+
     if not ok then
         cache[path] = nil
         error("LumenDecomp: failed loading Iridium/" .. path .. ": " .. tostring(value), 2)

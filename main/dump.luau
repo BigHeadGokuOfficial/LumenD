@@ -1,5 +1,6 @@
 local env = require("main.runtime.environment")
 local st = require("main.runtime.status")
+local coref = require("main.runtime.core")
 
 local dump = {}
 
@@ -77,22 +78,15 @@ local function outpath(root, obj, flat, used, made)
     return path
 end
 
-local core = {
-    CoreGui = true,
-    CorePackages = true,
-    RobloxReplicatedStorage = true,
-    CoreScriptSyncService = true,
-}
-
 local function scripts(ignorecore)
     local out = {}
     for _, root in ipairs(game:GetChildren()) do
-        if not (ignorecore and (core[root.Name] or core[root.ClassName])) then
-            if scriptobj(root) then out[#out + 1] = root end
+        if not (ignorecore and coref.root(root)) then
+            if scriptobj(root) and not (ignorecore and coref.is(root)) then out[#out + 1] = root end
             local ok, list = pcall(root.GetDescendants, root)
             if ok then
                 for _, obj in ipairs(list) do
-                    if scriptobj(obj) then out[#out + 1] = obj end
+                    if scriptobj(obj) and not (ignorecore and coref.is(obj)) then out[#out + 1] = obj end
                 end
             end
         end
@@ -169,18 +163,52 @@ ch:Fire("boot", true, "")
 ]]
 
 local function actors(lumen, list, opt, stat)
-    if opt.Parallel == false then return nil end
-    if #list < 48 then return nil end
-    if type(run_on_actor) ~= "function" or type(getactors) ~= "function" or type(create_comm_channel) ~= "function" or type(get_comm_channel) ~= "function" then return nil end
-    if type(lumen._workerSource) ~= "function" then return nil end
-
-    local ok, pool = pcall(getactors)
-    if not ok or type(pool) ~= "table" or #pool < 2 then return nil end
+    if opt.Parallel == false then return nil, "disabled" end
+    if #list < 48 then return nil, "too few scripts" end
+    if type(run_on_actor) ~= "function" or type(create_comm_channel) ~= "function" or type(get_comm_channel) ~= "function" then
+        return nil, "Potassium actor APIs unavailable"
+    end
+    if type(lumen._workerSource) ~= "function" then return nil, "worker source unavailable" end
 
     local want = tonumber(opt.MaxWorkers) or 4
-    want = math.max(2, math.min(math.floor(want), #pool, math.max(2, math.floor(#list / 24))))
+    want = math.max(2, math.min(math.floor(want), 32, math.max(2, math.floor(#list / 24))))
+
+    local pool = {}
+    local owned = nil
+    local ownok = pcall(function()
+        local parent = game:GetService("ReplicatedStorage")
+        owned = Instance.new("Folder")
+        owned.Name = "__LumenWorkers_" .. tostring(math.floor(os.clock() * 1000))
+        owned.Archivable = false
+        owned.Parent = parent
+        for i = 1, want do
+            local a = Instance.new("Actor")
+            a.Name = "Worker" .. tostring(i)
+            a.Archivable = false
+            a.Parent = owned
+            pool[#pool + 1] = a
+        end
+    end)
+
+    if not ownok or #pool < 2 then
+        if owned then pcall(function() owned:Destroy() end) end
+        owned = nil
+        pool = {}
+        if type(getactors) ~= "function" then return nil, "could not create worker Actors and getactors is unavailable" end
+        local ok, existing = pcall(getactors)
+        if not ok then return nil, "getactors failed: " .. tostring(existing) end
+        if type(existing) ~= "table" or #existing < 2 then return nil, "fewer than 2 usable Actors" end
+        pool = existing
+        want = math.min(want, #pool)
+    else
+        task.wait()
+    end
+
     local src = lumen:_workerSource()
-    if type(src) ~= "string" or src == "" then return nil end
+    if type(src) ~= "string" or src == "" then
+        if owned then pcall(function() owned:Destroy() end) end
+        return nil, "empty worker source"
+    end
 
     local ws = {}
     local q = {}
@@ -221,8 +249,13 @@ local function actors(lumen, list, opt, stat)
         if w.ready and not w.dead then live[#live + 1] = w end
     end
     if #live < 2 then
-        for _, w in ipairs(ws) do if w.con then pcall(function() w.con:Disconnect() end) end end
-        return nil
+        local why = {}
+        for _, w in ipairs(ws) do
+            if w.err then why[#why + 1] = w.err end
+            if w.con then pcall(function() w.con:Disconnect() end) end
+        end
+        if owned then pcall(function() owned:Destroy() end) end
+        return nil, "worker boot failed" .. (#why > 0 and (": " .. table.concat(why, " | ")) or "")
     end
 
     stat.parallel = #live
@@ -323,6 +356,7 @@ local function actors(lumen, list, opt, stat)
     end
 
     for _, w in ipairs(ws) do if w.con then pcall(function() w.con:Disconnect() end) end end
+    if owned then pcall(function() owned:Destroy() end) end
     stat.decompileTime = os.clock() - started
     stat.rate = stat.decompileTime > 0 and #list / stat.decompileTime or 0
     return cache
@@ -332,19 +366,22 @@ local function writetree(root, list, cache, treeon, stat, made)
     local used = {}
     local total = #list
     local started = os.clock()
+    local written = 0
     for i, obj in ipairs(list) do
         local src = cache[obj]
         if type(src) == "string" then
             local path = outpath(root, obj, not treeon, used, made)
             local ok, err = write(path, src)
-            if not ok then
+            if ok then
+                written += 1
+            else
                 stat.writeFailed += 1
                 stat.errors[#stat.errors + 1] = st.path(obj) .. " :: " .. tostring(err)
             end
         end
-        local elapsed = os.clock() - started
-        st.progress("Writing source tree", obj, i, total, elapsed > 0 and i / elapsed or nil)
+        st.progress("Writing source tree", obj, i, total)
     end
+    stat.written = written
     stat.writeTime = os.clock() - started
 end
 
@@ -355,6 +392,7 @@ local function summary(root, stat)
         "Scripts found: " .. tostring(stat.found),
         "Decompiled: " .. tostring(stat.good),
         "Failed/skipped: " .. tostring(stat.failed),
+        "Source files written: " .. tostring(stat.written or 0),
         "Write failures: " .. tostring(stat.writeFailed),
         "Binary: " .. tostring(stat.binary),
         "Workers: " .. tostring(stat.parallel or 1),
@@ -373,7 +411,7 @@ end
 function dump.run(lumen, opt)
     opt = opt or {}
     local root = opt.Root or rootdir()
-    local stat = { found = 0, good = 0, failed = 0, writeFailed = 0, binary = false, errors = {}, decompileTime = 0, writeTime = 0, rate = 0, parallel = 1 }
+    local stat = { found = 0, good = 0, failed = 0, written = 0, writeFailed = 0, binary = false, errors = {}, decompileTime = 0, writeTime = 0, rate = 0, parallel = 1 }
     local made = {}
     mkall(root, made)
     st.set("Starting", tostring(game.Name) .. " | " .. root)
@@ -382,12 +420,16 @@ function dump.run(lumen, opt)
     local cache
     if opt.Decompile and (opt.Tree or not opt.Binary) then
         list = scripts(opt.IgnoreCoreScripts == true)
-        local pok, pout = pcall(actors, lumen, list, opt, stat)
+        local pok, pout, preason = pcall(actors, lumen, list, opt, stat)
         if pok then
             cache = pout
+            if not cache and preason and opt.Parallel ~= false then
+                if type(rconsoleprint) == "function" then pcall(rconsoleprint, "[LumenDecomp] parallel unavailable: " .. tostring(preason) .. "\n") end
+                warn("[LumenDecomp] parallel unavailable: " .. tostring(preason))
+            end
         else
-            if type(rconsoleprint) == "function" then pcall(rconsoleprint, "[LumenDecomp] parallel fallback :: " .. tostring(pout) .. "\n") end
-            warn("[LumenDecomp] parallel fallback :: " .. tostring(pout))
+            if type(rconsoleprint) == "function" then pcall(rconsoleprint, "[LumenDecomp] parallel fallback: " .. tostring(pout) .. "\n") end
+            warn("[LumenDecomp] parallel fallback: " .. tostring(pout))
         end
         if not cache then cache = serial(lumen, list, opt, stat) end
         writetree(root, list, cache, opt.Tree, stat, made)
@@ -401,11 +443,12 @@ function dump.run(lumen, opt)
                 Binary = true,
                 Decompile = opt.Decompile == true,
                 SourceCache = cache,
+                IgnoreCoreScripts = opt.IgnoreCoreScripts == true,
                 NilInstances = opt.NilInstances == true,
                 RemovePlayerCharacters = opt.RemovePlayerCharacters == true,
                 SavePlayers = opt.SavePlayers == true,
                 MaxThreads = opt.MaxThreads or 8,
-                DecompileIgnore = opt.IgnoreCoreScripts and { "CoreGui", "CorePackages", "RobloxReplicatedStorage", "CoreScriptSyncService" } or opt.DecompileIgnore,
+                DecompileIgnore = opt.IgnoreCoreScripts and { "Chat", "CoreGui", "CorePackages", "RobloxReplicatedStorage", "CoreScriptSyncService" } or opt.DecompileIgnore,
                 ShowStatus = false,
             })
         end)
@@ -415,10 +458,10 @@ function dump.run(lumen, opt)
 
     summary(root, stat)
     if stat.good == 0 and stat.failed > 0 then
-        st.done("FAILED — 0 decompiled, " .. tostring(stat.failed) .. " failed | " .. tostring(stat.errors[1] or "unknown failure"))
+        st.done("FAILED - 0 decompiled, " .. tostring(stat.failed) .. " failed | " .. tostring(stat.errors[1] or "unknown failure"))
     else
         local mode = stat.parallel and stat.parallel > 1 and (" x" .. tostring(stat.parallel)) or ""
-        st.done("Done — " .. tostring(stat.good) .. " decompiled, " .. tostring(stat.failed) .. " failed | " .. string.format("%.1f/s", stat.rate or 0) .. mode)
+        st.done("Done - " .. tostring(stat.good) .. " decompiled, " .. tostring(stat.failed) .. " failed | " .. string.format("%.1f/s", stat.rate or 0) .. mode)
     end
     return root, stat
 end
@@ -454,7 +497,7 @@ function dump.auto(lumen, boot)
     st.set("Loaded", "v" .. tostring(lumen.Version) .. " | " .. flags)
     print("[LumenDecomp] " .. flags)
     if not binary and not decomp and not treeon then
-        task.delay(2, function() st.done("Loaded — idle | " .. flags) end)
+        task.delay(2, function() st.done("Loaded - idle | " .. flags) end)
         return false
     end
     if rawget(e, "__LumenDump") then

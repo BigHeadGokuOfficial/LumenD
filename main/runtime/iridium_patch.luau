@@ -1,6 +1,6 @@
 local patch = {}
 
-local rev = "v13-2"
+local rev = "v13-3"
 
 local function rep(s, a, b, tag)
     local p = s:find(a, 1, true)
@@ -9,6 +9,7 @@ local function rep(s, a, b, tag)
 end
 
 function patch.apply(path, src)
+    src = src:gsub("\r\n", "\n"):gsub("\r", "\n")
     if path == "Src/Luau/Spec.luau" then
         src = rep(src, "LBC_VERSION_MAX = 11", "LBC_VERSION_MAX = 13", "spec.max")
         src = rep(src, "LBC_VERSION_TARGET = 6", "LBC_VERSION_TARGET = 9", "spec.target")
@@ -31,10 +32,22 @@ function patch.apply(path, src)
         self.Protos[i] = Proto.new(Bytecode, self, Config.EncodingKey)
     end]], [[    self.ProtoSizes = {}
     for i = 1, self.ProtoCount do
+        local ProtoSize = nil
+        local ProtoStart = nil
         if self.BytecodeVersion >= 12 then
-            self.ProtoSizes[i] = Bytecode:ReadVarInt()
+            ProtoSize = Bytecode:ReadVarInt()
+            ProtoStart = Bytecode.Offset
+            self.ProtoSizes[i] = ProtoSize
         end
         self.Protos[i] = Proto.new(Bytecode, self, Config.EncodingKey)
+        if ProtoSize then
+            local ProtoEnd = ProtoStart + ProtoSize
+            if Bytecode.Offset < ProtoEnd then
+                Bytecode:seek(ProtoEnd - Bytecode.Offset)
+            elseif Bytecode.Offset > ProtoEnd then
+                error(`Proto {i} overread ({Bytecode.Offset - ProtoEnd} bytes)`)
+            end
+        end
     end]], "init.sizes")
 
         src = rep(src, [[local function SkipProto(Bytecode: Buffer.BufferReader, Version: number)
@@ -45,14 +58,15 @@ function patch.apply(path, src)
         Bytecode:seek(Bytecode:ReadVarInt())
     end]], [[local function SkipProto(Bytecode: Buffer.BufferReader, Version: number)
     if Version >= 12 then
-        Bytecode:ReadVarInt()
+        local ProtoSize = Bytecode:ReadVarInt()
+        Bytecode:seek(ProtoSize)
+        return
     end
 
     Bytecode:seek(4)
 
-    local Flags = 0
     if Version >= 4 then
-        Flags = Bytecode:readu8()
+        Bytecode:seek(1)
         Bytecode:seek(Bytecode:ReadVarInt())
     end]], "init.skiphead")
 
@@ -76,23 +90,7 @@ function patch.apply(path, src)
             Bytecode:seek(32)
         end]], "init.vectord")
 
-        src = rep(src, [[    if Version >= 11 then
-        for _ = 1, Bytecode:ReadVarInt() do
-            Bytecode:seek(1)
-            Bytecode:ReadVarInt()
-        end
-    end
-end]], [[    if Version >= 11 then
-        for _ = 1, Bytecode:ReadVarInt() do
-            Bytecode:seek(1)
-            Bytecode:ReadVarInt()
-        end
-    end
 
-    if Version >= 12 and bit32.band(Flags, 8) ~= 0 then
-        Bytecode:ReadVarInt()
-    end
-end]], "init.cost")
 
         src = rep(src, [[        if Version < LuauSpec.LuauBytecodeTag.LBC_VERSION_MIN or Version > LuauSpec.LuauBytecodeTag.LBC_VERSION_MAX then
             return nil
@@ -123,35 +121,18 @@ end]], "init.cost")
             error(`Unexpected constant kind ({ConstantType})`)
         end]], "proto.vectord")
 
-        src = rep(src, [[    if Deserializer.BytecodeVersion >= 11 then
-        local FeedbackSlotCount = Bytecode:ReadVarInt()
-        self.FeedbackSlots = table.create(FeedbackSlotCount)
-
-        for i = 1, FeedbackSlotCount do
-            self.FeedbackSlots[i] = {
-                Type = Bytecode:readu8(),
-                Pc = Bytecode:ReadVarInt()
-            }
+        local cost = [[    if Deserializer.BytecodeVersion >= 12 and bit32.band(self.Flags or 0, 8) ~= 0 then
+        self.Cost = Bytecode:ReadVarInt64()
+    end
+]]
+        local mark = "\n\treturn self\nend\n\nexport type Proto"
+        local pos = src:find(mark, 1, true)
+        if not pos then
+            mark = "\n    return self\nend\n\nexport type Proto"
+            pos = src:find(mark, 1, true)
         end
-    end
-
-\treturn self]], [[    if Deserializer.BytecodeVersion >= 11 then
-        local FeedbackSlotCount = Bytecode:ReadVarInt()
-        self.FeedbackSlots = table.create(FeedbackSlotCount)
-
-        for i = 1, FeedbackSlotCount do
-            self.FeedbackSlots[i] = {
-                Type = Bytecode:readu8(),
-                Pc = Bytecode:ReadVarInt()
-            }
-        end
-    end
-
-    if Deserializer.BytecodeVersion >= 12 and bit32.band(self.Flags or 0, 8) ~= 0 then
-        self.Cost = Bytecode:ReadVarInt()
-    end
-
-\treturn self]], "proto.cost")
+        if not pos then error("LumenDecomp: Iridium patch mismatch: proto.cost", 3) end
+        src = src:sub(1, pos) .. cost .. src:sub(pos + 1)
         return src
     end
 

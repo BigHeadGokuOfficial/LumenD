@@ -82,7 +82,7 @@ local function msg(stage, obj, done, total, rate)
     if rate then
         count = count .. " " .. string.format("%.1f/s", rate)
     end
-    local out = "LumenDecomp — " .. tostring(stage) .. count
+    local out = "LumenDecomp - " .. tostring(stage) .. count
     if path ~= "" then out = out .. "\n" .. path end
     return out
 end

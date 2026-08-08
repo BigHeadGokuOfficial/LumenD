@@ -3162,6 +3162,7 @@ return view
     ["main.dump"] = [===[
 local env = require("main.runtime.environment")
 local st = require("main.runtime.status")
+local coref = require("main.runtime.core")
 
 local dump = {}
 
@@ -3239,22 +3240,15 @@ local function outpath(root, obj, flat, used, made)
     return path
 end
 
-local core = {
-    CoreGui = true,
-    CorePackages = true,
-    RobloxReplicatedStorage = true,
-    CoreScriptSyncService = true,
-}
-
 local function scripts(ignorecore)
     local out = {}
     for _, root in ipairs(game:GetChildren()) do
-        if not (ignorecore and (core[root.Name] or core[root.ClassName])) then
-            if scriptobj(root) then out[#out + 1] = root end
+        if not (ignorecore and coref.root(root)) then
+            if scriptobj(root) and not (ignorecore and coref.is(root)) then out[#out + 1] = root end
             local ok, list = pcall(root.GetDescendants, root)
             if ok then
                 for _, obj in ipairs(list) do
-                    if scriptobj(obj) then out[#out + 1] = obj end
+                    if scriptobj(obj) and not (ignorecore and coref.is(obj)) then out[#out + 1] = obj end
                 end
             end
         end
@@ -3331,18 +3325,52 @@ ch:Fire("boot", true, "")
 ]]
 
 local function actors(lumen, list, opt, stat)
-    if opt.Parallel == false then return nil end
-    if #list < 48 then return nil end
-    if type(run_on_actor) ~= "function" or type(getactors) ~= "function" or type(create_comm_channel) ~= "function" or type(get_comm_channel) ~= "function" then return nil end
-    if type(lumen._workerSource) ~= "function" then return nil end
-
-    local ok, pool = pcall(getactors)
-    if not ok or type(pool) ~= "table" or #pool < 2 then return nil end
+    if opt.Parallel == false then return nil, "disabled" end
+    if #list < 48 then return nil, "too few scripts" end
+    if type(run_on_actor) ~= "function" or type(create_comm_channel) ~= "function" or type(get_comm_channel) ~= "function" then
+        return nil, "Potassium actor APIs unavailable"
+    end
+    if type(lumen._workerSource) ~= "function" then return nil, "worker source unavailable" end
 
     local want = tonumber(opt.MaxWorkers) or 4
-    want = math.max(2, math.min(math.floor(want), #pool, math.max(2, math.floor(#list / 24))))
+    want = math.max(2, math.min(math.floor(want), 32, math.max(2, math.floor(#list / 24))))
+
+    local pool = {}
+    local owned = nil
+    local ownok = pcall(function()
+        local parent = game:GetService("ReplicatedStorage")
+        owned = Instance.new("Folder")
+        owned.Name = "__LumenWorkers_" .. tostring(math.floor(os.clock() * 1000))
+        owned.Archivable = false
+        owned.Parent = parent
+        for i = 1, want do
+            local a = Instance.new("Actor")
+            a.Name = "Worker" .. tostring(i)
+            a.Archivable = false
+            a.Parent = owned
+            pool[#pool + 1] = a
+        end
+    end)
+
+    if not ownok or #pool < 2 then
+        if owned then pcall(function() owned:Destroy() end) end
+        owned = nil
+        pool = {}
+        if type(getactors) ~= "function" then return nil, "could not create worker Actors and getactors is unavailable" end
+        local ok, existing = pcall(getactors)
+        if not ok then return nil, "getactors failed: " .. tostring(existing) end
+        if type(existing) ~= "table" or #existing < 2 then return nil, "fewer than 2 usable Actors" end
+        pool = existing
+        want = math.min(want, #pool)
+    else
+        task.wait()
+    end
+
     local src = lumen:_workerSource()
-    if type(src) ~= "string" or src == "" then return nil end
+    if type(src) ~= "string" or src == "" then
+        if owned then pcall(function() owned:Destroy() end) end
+        return nil, "empty worker source"
+    end
 
     local ws = {}
     local q = {}
@@ -3383,8 +3411,13 @@ local function actors(lumen, list, opt, stat)
         if w.ready and not w.dead then live[#live + 1] = w end
     end
     if #live < 2 then
-        for _, w in ipairs(ws) do if w.con then pcall(function() w.con:Disconnect() end) end end
-        return nil
+        local why = {}
+        for _, w in ipairs(ws) do
+            if w.err then why[#why + 1] = w.err end
+            if w.con then pcall(function() w.con:Disconnect() end) end
+        end
+        if owned then pcall(function() owned:Destroy() end) end
+        return nil, "worker boot failed" .. (#why > 0 and (": " .. table.concat(why, " | ")) or "")
     end
 
     stat.parallel = #live
@@ -3485,6 +3518,7 @@ local function actors(lumen, list, opt, stat)
     end
 
     for _, w in ipairs(ws) do if w.con then pcall(function() w.con:Disconnect() end) end end
+    if owned then pcall(function() owned:Destroy() end) end
     stat.decompileTime = os.clock() - started
     stat.rate = stat.decompileTime > 0 and #list / stat.decompileTime or 0
     return cache
@@ -3494,19 +3528,22 @@ local function writetree(root, list, cache, treeon, stat, made)
     local used = {}
     local total = #list
     local started = os.clock()
+    local written = 0
     for i, obj in ipairs(list) do
         local src = cache[obj]
         if type(src) == "string" then
             local path = outpath(root, obj, not treeon, used, made)
             local ok, err = write(path, src)
-            if not ok then
+            if ok then
+                written += 1
+            else
                 stat.writeFailed += 1
                 stat.errors[#stat.errors + 1] = st.path(obj) .. " :: " .. tostring(err)
             end
         end
-        local elapsed = os.clock() - started
-        st.progress("Writing source tree", obj, i, total, elapsed > 0 and i / elapsed or nil)
+        st.progress("Writing source tree", obj, i, total)
     end
+    stat.written = written
     stat.writeTime = os.clock() - started
 end
 
@@ -3517,6 +3554,7 @@ local function summary(root, stat)
         "Scripts found: " .. tostring(stat.found),
         "Decompiled: " .. tostring(stat.good),
         "Failed/skipped: " .. tostring(stat.failed),
+        "Source files written: " .. tostring(stat.written or 0),
         "Write failures: " .. tostring(stat.writeFailed),
         "Binary: " .. tostring(stat.binary),
         "Workers: " .. tostring(stat.parallel or 1),
@@ -3535,7 +3573,7 @@ end
 function dump.run(lumen, opt)
     opt = opt or {}
     local root = opt.Root or rootdir()
-    local stat = { found = 0, good = 0, failed = 0, writeFailed = 0, binary = false, errors = {}, decompileTime = 0, writeTime = 0, rate = 0, parallel = 1 }
+    local stat = { found = 0, good = 0, failed = 0, written = 0, writeFailed = 0, binary = false, errors = {}, decompileTime = 0, writeTime = 0, rate = 0, parallel = 1 }
     local made = {}
     mkall(root, made)
     st.set("Starting", tostring(game.Name) .. " | " .. root)
@@ -3544,12 +3582,16 @@ function dump.run(lumen, opt)
     local cache
     if opt.Decompile and (opt.Tree or not opt.Binary) then
         list = scripts(opt.IgnoreCoreScripts == true)
-        local pok, pout = pcall(actors, lumen, list, opt, stat)
+        local pok, pout, preason = pcall(actors, lumen, list, opt, stat)
         if pok then
             cache = pout
+            if not cache and preason and opt.Parallel ~= false then
+                if type(rconsoleprint) == "function" then pcall(rconsoleprint, "[LumenDecomp] parallel unavailable: " .. tostring(preason) .. "\n") end
+                warn("[LumenDecomp] parallel unavailable: " .. tostring(preason))
+            end
         else
-            if type(rconsoleprint) == "function" then pcall(rconsoleprint, "[LumenDecomp] parallel fallback :: " .. tostring(pout) .. "\n") end
-            warn("[LumenDecomp] parallel fallback :: " .. tostring(pout))
+            if type(rconsoleprint) == "function" then pcall(rconsoleprint, "[LumenDecomp] parallel fallback: " .. tostring(pout) .. "\n") end
+            warn("[LumenDecomp] parallel fallback: " .. tostring(pout))
         end
         if not cache then cache = serial(lumen, list, opt, stat) end
         writetree(root, list, cache, opt.Tree, stat, made)
@@ -3563,11 +3605,12 @@ function dump.run(lumen, opt)
                 Binary = true,
                 Decompile = opt.Decompile == true,
                 SourceCache = cache,
+                IgnoreCoreScripts = opt.IgnoreCoreScripts == true,
                 NilInstances = opt.NilInstances == true,
                 RemovePlayerCharacters = opt.RemovePlayerCharacters == true,
                 SavePlayers = opt.SavePlayers == true,
                 MaxThreads = opt.MaxThreads or 8,
-                DecompileIgnore = opt.IgnoreCoreScripts and { "CoreGui", "CorePackages", "RobloxReplicatedStorage", "CoreScriptSyncService" } or opt.DecompileIgnore,
+                DecompileIgnore = opt.IgnoreCoreScripts and { "Chat", "CoreGui", "CorePackages", "RobloxReplicatedStorage", "CoreScriptSyncService" } or opt.DecompileIgnore,
                 ShowStatus = false,
             })
         end)
@@ -3577,10 +3620,10 @@ function dump.run(lumen, opt)
 
     summary(root, stat)
     if stat.good == 0 and stat.failed > 0 then
-        st.done("FAILED — 0 decompiled, " .. tostring(stat.failed) .. " failed | " .. tostring(stat.errors[1] or "unknown failure"))
+        st.done("FAILED - 0 decompiled, " .. tostring(stat.failed) .. " failed | " .. tostring(stat.errors[1] or "unknown failure"))
     else
         local mode = stat.parallel and stat.parallel > 1 and (" x" .. tostring(stat.parallel)) or ""
-        st.done("Done — " .. tostring(stat.good) .. " decompiled, " .. tostring(stat.failed) .. " failed | " .. string.format("%.1f/s", stat.rate or 0) .. mode)
+        st.done("Done - " .. tostring(stat.good) .. " decompiled, " .. tostring(stat.failed) .. " failed | " .. string.format("%.1f/s", stat.rate or 0) .. mode)
     end
     return root, stat
 end
@@ -3616,7 +3659,7 @@ function dump.auto(lumen, boot)
     st.set("Loaded", "v" .. tostring(lumen.Version) .. " | " .. flags)
     print("[LumenDecomp] " .. flags)
     if not binary and not decomp and not treeon then
-        task.delay(2, function() st.done("Loaded — idle | " .. flags) end)
+        task.delay(2, function() st.done("Loaded - idle | " .. flags) end)
         return false
     end
     if rawget(e, "__LumenDump") then
@@ -5780,6 +5823,46 @@ end
 
 return bc
 ]===],
+    ["main.runtime.core"] = [===[
+local core = {}
+
+local roots = {
+    Chat = true,
+    CoreGui = true,
+    CorePackages = true,
+    RobloxReplicatedStorage = true,
+    CoreScriptSyncService = true,
+}
+
+local player = {
+    PlayerModule = true,
+    RbxCharacterSounds = true,
+    ChatScript = true,
+    BubbleChat = true,
+    PlayerScriptsLoader = true,
+}
+
+function core.root(obj)
+    return obj and (roots[obj.Name] == true or roots[obj.ClassName] == true) or false
+end
+
+function core.is(obj)
+    local cur = obj
+    while cur and cur ~= game do
+        if core.root(cur) then return true end
+        if player[cur.Name] then
+            local p = cur.Parent
+            if p and (p.Name == "PlayerScripts" or p.Name == "StarterPlayerScripts") then
+                return true
+            end
+        end
+        cur = cur.Parent
+    end
+    return false
+end
+
+return core
+]===],
     ["main.runtime.environment"] = [===[
 local env = {}
 
@@ -5893,17 +5976,19 @@ req = function(name)
 
     cache[path] = LOADING
 
-    local src = http.get(rawBase .. path)
-    src = patch.apply(path, src)
-    src = "local require = __LUMEN_IRIDIUM_REQUIRE\n" .. src
+    local ok, value = pcall(function()
+        local src = http.get(rawBase .. path)
+        src = patch.apply(path, src)
+        src = "local require = __LUMEN_IRIDIUM_REQUIRE\n" .. src
 
-    local chunk, err = loadstring(src, "@Iridium/" .. path)
-    if not chunk then
-        cache[path] = nil
-        error("LumenDecomp: failed compiling Iridium/" .. path .. ": " .. tostring(err), 2)
-    end
+        local chunk, err = loadstring(src, "@Iridium/" .. path)
+        if not chunk then
+            error("LumenDecomp: failed compiling Iridium/" .. path .. ": " .. tostring(err), 0)
+        end
 
-    local ok, value = pcall(chunk)
+        return chunk()
+    end)
+
     if not ok then
         cache[path] = nil
         error("LumenDecomp: failed loading Iridium/" .. path .. ": " .. tostring(value), 2)
@@ -5964,7 +6049,7 @@ return iri
     ["main.runtime.iridium_patch"] = [===[
 local patch = {}
 
-local rev = "v13-2"
+local rev = "v13-3"
 
 local function rep(s, a, b, tag)
     local p = s:find(a, 1, true)
@@ -5973,6 +6058,7 @@ local function rep(s, a, b, tag)
 end
 
 function patch.apply(path, src)
+    src = src:gsub("\r\n", "\n"):gsub("\r", "\n")
     if path == "Src/Luau/Spec.luau" then
         src = rep(src, "LBC_VERSION_MAX = 11", "LBC_VERSION_MAX = 13", "spec.max")
         src = rep(src, "LBC_VERSION_TARGET = 6", "LBC_VERSION_TARGET = 9", "spec.target")
@@ -5995,10 +6081,22 @@ function patch.apply(path, src)
         self.Protos[i] = Proto.new(Bytecode, self, Config.EncodingKey)
     end]], [[    self.ProtoSizes = {}
     for i = 1, self.ProtoCount do
+        local ProtoSize = nil
+        local ProtoStart = nil
         if self.BytecodeVersion >= 12 then
-            self.ProtoSizes[i] = Bytecode:ReadVarInt()
+            ProtoSize = Bytecode:ReadVarInt()
+            ProtoStart = Bytecode.Offset
+            self.ProtoSizes[i] = ProtoSize
         end
         self.Protos[i] = Proto.new(Bytecode, self, Config.EncodingKey)
+        if ProtoSize then
+            local ProtoEnd = ProtoStart + ProtoSize
+            if Bytecode.Offset < ProtoEnd then
+                Bytecode:seek(ProtoEnd - Bytecode.Offset)
+            elseif Bytecode.Offset > ProtoEnd then
+                error(`Proto {i} overread ({Bytecode.Offset - ProtoEnd} bytes)`)
+            end
+        end
     end]], "init.sizes")
 
         src = rep(src, [[local function SkipProto(Bytecode: Buffer.BufferReader, Version: number)
@@ -6009,14 +6107,15 @@ function patch.apply(path, src)
         Bytecode:seek(Bytecode:ReadVarInt())
     end]], [[local function SkipProto(Bytecode: Buffer.BufferReader, Version: number)
     if Version >= 12 then
-        Bytecode:ReadVarInt()
+        local ProtoSize = Bytecode:ReadVarInt()
+        Bytecode:seek(ProtoSize)
+        return
     end
 
     Bytecode:seek(4)
 
-    local Flags = 0
     if Version >= 4 then
-        Flags = Bytecode:readu8()
+        Bytecode:seek(1)
         Bytecode:seek(Bytecode:ReadVarInt())
     end]], "init.skiphead")
 
@@ -6040,23 +6139,7 @@ function patch.apply(path, src)
             Bytecode:seek(32)
         end]], "init.vectord")
 
-        src = rep(src, [[    if Version >= 11 then
-        for _ = 1, Bytecode:ReadVarInt() do
-            Bytecode:seek(1)
-            Bytecode:ReadVarInt()
-        end
-    end
-end]], [[    if Version >= 11 then
-        for _ = 1, Bytecode:ReadVarInt() do
-            Bytecode:seek(1)
-            Bytecode:ReadVarInt()
-        end
-    end
 
-    if Version >= 12 and bit32.band(Flags, 8) ~= 0 then
-        Bytecode:ReadVarInt()
-    end
-end]], "init.cost")
 
         src = rep(src, [[        if Version < LuauSpec.LuauBytecodeTag.LBC_VERSION_MIN or Version > LuauSpec.LuauBytecodeTag.LBC_VERSION_MAX then
             return nil
@@ -6087,35 +6170,18 @@ end]], "init.cost")
             error(`Unexpected constant kind ({ConstantType})`)
         end]], "proto.vectord")
 
-        src = rep(src, [[    if Deserializer.BytecodeVersion >= 11 then
-        local FeedbackSlotCount = Bytecode:ReadVarInt()
-        self.FeedbackSlots = table.create(FeedbackSlotCount)
-
-        for i = 1, FeedbackSlotCount do
-            self.FeedbackSlots[i] = {
-                Type = Bytecode:readu8(),
-                Pc = Bytecode:ReadVarInt()
-            }
+        local cost = [[    if Deserializer.BytecodeVersion >= 12 and bit32.band(self.Flags or 0, 8) ~= 0 then
+        self.Cost = Bytecode:ReadVarInt64()
+    end
+]]
+        local mark = "\n\treturn self\nend\n\nexport type Proto"
+        local pos = src:find(mark, 1, true)
+        if not pos then
+            mark = "\n    return self\nend\n\nexport type Proto"
+            pos = src:find(mark, 1, true)
         end
-    end
-
-\treturn self]], [[    if Deserializer.BytecodeVersion >= 11 then
-        local FeedbackSlotCount = Bytecode:ReadVarInt()
-        self.FeedbackSlots = table.create(FeedbackSlotCount)
-
-        for i = 1, FeedbackSlotCount do
-            self.FeedbackSlots[i] = {
-                Type = Bytecode:readu8(),
-                Pc = Bytecode:ReadVarInt()
-            }
-        end
-    end
-
-    if Deserializer.BytecodeVersion >= 12 and bit32.band(self.Flags or 0, 8) ~= 0 then
-        self.Cost = Bytecode:ReadVarInt()
-    end
-
-\treturn self]], "proto.cost")
+        if not pos then error("LumenDecomp: Iridium patch mismatch: proto.cost", 3) end
+        src = src:sub(1, pos) .. cost .. src:sub(pos + 1)
         return src
     end
 
@@ -6213,7 +6279,7 @@ local function msg(stage, obj, done, total, rate)
     if rate then
         count = count .. " " .. string.format("%.1f/s", rate)
     end
-    local out = "LumenDecomp — " .. tostring(stage) .. count
+    local out = "LumenDecomp - " .. tostring(stage) .. count
     if path ~= "" then out = out .. "\n" .. path end
     return out
 end
@@ -8441,12 +8507,14 @@ return {
 local dex = require("main.serialization.dex_serializer")
 local iri = require("main.runtime.iridium")
 local st = require("main.runtime.status")
+local core = require("main.runtime.core")
 
 local save = {}
 
 local ready = false
 local fail = nil
 local cache = nil
+local skipcore = false
 
 local function cached(scr)
     if not cache then return nil end
@@ -8466,6 +8534,7 @@ local function start(lumen)
     iri.get()
 
     dex.SetDecompiler(function(scr)
+        if skipcore and core.is(scr) then return nil, "core script ignored" end
         local hit, src = cached(scr)
         if hit ~= nil then
             if hit then return src end
@@ -8507,15 +8576,18 @@ function save.run(lumen, obj, file, opt)
     if opt.Binary == nil then opt.Binary = true end
 
     local old = cache
+    local oldskip = skipcore
     cache = opt.SourceCache
+    skipcore = opt.IgnoreCoreScripts == true
 
     local pass = {}
     for k, v in pairs(opt) do
-        if k ~= "SourceCache" then pass[k] = v end
+        if k ~= "SourceCache" and k ~= "IgnoreCoreScripts" then pass[k] = v end
     end
 
     local callok, a, b = pcall(dex.Save, obj, file, pass)
     cache = old
+    skipcore = oldskip
 
     if not callok then error(a, 2) end
     return a, b
@@ -8534,7 +8606,7 @@ end
 return save
 ]===],
     ["main.version"] = [===[
-return { name = "LumenDecomp", version = "3.2.1" }
+return { name = "LumenDecomp", version = "3.2.2" }
 ]===],
     ["main.worker"] = [===[
 local cfg = require("main.config")
@@ -8578,7 +8650,7 @@ end
 
 local api = req("main.api")
 local workersrc = [=====[
-assert(type(loadstring) == "function", "LumenDecomp requires loadstring()")
+assert(type(loadstring) == "function", "LumenDecomp worker requires loadstring()")
 
 local mod = {
     ["main.analysis.dominators"] = [===[
@@ -13766,17 +13838,19 @@ req = function(name)
 
     cache[path] = LOADING
 
-    local src = http.get(rawBase .. path)
-    src = patch.apply(path, src)
-    src = "local require = __LUMEN_IRIDIUM_REQUIRE\n" .. src
+    local ok, value = pcall(function()
+        local src = http.get(rawBase .. path)
+        src = patch.apply(path, src)
+        src = "local require = __LUMEN_IRIDIUM_REQUIRE\n" .. src
 
-    local chunk, err = loadstring(src, "@Iridium/" .. path)
-    if not chunk then
-        cache[path] = nil
-        error("LumenDecomp: failed compiling Iridium/" .. path .. ": " .. tostring(err), 2)
-    end
+        local chunk, err = loadstring(src, "@Iridium/" .. path)
+        if not chunk then
+            error("LumenDecomp: failed compiling Iridium/" .. path .. ": " .. tostring(err), 0)
+        end
 
-    local ok, value = pcall(chunk)
+        return chunk()
+    end)
+
     if not ok then
         cache[path] = nil
         error("LumenDecomp: failed loading Iridium/" .. path .. ": " .. tostring(value), 2)
@@ -13837,7 +13911,7 @@ return iri
     ["main.runtime.iridium_patch"] = [===[
 local patch = {}
 
-local rev = "v13-2"
+local rev = "v13-3"
 
 local function rep(s, a, b, tag)
     local p = s:find(a, 1, true)
@@ -13846,6 +13920,7 @@ local function rep(s, a, b, tag)
 end
 
 function patch.apply(path, src)
+    src = src:gsub("\r\n", "\n"):gsub("\r", "\n")
     if path == "Src/Luau/Spec.luau" then
         src = rep(src, "LBC_VERSION_MAX = 11", "LBC_VERSION_MAX = 13", "spec.max")
         src = rep(src, "LBC_VERSION_TARGET = 6", "LBC_VERSION_TARGET = 9", "spec.target")
@@ -13868,10 +13943,22 @@ function patch.apply(path, src)
         self.Protos[i] = Proto.new(Bytecode, self, Config.EncodingKey)
     end]], [[    self.ProtoSizes = {}
     for i = 1, self.ProtoCount do
+        local ProtoSize = nil
+        local ProtoStart = nil
         if self.BytecodeVersion >= 12 then
-            self.ProtoSizes[i] = Bytecode:ReadVarInt()
+            ProtoSize = Bytecode:ReadVarInt()
+            ProtoStart = Bytecode.Offset
+            self.ProtoSizes[i] = ProtoSize
         end
         self.Protos[i] = Proto.new(Bytecode, self, Config.EncodingKey)
+        if ProtoSize then
+            local ProtoEnd = ProtoStart + ProtoSize
+            if Bytecode.Offset < ProtoEnd then
+                Bytecode:seek(ProtoEnd - Bytecode.Offset)
+            elseif Bytecode.Offset > ProtoEnd then
+                error(`Proto {i} overread ({Bytecode.Offset - ProtoEnd} bytes)`)
+            end
+        end
     end]], "init.sizes")
 
         src = rep(src, [[local function SkipProto(Bytecode: Buffer.BufferReader, Version: number)
@@ -13882,14 +13969,15 @@ function patch.apply(path, src)
         Bytecode:seek(Bytecode:ReadVarInt())
     end]], [[local function SkipProto(Bytecode: Buffer.BufferReader, Version: number)
     if Version >= 12 then
-        Bytecode:ReadVarInt()
+        local ProtoSize = Bytecode:ReadVarInt()
+        Bytecode:seek(ProtoSize)
+        return
     end
 
     Bytecode:seek(4)
 
-    local Flags = 0
     if Version >= 4 then
-        Flags = Bytecode:readu8()
+        Bytecode:seek(1)
         Bytecode:seek(Bytecode:ReadVarInt())
     end]], "init.skiphead")
 
@@ -13913,23 +14001,7 @@ function patch.apply(path, src)
             Bytecode:seek(32)
         end]], "init.vectord")
 
-        src = rep(src, [[    if Version >= 11 then
-        for _ = 1, Bytecode:ReadVarInt() do
-            Bytecode:seek(1)
-            Bytecode:ReadVarInt()
-        end
-    end
-end]], [[    if Version >= 11 then
-        for _ = 1, Bytecode:ReadVarInt() do
-            Bytecode:seek(1)
-            Bytecode:ReadVarInt()
-        end
-    end
 
-    if Version >= 12 and bit32.band(Flags, 8) ~= 0 then
-        Bytecode:ReadVarInt()
-    end
-end]], "init.cost")
 
         src = rep(src, [[        if Version < LuauSpec.LuauBytecodeTag.LBC_VERSION_MIN or Version > LuauSpec.LuauBytecodeTag.LBC_VERSION_MAX then
             return nil
@@ -13960,35 +14032,18 @@ end]], "init.cost")
             error(`Unexpected constant kind ({ConstantType})`)
         end]], "proto.vectord")
 
-        src = rep(src, [[    if Deserializer.BytecodeVersion >= 11 then
-        local FeedbackSlotCount = Bytecode:ReadVarInt()
-        self.FeedbackSlots = table.create(FeedbackSlotCount)
-
-        for i = 1, FeedbackSlotCount do
-            self.FeedbackSlots[i] = {
-                Type = Bytecode:readu8(),
-                Pc = Bytecode:ReadVarInt()
-            }
+        local cost = [[    if Deserializer.BytecodeVersion >= 12 and bit32.band(self.Flags or 0, 8) ~= 0 then
+        self.Cost = Bytecode:ReadVarInt64()
+    end
+]]
+        local mark = "\n\treturn self\nend\n\nexport type Proto"
+        local pos = src:find(mark, 1, true)
+        if not pos then
+            mark = "\n    return self\nend\n\nexport type Proto"
+            pos = src:find(mark, 1, true)
         end
-    end
-
-\treturn self]], [[    if Deserializer.BytecodeVersion >= 11 then
-        local FeedbackSlotCount = Bytecode:ReadVarInt()
-        self.FeedbackSlots = table.create(FeedbackSlotCount)
-
-        for i = 1, FeedbackSlotCount do
-            self.FeedbackSlots[i] = {
-                Type = Bytecode:readu8(),
-                Pc = Bytecode:ReadVarInt()
-            }
-        end
-    end
-
-    if Deserializer.BytecodeVersion >= 12 and bit32.band(self.Flags or 0, 8) ~= 0 then
-        self.Cost = Bytecode:ReadVarInt()
-    end
-
-\treturn self]], "proto.cost")
+        if not pos then error("LumenDecomp: Iridium patch mismatch: proto.cost", 3) end
+        src = src:sub(1, pos) .. cost .. src:sub(pos + 1)
         return src
     end
 

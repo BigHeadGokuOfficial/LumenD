@@ -1,4 +1,4 @@
-# LumenDecomp V3.2.1
+# LumenDecomp V3.2.2
 
 ```lua
 local g = getgenv()
@@ -7,7 +7,6 @@ g.Binary = true
 g.Decompile = true
 g.Tree = true
 g.IgnoreCoreScripts = true
-
 g.Parallel = true
 g.MaxWorkers = 4
 

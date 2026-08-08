@@ -1,12 +1,14 @@
 local dex = require("main.serialization.dex_serializer")
 local iri = require("main.runtime.iridium")
 local st = require("main.runtime.status")
+local core = require("main.runtime.core")
 
 local save = {}
 
 local ready = false
 local fail = nil
 local cache = nil
+local skipcore = false
 
 local function cached(scr)
     if not cache then return nil end
@@ -26,6 +28,7 @@ local function start(lumen)
     iri.get()
 
     dex.SetDecompiler(function(scr)
+        if skipcore and core.is(scr) then return nil, "core script ignored" end
         local hit, src = cached(scr)
         if hit ~= nil then
             if hit then return src end
@@ -67,15 +70,18 @@ function save.run(lumen, obj, file, opt)
     if opt.Binary == nil then opt.Binary = true end
 
     local old = cache
+    local oldskip = skipcore
     cache = opt.SourceCache
+    skipcore = opt.IgnoreCoreScripts == true
 
     local pass = {}
     for k, v in pairs(opt) do
-        if k ~= "SourceCache" then pass[k] = v end
+        if k ~= "SourceCache" and k ~= "IgnoreCoreScripts" then pass[k] = v end
     end
 
     local callok, a, b = pcall(dex.Save, obj, file, pass)
     cache = old
+    skipcore = oldskip
 
     if not callok then error(a, 2) end
     return a, b
