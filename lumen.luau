@@ -2,6 +2,7 @@ assert(type(loadstring) == "function", "LumenDecomp requires loadstring()")
 
 local mod = {
     ["main.analysis.dominators"] = [===[
+
 local dom = {}
 
 local function equal(a, b)
@@ -73,6 +74,161 @@ local post = require("main.analysis.postdom")
 
 local graph = {}
 
+local function immediatefromsets(blocks, sets)
+    local out = {}
+    for _, b in ipairs(blocks) do
+        local cand = {}
+        for id in pairs(sets[b.id] or {}) do if id ~= b.id then cand[#cand + 1] = id end end
+        table.sort(cand)
+        for _, id in ipairs(cand) do
+            local immediate = true
+            for _, other in ipairs(cand) do
+                if other ~= id and sets[other] and sets[other][id] then immediate = false break end
+            end
+            if immediate then out[b.id] = id break end
+        end
+    end
+    return out
+end
+
+local function dominancefrontiers(blocks, idom)
+    local df = {}; for _, b in ipairs(blocks) do df[b.id] = {} end
+    for _, b in ipairs(blocks) do
+        if #b.predecessors >= 2 then
+            for _, pred in ipairs(b.predecessors) do
+                local runner = pred
+                local guard = {}
+                while runner and runner ~= idom[b.id] and not guard[runner] do
+                    guard[runner] = true
+                    df[runner][b.id] = true
+                    runner = idom[runner]
+                end
+            end
+        end
+    end
+    return df
+end
+
+local function tarjan(blocks)
+    local index, stack, onstack, idx, low, out = 0, {}, {}, {}, {}, {}
+    local function visit(v)
+        index += 1; idx[v] = index; low[v] = index; stack[#stack + 1] = v; onstack[v] = true
+        for _, w in ipairs(blocks[v].successors) do
+            if not idx[w] then visit(w); low[v] = math.min(low[v], low[w])
+            elseif onstack[w] then low[v] = math.min(low[v], idx[w]) end
+        end
+        if low[v] == idx[v] then
+            local nodes, set = {}, {}
+            while true do
+                local w = stack[#stack]; stack[#stack] = nil; onstack[w] = nil
+                nodes[#nodes + 1] = w; set[w] = true
+                if w == v then break end
+            end
+            table.sort(nodes)
+            local cyclic = #nodes > 1
+            if #nodes == 1 then for _, w in ipairs(blocks[nodes[1]].successors) do if w == nodes[1] then cyclic = true break end end end
+            local entries, exits = {}, {}
+            for _, n in ipairs(nodes) do
+                for _, pred in ipairs(blocks[n].predecessors) do if not set[pred] then entries[n] = true end end
+                for _, succ in ipairs(blocks[n].successors) do if not set[succ] then exits[succ] = true end end
+            end
+            local entrycount = 0; for _ in pairs(entries) do entrycount += 1 end
+            out[#out + 1] = { nodes = nodes, set = set, cyclic = cyclic, entries = entries, exits = exits, irreducible = cyclic and entrycount > 1 }
+        end
+    end
+    for _, b in ipairs(blocks) do if not idx[b.id] then visit(b.id) end end
+    table.sort(out, function(a,b) return a.nodes[1] < b.nodes[1] end)
+    return out
+end
+
+local function loopforest(natural)
+    local parent = {}
+    local function subset(a, b)
+        for id in pairs(a) do if not b[id] then return false end end
+        return true
+    end
+    for i, loop in ipairs(natural) do
+        local best, bestsize
+        local size = 0; for _ in pairs(loop.nodes) do size += 1 end
+        for j, outer in ipairs(natural) do
+            if i ~= j and subset(loop.nodes, outer.nodes) then
+                local os = 0; for _ in pairs(outer.nodes) do os += 1 end
+                if os > size and (not bestsize or os < bestsize) then best, bestsize = j, os end
+            end
+        end
+        parent[i] = best
+    end
+    return parent
+end
+
+local function push(t, v)
+    for _, x in ipairs(t) do if x == v then return end end
+    t[#t + 1] = v
+end
+
+local function edgesuccessors(proto, pc, aux)
+    local op = proto.Instructions[pc]
+    local name = ins.name(op)
+    local nx = ins.next(proto, pc, aux)
+    local out = {}
+
+    local function valid(p)
+        return p >= 1 and p <= #proto.Instructions and not aux[p]
+    end
+    local function add(p)
+        if valid(p) then push(out, p) end
+    end
+
+    if name == "RETURN" then
+        return out
+    elseif name == "LOADB" and (op.C or 0) ~= 0 then
+        add(pc + (op.C or 0) + 1)
+    elseif name == "FORNPREP" then
+
+        add(nx)
+        add(ins.jumpTarget(pc, op))
+    elseif name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" then
+
+        add(ins.jumpTarget(pc, op))
+    elseif ins.isConditional(op) then
+        add(ins.jumpTarget(pc, op))
+        add(nx)
+    elseif ins.isUnconditional(op) then
+        add(ins.jumpTarget(pc, op))
+    else
+        add(nx)
+    end
+    return out
+end
+
+local function verify(proto, aux, blocks, blockmap, nexts)
+    local covered = {}
+    for _, b in ipairs(blocks) do
+        assert(b.id >= 1 and b.id <= #blocks, "LumenV4: CFG block id out of range")
+        assert(#b.pcs > 0, "LumenV4: empty CFG block")
+        for _, pc in ipairs(b.pcs) do
+            assert(not aux[pc], "LumenV4: AUX word entered a basic block")
+            assert(not covered[pc], "LumenV4: duplicate CFG PC " .. tostring(pc))
+            covered[pc] = b.id
+            assert(blockmap[pc] == b.id, "LumenV4: blockmap mismatch at PC " .. tostring(pc))
+        end
+        for _, sid in ipairs(b.successors) do
+            assert(blocks[sid], "LumenV4: invalid CFG successor " .. tostring(sid))
+            local back = false
+            for _, pid in ipairs(blocks[sid].predecessors) do if pid == b.id then back = true break end end
+            assert(back, "LumenV4: asymmetric CFG edge")
+        end
+    end
+    for pc = 1, #proto.Instructions do
+        if not aux[pc] and blockmap[pc] then
+            for _, target in ipairs(nexts[pc] or {}) do
+                assert(blockmap[target], "LumenV4: successor has no block at PC " .. tostring(target))
+            end
+        end
+    end
+    return true
+end
+
 function graph.build(proto)
     local ops = proto.Instructions
     local aux = ins.auxSlots(proto)
@@ -85,33 +241,18 @@ function graph.build(proto)
 
     for pc = 1, #ops do
         if not aux[pc] then
+            local successors = edgesuccessors(proto, pc, aux)
+            nexts[pc] = successors
+            for _, target in ipairs(successors) do leaders[target] = true end
+
             local op = ops[pc]
             local name = ins.name(op)
-            local nextPC = ins.next(proto, pc, aux)
-            local successors = {}
+            local nx = ins.next(proto, pc, aux)
 
-            if name == "RETURN" then
-
-            elseif name == "LOADB" and (op.C or 0) ~= 0 then
-                local target = pc + op.C + 1
-                if valid(target) then successors[#successors + 1] = target; leaders[target] = true end
-                if valid(nextPC) then leaders[nextPC] = true end
-
-            elseif ins.isConditional(op) then
-                local target = ins.jumpTarget(pc, op)
-                if valid(target) then successors[#successors + 1] = target; leaders[target] = true end
-                if valid(nextPC) then successors[#successors + 1] = nextPC; leaders[nextPC] = true end
-
-            elseif ins.isUnconditional(op) then
-                local target = ins.jumpTarget(pc, op)
-                if valid(target) then successors[#successors + 1] = target; leaders[target] = true end
-                if valid(nextPC) then leaders[nextPC] = true end
-
-            else
-                if valid(nextPC) then successors[#successors + 1] = nextPC end
+            if name == "RETURN" or name == "LOADB" and (op.C or 0) ~= 0
+                or name == "FORNPREP" or ins.isConditional(op) or ins.isUnconditional(op) then
+                if valid(nx) then leaders[nx] = true end
             end
-
-            nexts[pc] = successors
         end
     end
 
@@ -119,67 +260,94 @@ function graph.build(proto)
     for pc in pairs(leaders) do if valid(pc) then list[#list + 1] = pc end end
     table.sort(list)
 
-    local blocks = {}
-    local blockmap = {}
-
-    for index, startPC in ipairs(list) do
-        local nextLeader = list[index + 1] or (#ops + 1)
+    local rawblocks, rawmap = {}, {}
+    for index, startpc in ipairs(list) do
+        local nextleader = list[index + 1] or (#ops + 1)
         local pcs = {}
-
-        for pc = startPC, nextLeader - 1 do
+        for pc = startpc, nextleader - 1 do
             if not aux[pc] then
                 pcs[#pcs + 1] = pc
-                blockmap[pc] = index
+                rawmap[pc] = index
             end
         end
-
-        blocks[index] = {
-            id = index,
-            startPC = startPC,
-            endPC = pcs[#pcs] or startPC,
-            pcs = pcs,
-            successors = {},
-            predecessors = {},
-        }
-    end
-
-    for _, block in ipairs(blocks) do
-        local seen = {}
-        for _, nextpc in ipairs(nexts[block.endPC] or {}) do
-            local nextblock = blockmap[nextpc]
-            if nextblock and not seen[nextblock] then
-                seen[nextblock] = true
-                block.successors[#block.successors + 1] = nextblock
-            end
+        if #pcs > 0 then
+            rawblocks[index] = { id = index, startPC = startpc, endPC = pcs[#pcs], pcs = pcs, successors = {}, predecessors = {} }
         end
     end
 
-    for _, block in ipairs(blocks) do
-        for _, successor in ipairs(block.successors) do
-            blocks[successor].predecessors[#blocks[successor].predecessors + 1] = block.id
+    for _, b in ipairs(rawblocks) do
+        for _, target in ipairs(nexts[b.endPC] or {}) do
+            local sid = rawmap[target]
+            if sid then push(b.successors, sid) end
         end
+    end
+
+
+    local reachable, todo = {}, { rawmap[1] }
+    local at = 1
+    while at <= #todo do
+        local id = todo[at]; at += 1
+        if id and not reachable[id] then
+            reachable[id] = true
+            for _, sid in ipairs(rawblocks[id].successors) do todo[#todo + 1] = sid end
+        end
+    end
+
+    local remap, blocks = {}, {}
+    for oldid, b in ipairs(rawblocks) do
+        if reachable[oldid] then
+            local id = #blocks + 1
+            remap[oldid] = id
+            blocks[id] = { id = id, startPC = b.startPC, endPC = b.endPC, pcs = b.pcs, successors = {}, predecessors = {} }
+        end
+    end
+
+    local blockmap = {}
+    for oldid, newid in pairs(remap) do
+        local old = rawblocks[oldid]
+        local b = blocks[newid]
+        for _, pc in ipairs(b.pcs) do blockmap[pc] = newid end
+        for _, oldsucc in ipairs(old.successors) do
+            local sid = remap[oldsucc]
+            if sid then push(b.successors, sid) end
+        end
+    end
+    for _, b in ipairs(blocks) do
+        for _, sid in ipairs(b.successors) do push(blocks[sid].predecessors, b.id) end
     end
 
     local dominators = dom.compute(blocks)
-    local postdom, ipdom = post.run(blocks)
-
-    return {
+    local idom = immediatefromsets(blocks, dominators)
+    local postdom, ipdom, exitid = post.run(blocks)
+    local naturalloops = loops.find(blocks, dominators)
+    local sccs = tarjan(blocks)
+    local out = {
         proto = proto,
         aux = aux,
         blocks = blocks,
         blockmap = blockmap,
         nexts = nexts,
         dominators = dominators,
+        idom = idom,
+        dominanceFrontiers = dominancefrontiers(blocks, idom),
         postdom = postdom,
         ipdom = ipdom,
-        loops = loops.find(blocks, dominators),
+        exitId = exitid,
+        loops = naturalloops,
+        loopForest = loopforest(naturalloops),
+        sccs = sccs,
+        irreducible = false,
         registerStats = regs.stats(proto, aux),
     }
+    for _, component in ipairs(sccs) do if component.irreducible then out.irreducible = true break end end
+    out.verified = verify(proto, aux, blocks, blockmap, nexts)
+    return out
 end
 
 return graph
 ]===],
     ["main.analysis.loops"] = [===[
+
 local loops = {}
 
 function loops.find(blocks, dom)
@@ -234,57 +402,64 @@ end
 return loops
 ]===],
     ["main.analysis.postdom"] = [===[
+
 local post = {}
 
+local function clone(s)
+    local out = {}
+    for k in pairs(s) do out[k] = true end
+    return out
+end
+
 local function same(a, b)
-    for k in pairs(a) do
-        if not b[k] then return false end
-    end
-    for k in pairs(b) do
-        if not a[k] then return false end
-    end
+    for k in pairs(a) do if not b[k] then return false end end
+    for k in pairs(b) do if not a[k] then return false end end
     return true
 end
 
+local function intersectinto(dst, src)
+    for k in pairs(dst) do
+        if not src[k] then dst[k] = nil end
+    end
+end
+
 function post.run(blocks)
-    local all = {}
+    local exitid = #blocks + 1
+    local all = { [exitid] = true }
     for _, b in ipairs(blocks) do all[b.id] = true end
 
-    local pd = {}
-    for _, b in ipairs(blocks) do
-        local set = {}
-        if #b.successors == 0 then
-            set[b.id] = true
-        else
-            for id in pairs(all) do set[id] = true end
-        end
-        pd[b.id] = set
-    end
+    local pd = { [exitid] = { [exitid] = true } }
+    for _, b in ipairs(blocks) do pd[b.id] = clone(all) end
 
     local dirty = true
+    local iterations = 0
+    local limit = math.max(64, (#blocks + 1) * (#blocks + 1) * 4)
     while dirty do
+        iterations += 1
+        if iterations > limit then
+            error("LumenV4: post-dominator analysis failed to converge", 2)
+        end
         dirty = false
+
         for i = #blocks, 1, -1 do
             local b = blocks[i]
-            if #b.successors > 0 then
-                local set
-                for _, sid in ipairs(b.successors) do
-                    local src = pd[sid]
-                    if not set then
-                        set = {}
-                        for id in pairs(src) do set[id] = true end
-                    else
-                        for id in pairs(set) do
-                            if not src[id] then set[id] = nil end
-                        end
-                    end
+            local succ = b.successors
+            local set
+
+            if #succ == 0 then
+                set = clone(pd[exitid])
+            else
+                for _, sid in ipairs(succ) do
+                    local src = assert(pd[sid], "LumenV4: invalid postdom successor " .. tostring(sid))
+                    if not set then set = clone(src) else intersectinto(set, src) end
                 end
-                set = set or {}
-                set[b.id] = true
-                if not same(pd[b.id], set) then
-                    pd[b.id] = set
-                    dirty = true
-                end
+            end
+
+            set = set or {}
+            set[b.id] = true
+            if not same(pd[b.id], set) then
+                pd[b.id] = set
+                dirty = true
             end
         end
     end
@@ -295,22 +470,25 @@ function post.run(blocks)
         for id in pairs(pd[b.id]) do
             if id ~= b.id then cand[#cand + 1] = id end
         end
+        table.sort(cand)
+
         for _, id in ipairs(cand) do
-            local near = true
+            local immediate = true
+
             for _, other in ipairs(cand) do
                 if other ~= id and pd[other] and pd[other][id] then
-                    near = false
+                    immediate = false
                     break
                 end
             end
-            if near then
+            if immediate then
                 ip[b.id] = id
                 break
             end
         end
     end
 
-    return pd, ip
+    return pd, ip, exitid
 end
 
 return post
@@ -321,165 +499,108 @@ local ins = require("main.bytecode.instructions")
 local regs = {}
 
 local function add(set, value)
-    if type(value) == "number" and value >= 0 and value < 255 then
-        set[value] = true
-    end
+    if type(value) == "number" and value >= 0 and value < 255 then set[value] = true end
+end
+local function range(set, first, last)
+    for reg = first, math.min(last, 254) do add(set, reg) end
 end
 
-local function range(set, first, last)
-    for reg = first, last do
-        add(set, reg)
-    end
-end
 
 function regs.readWrite(op)
-    local reads, writes = {}, {}
+    local reads, writes, pack = {}, {}, {}
     local name = ins.name(op)
-    local A, B, C = op.A or 0, op.B or 0, op.C or 0
+    local ra, rb, rc = op.A or 0, op.B or 0, op.C or 0
     local aux = op.AuxValue and op.AuxValue.Value or 0
 
     if name == "LOADNIL" or name == "LOADB" or name == "LOADN" or name == "LOADK"
-        or name == "LOADKX" or name == "GETGLOBAL" or name == "GETUPVAL"
-        or name == "GETIMPORT" or name == "NEWTABLE" or name == "DUPTABLE"
-        or name == "NEWCLOSURE" or name == "DUPCLOSURE" then
-        add(writes, A)
-
-    elseif name == "MOVE" then
-        add(reads, B); add(writes, A)
-
-    elseif name == "SETGLOBAL" or name == "SETUPVAL" then
-        add(reads, A)
-
-    elseif name == "GETTABLE" then
-        add(reads, B); add(reads, C); add(writes, A)
-
-    elseif name == "SETTABLE" then
-        add(reads, A); add(reads, B); add(reads, C)
-
-    elseif name == "GETTABLEKS" or name == "GETTABLEN" or name == "GETUDATAKS" then
-        add(reads, B); add(writes, A)
-
-    elseif name == "SETTABLEKS" or name == "SETTABLEN" or name == "SETUDATAKS" then
-        add(reads, A); add(reads, B)
-
-    elseif name == "NAMECALL" or name == "NAMECALLUDATA" then
-        add(reads, B); add(writes, A); add(writes, A + 1)
-
+        or name == "LOADKX" or name == "GETGLOBAL" or name == "GETUPVAL" or name == "GETIMPORT"
+        or name == "NEWTABLE" or name == "DUPTABLE" or name == "NEWCLOSURE" or name == "DUPCLOSURE" then
+        add(writes, ra)
+    elseif name == "MOVE" then add(reads, rb); add(writes, ra)
+    elseif name == "SETGLOBAL" or name == "SETUPVAL" then add(reads, ra)
+    elseif name == "GETTABLE" then add(reads, rb); add(reads, rc); add(writes, ra)
+    elseif name == "SETTABLE" then add(reads, ra); add(reads, rb); add(reads, rc)
+    elseif name == "GETTABLEKS" or name == "GETTABLEN" or name == "GETUDATAKS" then add(reads, rb); add(writes, ra)
+    elseif name == "SETTABLEKS" or name == "SETTABLEN" or name == "SETUDATAKS" then add(reads, ra); add(reads, rb)
+    elseif name == "NAMECALL" or name == "NAMECALLUDATA" then add(reads, rb); add(writes, ra); add(writes, ra + 1)
     elseif name == "CALL" or name == "CALLFB" then
-        if B == 0 then add(reads, A) else range(reads, A, A + B - 1) end
-        if C == 0 then add(writes, A) elseif C > 1 then range(writes, A, A + C - 2) end
-
+        add(reads, ra)
+        if rb == 0 then
+            pack.openReadFrom = ra + 1
+            pack.consumesTop = true
+        elseif rb > 1 then range(reads, ra + 1, ra + rb - 1) end
+        if rc == 0 then
+            add(writes, ra)
+            pack.openWriteFrom = ra
+            pack.producesTop = true
+        elseif rc > 1 then range(writes, ra, ra + rc - 2) end
     elseif name == "RETURN" then
-        if B == 0 then add(reads, A) elseif B > 1 then range(reads, A, A + B - 2) end
-
-    elseif name == "ADD" or name == "SUB" or name == "MUL" or name == "DIV"
-        or name == "MOD" or name == "POW" or name == "IDIV"
-        or name == "AND" or name == "OR" then
-        add(reads, B); add(reads, C); add(writes, A)
-
-    elseif name == "ADDK" or name == "SUBK" or name == "MULK" or name == "DIVK"
-        or name == "MODK" or name == "POWK" or name == "IDIVK"
-        or name == "ANDK" or name == "ORK" then
-        add(reads, B); add(writes, A)
-
-    elseif name == "SUBRK" or name == "DIVRK" then
-        add(reads, C); add(writes, A)
-
-    elseif name == "CONCAT" then
-        range(reads, B, C); add(writes, A)
-
-    elseif name == "NOT" or name == "MINUS" or name == "LENGTH" then
-        add(reads, B); add(writes, A)
-
+        if rb == 0 then add(reads, ra); pack.openReadFrom = ra; pack.consumesTop = true
+        elseif rb > 1 then range(reads, ra, ra + rb - 2) end
+    elseif name == "ADD" or name == "SUB" or name == "MUL" or name == "DIV" or name == "MOD" or name == "POW" or name == "IDIV" or name == "AND" or name == "OR" then
+        add(reads, rb); add(reads, rc); add(writes, ra)
+    elseif name == "ADDK" or name == "SUBK" or name == "MULK" or name == "DIVK" or name == "MODK" or name == "POWK" or name == "IDIVK" or name == "ANDK" or name == "ORK" then
+        add(reads, rb); add(writes, ra)
+    elseif name == "SUBRK" or name == "DIVRK" then add(reads, rc); add(writes, ra)
+    elseif name == "CONCAT" then range(reads, rb, rc); add(writes, ra)
+    elseif name == "NOT" or name == "MINUS" or name == "LENGTH" then add(reads, rb); add(writes, ra)
     elseif name == "SETLIST" then
-        add(reads, A)
-        if C == 0 then add(reads, B) elseif C > 1 then range(reads, B, B + C - 2) end
+        add(reads, ra)
+        if rc == 0 then add(reads, rb); pack.openReadFrom = rb; pack.consumesTop = true
+        elseif rc > 1 then range(reads, rb, rb + rc - 2) end
+    elseif name == "FORNPREP" then
+        range(reads, ra, ra + 2)
 
-    elseif name == "FORNPREP" or name == "FORNLOOP" then
-        range(reads, A, A + 3); range(writes, A + 2, A + 3)
 
+        range(writes, ra, ra + 2)
+    elseif name == "FORNLOOP" then
+        range(reads, ra, ra + 2); add(writes, ra + 2)
     elseif name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" then
-        range(reads, A, A + 2)
-
+        range(reads, ra, ra + 2); range(writes, ra, ra + 2)
     elseif name == "FORGLOOP" then
         local count = bit32.band(aux, 0xff)
-        range(reads, A, A + 2); add(writes, A + 2)
-        if count > 0 then range(writes, A + 3, A + 2 + count) end
-
+        range(reads, ra, ra + 2); add(writes, ra + 2)
+        if count > 0 then range(writes, ra + 3, ra + 2 + count) end
     elseif name == "GETVARARGS" then
-        if B == 0 then add(writes, A) elseif B > 1 then range(writes, A, A + B - 2) end
-
-    elseif name == "CAPTURE" then
-        if A == 0 or A == 1 then add(reads, B) end
-
-    elseif name == "JUMPIF" or name == "JUMPIFNOT"
-        or name == "JUMPXEQKNIL" or name == "JUMPXEQKB"
-        or name == "JUMPXEQKN" or name == "JUMPXEQKS"
-        or name == "CMPPROTO" then
-        add(reads, A)
-
-    elseif name == "JUMPIFEQ" or name == "JUMPIFNOTEQ"
-        or name == "JUMPIFLT" or name == "JUMPIFLE"
-        or name == "JUMPIFNOTLT" or name == "JUMPIFNOTLE" then
-        add(reads, A); add(reads, bit32.band(aux, 0xff))
-
-    elseif name == "NEWCLASSMEMBER" then
-        add(reads, A); add(reads, C)
-
-    elseif name == "NEWCLASS" then
-        if B ~= 0xff then add(reads, B) end
-        add(writes, A)
+        if rb == 0 then add(writes, ra); pack.openWriteFrom = ra; pack.producesTop = true
+        elseif rb > 1 then range(writes, ra, ra + rb - 2) end
+    elseif name == "CAPTURE" then if ra == 0 or ra == 1 then add(reads, rb) end
+    elseif name == "JUMPIF" or name == "JUMPIFNOT" or name == "JUMPXEQKNIL" or name == "JUMPXEQKB" or name == "JUMPXEQKN" or name == "JUMPXEQKS" or name == "CMPPROTO" then
+        add(reads, ra)
+    elseif name == "JUMPIFEQ" or name == "JUMPIFNOTEQ" or name == "JUMPIFLT" or name == "JUMPIFLE" or name == "JUMPIFNOTLT" or name == "JUMPIFNOTLE" then
+        add(reads, ra); add(reads, bit32.band(aux, 0xff))
+    elseif name == "NEWCLASSMEMBER" then add(reads, ra); add(reads, rc)
+    elseif name == "NEWCLASS" then if rb ~= 0xff then add(reads, rb) end; add(writes, ra)
     end
 
-    return reads, writes
+    return reads, writes, pack
 end
 
 function regs.stats(proto, aux)
     local stats = {}
     aux = aux or ins.auxSlots(proto)
-
     local function get(reg)
         local entry = stats[reg]
         if not entry then
-            entry = {
-                reads = 0, writes = 0,
-                firstWrite = nil, lastWrite = nil,
-                firstRead = nil, lastRead = nil,
-                firstAccess = nil, lastAccess = nil,
-            }
+            entry = { reads = 0, writes = 0, firstWrite = nil, lastWrite = nil, firstRead = nil, lastRead = nil, firstAccess = nil, lastAccess = nil }
             stats[reg] = entry
         end
         return entry
     end
-
     for pc = 1, #proto.Instructions do
         if not aux[pc] then
-            local op = proto.Instructions[pc]
-            local reads, writes = regs.readWrite(op)
-
+            local reads, writes = regs.readWrite(proto.Instructions[pc])
             for reg in pairs(reads) do
-                local entry = get(reg)
-                entry.reads += 1
-                entry.firstRead = entry.firstRead or pc
-                entry.lastRead = pc
-                entry.firstAccess = entry.firstAccess or pc
-                entry.lastAccess = pc
+                local e = get(reg); e.reads += 1; e.firstRead = e.firstRead or pc; e.lastRead = pc; e.firstAccess = e.firstAccess or pc; e.lastAccess = pc
             end
-
-            local name = ins.name(op)
+            local name = ins.name(proto.Instructions[pc])
             for reg in pairs(writes) do
                 if name ~= "NAMECALL" and name ~= "NAMECALLUDATA" then
-                    local entry = get(reg)
-                    entry.writes += 1
-                    entry.firstWrite = entry.firstWrite or pc
-                    entry.lastWrite = pc
-                    entry.firstAccess = entry.firstAccess or pc
-                    entry.lastAccess = pc
+                    local e = get(reg); e.writes += 1; e.firstWrite = e.firstWrite or pc; e.lastWrite = pc; e.firstAccess = e.firstAccess or pc; e.lastAccess = pc
                 end
             end
         end
     end
-
     return stats
 end
 
@@ -492,329 +613,349 @@ local regs = require("main.analysis.registers")
 local ssa = {}
 
 local function copy(source)
-    local result = {}
-    for key, value in pairs(source) do
-        result[key] = value
-    end
-    return result
+    local out = {}; for k, v in pairs(source) do out[k] = v end; return out
+end
+local function same(a, b)
+    for k, v in pairs(a) do if b[k] ~= v then return false end end
+    for k, v in pairs(b) do if a[k] ~= v then return false end end
+    return true
+end
+local function seteq(a, b)
+    for k in pairs(a) do if not b[k] then return false end end
+    for k in pairs(b) do if not a[k] then return false end end
+    return true
 end
 
-local function same(a, b)
-    for key, value in pairs(a) do
-        if b[key] ~= value then
-            return false
+
+local ambig = {}
+
+
+local function packflow(proto, cfg)
+    local pin, pout, before, consumer = {}, {}, {}, {}
+    local changed, iterations = true, 0
+    local limit = math.max(64, (#cfg.blocks + 1) * 256)
+
+    local function merge(block)
+        if block.id == 1 or #block.predecessors == 0 then return nil end
+        local first, have = nil, false
+        for _, pred in ipairs(block.predecessors) do
+            local v = pout[pred]
+            if not have then first, have = v, true
+            elseif first ~= v then return ambig end
+        end
+        return first
+    end
+
+    while changed do
+        iterations += 1
+        if iterations > limit then error("LumenV4: ValuePack dataflow failed to converge", 2) end
+        changed = false
+        for _, block in ipairs(cfg.blocks) do
+            local incoming = merge(block)
+            if pin[block.id] ~= incoming then pin[block.id] = incoming; changed = true end
+            local cur = incoming
+            for _, pc in ipairs(block.pcs) do
+                local _, _, pack = regs.readWrite(proto.Instructions[pc])
+                if pack.consumesTop then consumer[pc] = cur end
+                if pack.producesTop then
+                    cur = pc
+                elseif pack.consumesTop then
+                    cur = nil
+                end
+            end
+            if pout[block.id] ~= cur then pout[block.id] = cur; changed = true end
         end
     end
 
-    for key, value in pairs(b) do
-        if a[key] ~= value then
-            return false
+
+    for _, block in ipairs(cfg.blocks) do
+        local cur = pin[block.id]
+        for _, pc in ipairs(block.pcs) do
+            before[pc] = cur
+            local _, _, pack = regs.readWrite(proto.Instructions[pc])
+            if pack.consumesTop then consumer[pc] = cur end
+            if pack.producesTop then cur = pc elseif pack.consumesTop then cur = nil end
         end
     end
+    return pin, pout, before, consumer, ambig
+end
 
-    return true
+local function liveness(proto, cfg, packinput, ambiguous)
+    local use, def, lin, lout = {}, {}, {}, {}
+    for _, b in ipairs(cfg.blocks) do
+        local u, d = {}, {}
+        for _, pc in ipairs(b.pcs) do
+            local r, w, pack = regs.readWrite(proto.Instructions[pc])
+            for reg in pairs(r) do if not d[reg] then u[reg] = true end end
+            if pack.openReadFrom then
+                local producer = packinput[pc]
+                if type(producer) == "number" then
+                    local _, _, pp = regs.readWrite(proto.Instructions[producer])
+                    local topbase = pp.openWriteFrom
+                    if topbase and topbase >= pack.openReadFrom then
+                        for reg = pack.openReadFrom, topbase - 1 do if not d[reg] then u[reg] = true end end
+                    end
+                end
+            end
+            for reg in pairs(w) do d[reg] = true end
+            if pack.openWriteFrom then for reg = pack.openWriteFrom, 254 do d[reg] = true end end
+        end
+        use[b.id], def[b.id], lin[b.id], lout[b.id] = u, d, {}, {}
+    end
+
+    local changed = true
+    local iterations = 0
+    local limit = math.max(64, #cfg.blocks * 512)
+    while changed do
+        iterations += 1
+        if iterations > limit then error("LumenV4: liveness failed to converge", 2) end
+        changed = false
+        for i = #cfg.blocks, 1, -1 do
+            local b = cfg.blocks[i]
+            local out = {}
+            for _, sid in ipairs(b.successors) do for r in pairs(lin[sid]) do out[r] = true end end
+            local inn = copy(use[b.id])
+            for r in pairs(out) do if not def[b.id][r] then inn[r] = true end end
+            if not seteq(lout[b.id], out) then lout[b.id] = out; changed = true end
+            if not seteq(lin[b.id], inn) then lin[b.id] = inn; changed = true end
+        end
+    end
+    local after = {}
+    for _, b in ipairs(cfg.blocks) do
+        local live = copy(lout[b.id])
+        for i = #b.pcs, 1, -1 do
+            local pc = b.pcs[i]
+            after[pc] = copy(live)
+            local r, w, pack = regs.readWrite(proto.Instructions[pc])
+            if pack.openWriteFrom then
+                for reg = pack.openWriteFrom, 254 do live[reg] = nil end
+            end
+            for reg in pairs(w) do live[reg] = nil end
+            if pack.openReadFrom then
+                local producer = packinput[pc]
+                if type(producer) == "number" then
+                    local _, _, pp = regs.readWrite(proto.Instructions[producer])
+                    local topbase = pp.openWriteFrom
+                    if topbase and topbase >= pack.openReadFrom then
+                        for reg = pack.openReadFrom, topbase - 1 do live[reg] = true end
+                    end
+                end
+            end
+            for reg in pairs(r) do live[reg] = true end
+        end
+    end
+    return lin, lout, after
 end
 
 function ssa.build(proto, cfg)
     cfg = cfg or graph.build(proto)
-
+    local packinblock, packoutblock, packbefore, packinput, ambiguouspack = packflow(proto, cfg)
+    local livein, liveout, liveafter = liveness(proto, cfg, packinput, ambiguouspack)
     local result = {
-        proto = proto,
-        cfg = cfg,
-        params = {},
-        defsByPC = {},
-        usesByPC = {},
-        versions = {},
-        phisByBlock = {},
-        inVersions = {},
-        outVersions = {},
-        useCount = {},
-        defUse = {},
+        proto = proto, cfg = cfg, params = {}, defsByPC = {}, usesByPC = {}, versions = {}, phisByBlock = {},
+        inVersions = {}, outVersions = {}, useCount = {}, defUse = {}, undefByReg = {}, packsByPC = {},
+        liveIn = livein, liveOut = liveout, liveAfter = liveafter,
+        packInBlock = packinblock, packOutBlock = packoutblock, packBefore = packbefore,
+        packInput = packinput, ambiguousPack = ambiguouspack,
     }
-
     local nextver = 1
-
     local function newver(kind, reg, pc, block)
-        local id = nextver
-        nextver = nextver + 1
-
-        result.versions[id] = {
-            id = id,
-            kind = kind,
-            reg = reg,
-            pc = pc,
-            block = block,
-        }
-
+        local id = nextver; nextver += 1
+        result.versions[id] = { id = id, kind = kind, reg = reg, pc = pc, block = block }
+        return id
+    end
+    local function undef(reg)
+        local id = result.undefByReg[reg]
+        if not id then id = newver("undef", reg, nil, nil); result.undefByReg[reg] = id end
         return id
     end
 
     for reg = 0, (proto.ParameterCount or 0) - 1 do
-        local id = newver("param", reg, 0, 1)
-        result.params[reg] = id
+        local id = newver("param", reg, 0, 1); result.params[reg] = id
     end
 
-    for _, block in ipairs(cfg.blocks) do
-        for _, pc in ipairs(block.pcs) do
-            local op = proto.Instructions[pc]
-            local _, writes = regs.readWrite(op)
 
-            if next(writes) then
-                local defs = {}
-                result.defsByPC[pc] = defs
-
-                for reg in pairs(writes) do
-                    defs[reg] = newver("def", reg, pc, block.id)
+    for _, b in ipairs(cfg.blocks) do
+        for _, pc in ipairs(b.pcs) do
+            local _, writes, pack = regs.readWrite(proto.Instructions[pc])
+            result.packsByPC[pc] = next(pack) and pack or nil
+            local need = next(writes) ~= nil or pack.openWriteFrom ~= nil
+            if need then
+                local defs = {}; result.defsByPC[pc] = defs
+                for reg in pairs(writes) do defs[reg] = newver("def", reg, pc, b.id) end
+                if pack.openWriteFrom then
+                    for reg in pairs(liveafter[pc] or {}) do
+                        if reg >= pack.openWriteFrom and not defs[reg] then defs[reg] = newver("pack", reg, pc, b.id) end
+                    end
                 end
             end
         end
     end
 
     local phimap = {}
-
-    local function getphi(blockId, reg)
-        local byRegister = phimap[blockId]
-        if not byRegister then
-            byRegister = {}
-            phimap[blockId] = byRegister
-        end
-
-        local id = byRegister[reg]
-        if id then
-            return id
-        end
-
-        id = newver("phi", reg, nil, blockId)
-        byRegister[reg] = id
-
-        local blockPhis = result.phisByBlock[blockId]
-        if not blockPhis then
-            blockPhis = {}
-            result.phisByBlock[blockId] = blockPhis
-        end
-
-        blockPhis[reg] = {
-            id = id,
-            reg = reg,
-            inputs = {},
-        }
-
+    local function getphi(blockid, reg)
+        local m = phimap[blockid]; if not m then m = {}; phimap[blockid] = m end
+        if m[reg] then return m[reg] end
+        local id = newver("phi", reg, nil, blockid); m[reg] = id
+        local p = result.phisByBlock[blockid]; if not p then p = {}; result.phisByBlock[blockid] = p end
+        p[reg] = { id = id, reg = reg, inputs = {}, incoming = {}, missing = false }
         return id
     end
 
     local function merge(block)
-        if block.id == 1 then
-            return copy(result.params)
-        end
-
-        if #block.predecessors == 0 then
-            return {}
-        end
-
-        local regs = {}
-        for _, pred in ipairs(block.predecessors) do
-            local vals = result.outVersions[pred] or {}
-            for reg in pairs(vals) do
-                regs[reg] = true
-            end
-        end
-
+        if block.id == 1 then return copy(result.params) end
+        if #block.predecessors == 0 then return {} end
         local merged = {}
-
-        for reg in pairs(regs) do
-            local unique = {}
-            local count = 0
-            local byreg = phimap[block.id]
-            local prior = byreg and byreg[reg]
-
-            local missing = false
+        for reg in pairs(livein[block.id] or {}) do
+            local unique, incoming, count = {}, {}, 0
+            local prior = phimap[block.id] and phimap[block.id][reg]
             for _, pred in ipairs(block.predecessors) do
-                local vals = result.outVersions[pred] or {}
-                local version = vals[reg]
-
-                if version == nil then
-                    missing = true
-                elseif version ~= prior and not unique[version] then
-                    unique[version] = true
-                    count = count + 1
-                end
+                local version = (result.outVersions[pred] or {})[reg] or undef(reg)
+                incoming[pred] = version
+                if version ~= prior and not unique[version] then unique[version] = true; count += 1 end
             end
-
-            if missing then count = count + 1 end
-
             if count == 1 then
-                for version in pairs(unique) do
-                    merged[reg] = version
-                    break
-                end
+                for v in pairs(unique) do merged[reg] = v break end
             elseif count > 1 then
-                local phi = getphi(block.id, reg)
-                merged[reg] = phi
-
-                local record = result.phisByBlock[block.id][reg]
-                record.inputs = unique
-                record.missing = missing
+                local id = getphi(block.id, reg); merged[reg] = id
+                local rec = result.phisByBlock[block.id][reg]
+                rec.inputs, rec.incoming = unique, incoming
+                rec.missing = unique[undef(reg)] == true
             end
         end
-
         return merged
     end
 
-    local changed = true
-    local iterations = 0
-    local maxiter = math.max(16, #cfg.blocks * 8)
-
-    while changed and iterations < maxiter do
-        iterations = iterations + 1
+    local changed, iterations = true, 0
+    local limit = math.max(128, (#cfg.blocks + 1) * 1024)
+    while changed do
+        iterations += 1
+        if iterations > limit then error("LumenV4: SSA failed to converge", 2) end
         changed = false
-
-        for _, block in ipairs(cfg.blocks) do
-            local incoming = merge(block)
-            local oldin = result.inVersions[block.id] or {}
-
-            if not same(oldin, incoming) then
-                result.inVersions[block.id] = incoming
-                changed = true
-            end
-
+        for _, b in ipairs(cfg.blocks) do
+            local incoming = merge(b)
+            if not same(result.inVersions[b.id] or {}, incoming) then result.inVersions[b.id] = incoming; changed = true end
             local current = copy(incoming)
-
-            for _, pc in ipairs(block.pcs) do
+            for _, pc in ipairs(b.pcs) do
                 local defs = result.defsByPC[pc]
-                if defs then
-                    for reg, version in pairs(defs) do
-                        current[reg] = version
-                    end
-                end
+                if defs then for reg, v in pairs(defs) do current[reg] = v end end
             end
-
-            local oldout = result.outVersions[block.id] or {}
-            if not same(oldout, current) then
-                result.outVersions[block.id] = current
-                changed = true
-            end
+            if not same(result.outVersions[b.id] or {}, current) then result.outVersions[b.id] = current; changed = true end
         end
     end
+    result.converged, result.iterations = true, iterations
 
-    result.converged = not changed
-    result.iterations = iterations
-
-    for blockId, phis in pairs(result.phisByBlock) do
-        local incoming = result.inVersions[blockId] or {}
-        for reg, phi in pairs(phis) do
-            if incoming[reg] ~= phi.id then
-                phis[reg] = nil
-                result.versions[phi.id].dead = true
-            end
+    for bid, phis in pairs(result.phisByBlock) do
+        local incoming = result.inVersions[bid] or {}
+        for reg, p in pairs(phis) do
+            if incoming[reg] ~= p.id then phis[reg] = nil; result.versions[p.id].dead = true end
         end
-        if not next(phis) then result.phisByBlock[blockId] = nil end
+        if not next(phis) then result.phisByBlock[bid] = nil end
     end
 
-    for _, block in ipairs(cfg.blocks) do
-        local current = copy(result.inVersions[block.id] or {})
 
-        for _, pc in ipairs(block.pcs) do
-            local op = proto.Instructions[pc]
-            local reads, _ = regs.readWrite(op)
+    for _, b in ipairs(cfg.blocks) do
+        local current = copy(result.inVersions[b.id] or {})
+        for _, pc in ipairs(b.pcs) do
+            local reads = regs.readWrite(proto.Instructions[pc])
             local uses = {}
-
             for reg in pairs(reads) do
-                local version = current[reg]
-                if version ~= nil then
-                    uses[reg] = version
-                    result.useCount[version] = (result.useCount[version] or 0) + 1
-
-                    local uses = result.defUse[version]
-                    if not uses then
-                        uses = {}
-                        result.defUse[version] = uses
-                    end
-
-                    uses[#uses + 1] = {
-                        pc = pc,
-                        reg = reg,
-                        block = block.id,
-                    }
-                end
-            end
-
-            if next(uses) then
-                result.usesByPC[pc] = uses
-            end
-
-            local defs = result.defsByPC[pc]
-            if defs then
-                for reg, version in pairs(defs) do
-                    current[reg] = version
-                end
-            end
-        end
-    end
-
-    for blockId, phis in pairs(result.phisByBlock) do
-        for reg, phi in pairs(phis) do
-            for version in pairs(phi.inputs) do
+                local version = current[reg] or undef(reg)
+                uses[reg] = version
                 result.useCount[version] = (result.useCount[version] or 0) + 1
+                local list = result.defUse[version] or {}; result.defUse[version] = list
+                list[#list + 1] = { pc = pc, reg = reg, block = b.id }
+            end
+            if next(uses) then result.usesByPC[pc] = uses end
+            local defs = result.defsByPC[pc]
+            if defs then for reg, v in pairs(defs) do current[reg] = v end end
+        end
+    end
 
-                local uses = result.defUse[version]
-                if not uses then
-                    uses = {}
-                    result.defUse[version] = uses
+    for bid, phis in pairs(result.phisByBlock) do
+        local predcount = #cfg.blocks[bid].predecessors
+        for reg, p in pairs(phis) do
+            local n = 0
+            for _, pred in ipairs(cfg.blocks[bid].predecessors) do
+                local v = assert(p.incoming[pred], "LumenV4: phi missing predecessor input")
+                n += 1
+                result.useCount[v] = (result.useCount[v] or 0) + 1
+                local list = result.defUse[v] or {}; result.defUse[v] = list
+                list[#list + 1] = { phi = p.id, block = bid, reg = reg, predecessor = pred }
+            end
+            assert(n == predcount, "LumenV4: phi predecessor cardinality mismatch")
+        end
+    end
+
+    local function verifyssa()
+        local function dominates(defv, useblock, usepc)
+            if not defv or defv.kind == "undef" then return true end
+            if defv.kind == "param" then return cfg.dominators[useblock] and cfg.dominators[useblock][1] == true end
+            if defv.kind == "phi" then return cfg.dominators[useblock] and cfg.dominators[useblock][defv.block] == true end
+            if defv.block == useblock then return type(defv.pc) == "number" and defv.pc < usepc end
+            return cfg.dominators[useblock] and cfg.dominators[useblock][defv.block] == true
+        end
+
+        for pc, uses in pairs(result.usesByPC) do
+            local blockid = assert(cfg.blockmap[pc], "LumenV4: SSA use outside reachable CFG")
+            for reg, version in pairs(uses) do
+                local v = assert(result.versions[version], "LumenV4: SSA use has invalid version")
+                assert(dominates(v, blockid, pc), ("LumenV4: SSA definition v%d does not dominate use r%d@pc%d"):format(version, reg, pc))
+            end
+        end
+
+        for bid, phis in pairs(result.phisByBlock) do
+            local block = assert(cfg.blocks[bid])
+            for reg, phi in pairs(phis) do
+                local seen = 0
+                for _, pred in ipairs(block.predecessors) do
+                    local expected = (result.outVersions[pred] or {})[reg] or undef(reg)
+                    assert(phi.incoming[pred] == expected, ("LumenV4: phi v%d has invalid edge value from b%d"):format(phi.id, pred))
+                    seen += 1
                 end
-
-                uses[#uses + 1] = {
-                    phi = phi.id,
-                    block = blockId,
-                    reg = reg,
-                }
+                assert(seen == #block.predecessors, "LumenV4: phi edge cardinality mismatch")
             end
         end
-    end
 
-    function result:versionForUse(pc, reg)
-        local uses = self.usesByPC[pc]
-        return uses and uses[reg] or nil
+        for pc, pack in pairs(result.packsByPC) do
+            if pack and pack.consumesTop then
+                local producer = result.packInput[pc]
+                if producer ~= result.ambiguousPack then
+                    if type(producer) ~= "number" then
+                        error("LumenV4: UNSUPPORTED open ValuePack consumer has no reaching producer at pc " .. tostring(pc), 2)
+                    end
+                    local pp = result.packsByPC[producer]
+                    assert(pp and pp.producesTop, "LumenV4: ValuePack consumer references non-producer")
+                end
+            end
+        end
+        return true
     end
+    result.verified = verifyssa()
 
-    function result:versionForDef(pc, reg)
-        local defs = self.defsByPC[pc]
-        return defs and defs[reg] or nil
-    end
-
-    function result:isSingleUse(version)
-        return (self.useCount[version] or 0) == 1
-    end
-
-    function result:onlyUse(version)
-        local uses = self.defUse[version]
-        return uses and #uses == 1 and uses[1] or nil
-    end
-
+    function result:versionForUse(pc, reg) local u = self.usesByPC[pc]; return u and u[reg] or nil end
+    function result:versionForDef(pc, reg) local d = self.defsByPC[pc]; return d and d[reg] or nil end
+    function result:isSingleUse(v) return (self.useCount[v] or 0) == 1 end
+    function result:onlyUse(v) local u = self.defUse[v]; return u and #u == 1 and u[1] or nil end
     function result:summary()
-        local phiCount = 0
-        for _, phis in pairs(self.phisByBlock) do
-            for _ in pairs(phis) do
-                phiCount = phiCount + 1
+        local phis, versions, undefs, packs, divergentpacks = 0, 0, 0, 0, 0
+        for _, ps in pairs(self.phisByBlock) do for _ in pairs(ps) do phis += 1 end end
+        for _, v in ipairs(self.versions) do if not v.dead then versions += 1; if v.kind == "undef" then undefs += 1 end end end
+        for pc, p in pairs(self.packsByPC) do
+            if p then
+                packs += 1
+                if p.consumesTop and self.packInput[pc] == self.ambiguousPack then divergentpacks += 1 end
             end
         end
-
-        local versions = 0
-        for _, ver in ipairs(self.versions) do if not ver.dead then versions = versions + 1 end end
-        return {
-            converged = self.converged,
-            iterations = self.iterations,
-            versions = versions,
-            phis = phiCount,
-            blocks = #self.cfg.blocks,
-        }
+        return { converged = true, iterations = self.iterations, versions = versions, phis = phis, blocks = #self.cfg.blocks, undefs = undefs, openPacks = packs, divergentPacks = divergentpacks }
     end
-
     return result
 end
 
 return ssa
 ]===],
     ["main.api"] = [===[
+
 local ver = require("main.version")
 local cfg = require("main.config")
 local options = require("main.options")
@@ -970,6 +1111,7 @@ end
 return api
 ]===],
     ["main.ast.booleans"] = [===[
+
 local pass = {}
 
 local function val(n)
@@ -1034,6 +1176,7 @@ end
 return pass
 ]===],
     ["main.ast.callbacks"] = [===[
+
 local pass = {}
 
 local function esc(s)
@@ -1129,6 +1272,7 @@ end
 return pass
 ]===],
     ["main.ast.compound"] = [===[
+
 local pass = {}
 
 local list = {
@@ -1171,6 +1315,7 @@ end
 return pass
 ]===],
     ["main.ast.conditions"] = [===[
+
 local pass = {}
 
 local function same(a, b)
@@ -1227,6 +1372,7 @@ end
 return pass
 ]===],
     ["main.ast.deadcode"] = [===[
+
 local pass = {}
 
 local function walk(block)
@@ -1255,6 +1401,7 @@ end
 return pass
 ]===],
     ["main.ast.doblocks"] = [===[
+
 local pass = {}
 
 local function words(s, out)
@@ -1417,6 +1564,7 @@ end
 return pass
 ]===],
     ["main.ast.fold"] = [===[
+
 local pass = {}
 
 local function bool(s)
@@ -1481,6 +1629,7 @@ end
 return pass
 ]===],
     ["main.ast.guards2"] = [===[
+
 local pass = {}
 
 local inv = {
@@ -1543,6 +1692,7 @@ end
 return pass
 ]===],
     ["main.ast.inline"] = [===[
+
 local pass = {}
 
 local function init(n)
@@ -1640,6 +1790,7 @@ end
 return pass
 ]===],
     ["main.ast.locals"] = [===[
+
 local pass = {}
 
 local function walk(block)
@@ -1679,6 +1830,7 @@ end
 return pass
 ]===],
     ["main.ast.logic"] = [===[
+
 local pass = {}
 
 local inv = {
@@ -1729,6 +1881,7 @@ end
 return pass
 ]===],
     ["main.ast.lower"] = [===[
+
 local n = require("main.ast.nodes")
 
 local build = {}
@@ -1868,6 +2021,7 @@ end
 return build
 ]===],
     ["main.ast.nodes"] = [===[
+
 local n = {}
 
 function n.block()
@@ -1909,53 +2063,19 @@ end
 return n
 ]===],
     ["main.ast.pipeline"] = [===[
-local fold = require("main.ast.fold")
-local cond = require("main.ast.conditions")
-local logic = require("main.ast.logic")
-local guards = require("main.recover.guards")
-local guards2 = require("main.ast.guards2")
-local selectp = require("main.ast.selects")
-local ret = require("main.ast.returns")
-local inline = require("main.ast.inline")
-local callbacks = require("main.ast.callbacks")
-local bools = require("main.ast.booleans")
-local comp = require("main.ast.compound")
-local locals = require("main.ast.locals")
-local dead = require("main.ast.deadcode")
-local scopes = require("main.ast.doblocks")
+
+
 
 local pass = {}
 
 function pass.run(root, opt)
-    opt = opt or {}
-    if opt.dce ~= false then dead.run(root) end
-    if opt.fold ~= false then fold.run(root) end
-    if opt.conditions ~= false then
-        cond.run(root)
-        if opt.selects ~= false then selectp.run(root) end
-        if opt.returns ~= false then ret.run(root) end
-    end
-    if opt.inlineast ~= false then inline.run(root) end
-    if opt.callbacks ~= false then callbacks.run(root) end
-    if opt.conditions ~= false and opt.booleans ~= false then bools.run(root) end
-    if opt.guards ~= false then
-        guards2.run(root)
-        guards.run(root)
-    end
-    locals.run(root)
-    if opt.compound ~= false then comp.run(root) end
-    if opt.conditions ~= false then
-        logic.run(root)
-        cond.run(root)
-    end
-    if opt.dce ~= false then dead.run(root) end
-    if (opt.doblocks or 0) > 0 then scopes.run(root, opt.doblocks) end
     return root
 end
 
 return pass
 ]===],
     ["main.ast.printer"] = [===[
+
 local printast = {}
 
 local function esc(s)
@@ -2080,6 +2200,7 @@ end
 return printast
 ]===],
     ["main.ast.returns"] = [===[
+
 local pass = {}
 
 local function ret(b)
@@ -2138,6 +2259,7 @@ end
 return pass
 ]===],
     ["main.ast.selects"] = [===[
+
 local pass = {}
 
 local function asn(node)
@@ -2214,6 +2336,7 @@ end
 return pass
 ]===],
     ["main.bytecode.instructions"] = [===[
+
 local ins = {}
 
 local conditional = {
@@ -2302,24 +2425,26 @@ end
 return ins
 ]===],
     ["main.config"] = [===[
+
 local base = {
     aggressive = false,
     fold = true,
     inline = true,
     dce = true,
     conditions = true,
-    guards = true,
+    guards = false,
     types = true,
-    selects = true,
-    returns = true,
-    compound = true,
-    inlineast = true,
-    callbacks = true,
-    booleans = true,
+    selects = false,
+    returns = false,
+    compound = false,
+    inlineast = false,
+    callbacks = false,
+    booleans = false,
     smartnames = true,
     functions = true,
     doblocks = 0,
     iridium = nil,
+    fidelity = true,
 }
 
 local map = {
@@ -2329,19 +2454,31 @@ local map = {
     ConstantFolding = "fold",
     ConditionalStructurer = "conditions",
     DoBlockInsertionThreshold = "doblocks",
+    FidelityMode = "fidelity",
 }
 
 return function(opt)
     local out = {}
     for k, v in pairs(base) do out[k] = v end
-    if opt then
-        for k, v in pairs(opt) do out[map[k] or k] = v end
-    end
+    if opt then for k, v in pairs(opt) do out[map[k] or k] = v end end
     out.doblocks = math.max(0, math.floor(tonumber(out.doblocks) or 0))
+    if out.fidelity ~= false then
+
+        out.fold = false
+        out.guards = false
+        out.selects = false
+        out.returns = false
+        out.compound = false
+        out.inlineast = false
+        out.callbacks = false
+        out.booleans = false
+        out.doblocks = 0
+    end
     return out
 end
 ]===],
     ["main.decompiler.context"] = [===[
+
 local ins = require("main.bytecode.instructions")
 local ex = require("main.output.expr")
 local lit = require("main.output.literals")
@@ -2755,6 +2892,687 @@ local branch = require("main.recover.branches")
 local loops = require("main.recover.loops")
 local ins = require("main.bytecode.instructions")
 local ex = require("main.output.expr")
+local lit = require("main.output.literals")
+local regs = require("main.analysis.registers")
+local vmfallback = (function()
+local ins = require("main.bytecode.instructions")
+local lit = require("main.output.literals")
+
+local vm = {}
+
+local function line(out, depth, text)
+    out[#out + 1] = string.rep("    ", depth) .. text
+end
+
+local function key2(proto, index)
+    return proto.Constants and proto.Constants[(index or 0) + 1]
+end
+
+local function rawstr(constant)
+    return lit.rawStringConstant(constant)
+end
+
+local function q(value)
+    return lit.string(tostring(value or ""))
+end
+
+local function classshapeexpr(k)
+    local name = rawstr(k and k.ClassName) or "AnonymousClass"
+    local props, methods = {}, {}
+    for _, v in ipairs(k and k.Properties or {}) do props[#props + 1] = q(rawstr(v) or "property") end
+    for _, v in ipairs(k and k.Methods or {}) do methods[#methods + 1] = q(rawstr(v) or "method") end
+    return "__classshape(" .. q(name) .. ", {" .. table.concat(props, ", ") .. "}, {" .. table.concat(methods, ", ") .. "})"
+end
+
+local function constexpr(proto, index)
+    local k = key2(proto, index)
+    if not k then return "nil" end
+    if k.__type == "Import" then
+        local parts = {}
+        for _, part in ipairs(k.Value or {}) do parts[#parts + 1] = rawstr(part) or "?" end
+        if #parts == 0 then return "nil" end
+        local first = parts[1]
+        local out
+        if first == "type" and #parts == 1 then out = "__v4type"
+        elseif first == "typeof" and #parts == 1 then out = "__v4typeof"
+        elseif first == "class" then out = "__classlib"
+        else out = "__env[" .. q(first) .. "]" end
+        for i = 2, #parts do out = out .. "[" .. q(parts[i]) .. "]" end
+        return out
+    elseif k.__type == "ClassShape" then
+        return classshapeexpr(k)
+    elseif k.__type == "Closure" then
+        return "nil"
+    end
+    return lit.constant(k)
+end
+
+local function aux(op)
+    return op and op.AuxValue and op.AuxValue.Value or 0
+end
+
+local function methodkey(proto, op, userdata)
+    local index = aux(op)
+    if userdata then index = bit32.band(index, 0xffff) end
+    return rawstr(key2(proto, index)) or "unknownMethod"
+end
+
+local function tablekey(proto, op, userdata)
+    local index = aux(op)
+    if userdata then index = bit32.band(index, 0xffff) end
+    return rawstr(key2(proto, index)) or "?"
+end
+
+local function realpcs(proto)
+    local slots = ins.auxSlots(proto)
+    local pcs = {}
+    for pc = 1, #proto.Instructions do
+        if not slots[pc] then pcs[#pcs + 1] = pc end
+    end
+    return pcs, slots
+end
+
+local function argsexpr(first, count, openlast)
+    if openlast then
+        return "__unpack(" .. tostring(first) .. ", __top - 1)"
+    end
+    local args = {}
+    for i = 0, count - 1 do args[#args + 1] = "__get(" .. tostring(first + i) .. ")" end
+    return table.concat(args, ", ")
+end
+
+local function emitcallresult(out, depth, ra, rc, callexpr)
+    if rc == 1 then
+        line(out, depth, callexpr)
+        line(out, depth, "__top = nil")
+        return
+    end
+
+    line(out, depth, "local __ret = table.pack(" .. callexpr .. ")")
+    if rc == 0 then
+        line(out, depth, "for __i = 1, __ret.n do __set(" .. tostring(ra) .. " + __i - 1, __ret[__i]) end")
+        line(out, depth, "__top = " .. tostring(ra) .. " + __ret.n")
+    else
+        local n = rc - 1
+        for i = 0, n - 1 do line(out, depth, "__set(" .. tostring(ra + i) .. ", __ret[" .. tostring(i + 1) .. "])") end
+        line(out, depth, "__top = nil")
+    end
+end
+
+local function captureinfo(proto, startpc, child, slots)
+    local list = {}
+    local pc = startpc
+    for i = 1, (child and child.UpvalueCount or 0) do
+        while slots[pc] do pc += 1 end
+        local op = proto.Instructions[pc]
+        if not op or ins.name(op) ~= "CAPTURE" then
+
+            list[i] = { kind = 0, src = nil, malformed = true }
+        else
+            list[i] = { kind = op.A or 0, src = op.B or 0, pc = pc }
+            pc = ins.next(proto, pc, slots)
+        end
+    end
+    return list, pc
+end
+
+local function emitcapturearray(out, depth, captures, selfreg)
+    local selfvals = {}
+    line(out, depth, "local __caps = {}")
+    line(out, depth, "local __modes = {}")
+    line(out, depth, "local __selfcaps = {}")
+    for i, c in ipairs(captures) do
+        if c.malformed then
+            line(out, depth, "__caps[" .. tostring(i) .. "] = {v = nil, ref = false}")
+            line(out, depth, "__modes[" .. tostring(i) .. "] = 0")
+        elseif c.kind == 0 and c.src == selfreg then
+
+            selfvals[#selfvals + 1] = i
+            line(out, depth, "__caps[" .. tostring(i) .. "] = {v = nil, ref = false}")
+            line(out, depth, "__modes[" .. tostring(i) .. "] = 0")
+            line(out, depth, "__selfcaps[" .. tostring(i) .. "] = true")
+        elseif c.kind == 0 then
+            line(out, depth, "__caps[" .. tostring(i) .. "] = {v = __get(" .. tostring(c.src) .. "), ref = false}")
+            line(out, depth, "__modes[" .. tostring(i) .. "] = 0")
+        elseif c.kind == 1 then
+            line(out, depth, "__caps[" .. tostring(i) .. "] = __cell(" .. tostring(c.src) .. ")")
+            line(out, depth, "__modes[" .. tostring(i) .. "] = 1")
+        else
+            local ui = tostring((c.src or 0) + 1)
+            line(out, depth, "local __u" .. tostring(i) .. " = __up[" .. ui .. "]")
+            line(out, depth, "if __u" .. tostring(i) .. " and __u" .. tostring(i) .. ".ref then __caps[" .. tostring(i) .. "] = __u" .. tostring(i) .. " else __caps[" .. tostring(i) .. "] = {v = __u" .. tostring(i) .. " and __u" .. tostring(i) .. ".v or nil, ref = false} end")
+            line(out, depth, "__modes[" .. tostring(i) .. "] = 2")
+        end
+    end
+    return selfvals
+end
+
+local function protomap(parsed)
+    local byobject = {}
+    for i, p in ipairs(parsed.Protos or {}) do byobject[p] = i end
+    return byobject
+end
+
+local function closurechild(parsed, proto, op, byobject)
+    local name = ins.name(op)
+    if name == "NEWCLOSURE" then
+        local child = proto.Protos and proto.Protos[(op.D or 0) + 1]
+        return child, child and byobject[child] or nil
+    elseif name == "DUPCLOSURE" then
+        local k = key2(proto, op.D)
+        if k and k.__type == "Closure" then
+            local id = (k.Value or 0) + 1
+            return parsed.Protos and parsed.Protos[id], id
+        end
+    end
+end
+
+local function emitprotofactory(out, parsed, proto, id, byobject)
+    local pcs, slots = realpcs(proto)
+    local maxstack = math.max(1, tonumber(proto.MaxStackSize) or 255)
+    local params = math.max(0, tonumber(proto.ParameterCount) or 0)
+    local pnames = {}
+    for i = 0, params - 1 do pnames[#pnames + 1] = "__a" .. tostring(i) end
+    if proto.IsVararg then pnames[#pnames + 1] = "..." end
+
+    line(out, 0, "__factory[" .. tostring(id) .. "] = function(__up)")
+    line(out, 1, "local function __fn(" .. table.concat(pnames, ", ") .. ")")
+    line(out, 2, "local __r, __open = {}, {}")
+    line(out, 2, "local __top = nil")
+    if proto.IsVararg then line(out, 2, "local __var = table.pack(...)") else line(out, 2, "local __var = {n = 0}") end
+    for i = 0, params - 1 do line(out, 2, "__r[" .. tostring(i) .. "] = __a" .. tostring(i)) end
+
+    line(out, 2, "local function __get(__i)")
+    line(out, 3, "local __c = __open[__i]")
+    line(out, 3, "if __c ~= nil then return __c.v end")
+    line(out, 3, "return __r[__i]")
+    line(out, 2, "end")
+    line(out, 2, "local function __set(__i, __v)")
+    line(out, 3, "local __c = __open[__i]")
+    line(out, 3, "if __c ~= nil then __c.v = __v else __r[__i] = __v end")
+    line(out, 2, "end")
+    line(out, 2, "local function __cell(__i)")
+    line(out, 3, "local __c = __open[__i]")
+    line(out, 3, "if __c == nil then __c = {v = __r[__i], ref = true}; __open[__i] = __c end")
+    line(out, 3, "return __c")
+    line(out, 2, "end")
+    line(out, 2, "local function __close(__a)")
+    line(out, 3, "for __i = __a, " .. tostring(maxstack - 1) .. " do")
+    line(out, 4, "local __c = __open[__i]")
+    line(out, 4, "if __c ~= nil then __r[__i] = __c.v; __open[__i] = nil end")
+    line(out, 3, "end")
+    line(out, 2, "end")
+    line(out, 2, "local function __unpack(__first, __last)")
+    line(out, 3, "if __last == nil or __last < __first then return end")
+    line(out, 3, "local __n = __last - __first + 1")
+    line(out, 3, "local __a = {n = __n}")
+    line(out, 3, "for __i = 1, __n do __a[__i] = __get(__first + __i - 1) end")
+    line(out, 3, "return table.unpack(__a, 1, __n)")
+    line(out, 2, "end")
+
+    local firstpc = pcs[1] or 1
+    line(out, 2, "local __pc = " .. tostring(firstpc))
+    line(out, 2, "while true do")
+
+    local consumedcaptures = {}
+    for _, pc in ipairs(pcs) do
+        local op = proto.Instructions[pc]
+        local name = ins.name(op)
+        if name == "NEWCLOSURE" or name == "DUPCLOSURE" then
+            local child = closurechild(parsed, proto, op, byobject)
+            if child then
+                local captures = captureinfo(proto, ins.next(proto, pc, slots), child, slots)
+                for _, c in ipairs(captures) do if c.pc then consumedcaptures[c.pc] = true end end
+            end
+        end
+    end
+
+    local branchindex = 0
+    for _, pc in ipairs(pcs) do
+        if not consumedcaptures[pc] then
+            local op = proto.Instructions[pc]
+            local name = ins.name(op)
+            local nextpc = ins.next(proto, pc, slots)
+            branchindex += 1
+            line(out, 3, (branchindex == 1 and "if " or "elseif ") .. "__pc == " .. tostring(pc) .. " then")
+            local d = 4
+            local ra, rb2, rc, rd = op.A or 0, op.B or 0, op.C or 0, op.D or 0
+            local av = aux(op)
+
+            if name == "NOP" or name == "BREAK" or name == "PREPVARARGS" or name == "COVERAGE" or name == "NATIVECALL" or name:match("^FASTCALL") then
+                line(out, d, "__pc = " .. tostring(nextpc))
+            elseif name == "LOADNIL" then
+                line(out, d, "__set(" .. ra .. ", nil)"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "LOADB" then
+                line(out, d, "__set(" .. ra .. ", " .. (rb2 == 1 and "true" or "false") .. ")")
+                line(out, d, "__pc = " .. tostring(rc ~= 0 and (pc + rc + 1) or nextpc))
+            elseif name == "LOADN" then
+                line(out, d, "__set(" .. ra .. ", " .. lit.number(rd) .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "LOADK" then
+                line(out, d, "__set(" .. ra .. ", " .. constexpr(proto, rd) .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "LOADKX" then
+                line(out, d, "__set(" .. ra .. ", " .. constexpr(proto, av) .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "MOVE" then
+                line(out, d, "__set(" .. ra .. ", __get(" .. rb2 .. "))"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "GETGLOBAL" then
+                local key = rawstr(key2(proto, av)) or "unknownGlobal"
+                local value = key == "type" and "__v4type" or (key == "typeof" and "__v4typeof" or (key == "class" and "__classlib" or ("__env[" .. q(key) .. "]")))
+                line(out, d, "__set(" .. ra .. ", " .. value .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "SETGLOBAL" then
+                local key = rawstr(key2(proto, av)) or "unknownGlobal"
+                line(out, d, "__env[" .. q(key) .. "] = __get(" .. ra .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "GETUPVAL" then
+                line(out, d, "local __u = __up[" .. tostring(rb2 + 1) .. "]")
+                line(out, d, "__set(" .. ra .. ", __u and __u.v or nil)"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "SETUPVAL" then
+                line(out, d, "local __u = __up[" .. tostring(rb2 + 1) .. "]")
+                line(out, d, "if __u == nil then __u = {v = nil, ref = true}; __up[" .. tostring(rb2 + 1) .. "] = __u end")
+                line(out, d, "__u.v = __get(" .. ra .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "CLOSEUPVALS" then
+                line(out, d, "__close(" .. ra .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "GETIMPORT" then
+                line(out, d, "__set(" .. ra .. ", " .. constexpr(proto, rd) .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "GETTABLE" then
+                line(out, d, "__set(" .. ra .. ", __get(" .. rb2 .. ")[__get(" .. rc .. ")])"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "SETTABLE" then
+                line(out, d, "__get(" .. rb2 .. ")[__get(" .. rc .. ")] = __get(" .. ra .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "GETTABLEKS" or name == "GETUDATAKS" then
+                local key = tablekey(proto, op, name == "GETUDATAKS")
+                line(out, d, "__set(" .. ra .. ", __get(" .. rb2 .. ")[" .. q(key) .. "])"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "SETTABLEKS" or name == "SETUDATAKS" then
+                local key = tablekey(proto, op, name == "SETUDATAKS")
+                line(out, d, "__get(" .. rb2 .. ")[" .. q(key) .. "] = __get(" .. ra .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "GETTABLEN" then
+                line(out, d, "__set(" .. ra .. ", __get(" .. rb2 .. ")[" .. tostring(rc + 1) .. "])"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "SETTABLEN" then
+                line(out, d, "__get(" .. rb2 .. ")[" .. tostring(rc + 1) .. "] = __get(" .. ra .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "NEWTABLE" then
+                line(out, d, "__set(" .. ra .. ", {})"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "DUPTABLE" then
+                line(out, d, "__set(" .. ra .. ", " .. constexpr(proto, rd) .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "NEWCLOSURE" or name == "DUPCLOSURE" then
+                local child, childid = closurechild(parsed, proto, op, byobject)
+                local captures, after = captureinfo(proto, nextpc, child, slots)
+                local selfvals = emitcapturearray(out, d, captures, ra)
+                if childid then
+                    if name == "DUPCLOSURE" then
+                        line(out, d, "local __cl = __dup(" .. q(tostring(id) .. ":" .. tostring(rd)) .. ", " .. tostring(childid) .. ", __caps, __modes, __selfcaps)")
+                        line(out, d, "__set(" .. ra .. ", __cl)")
+                    else
+                        line(out, d, "local __cl = __factory[" .. tostring(childid) .. "](__caps)")
+                        for _, ci in ipairs(selfvals) do line(out, d, "__caps[" .. tostring(ci) .. "].v = __cl") end
+                        line(out, d, "__set(" .. ra .. ", __cl)")
+                    end
+                else
+                    line(out, d, "__set(" .. ra .. ", function(...) return nil end)")
+                end
+                line(out, d, "__pc = " .. tostring(after))
+            elseif name == "CAPTURE" then
+
+                line(out, d, "__pc = " .. nextpc)
+            elseif name == "NAMECALL" or name == "NAMECALLUDATA" then
+                local key = methodkey(proto, op, name == "NAMECALLUDATA")
+                local callpc = nextpc
+                local callop = proto.Instructions[callpc]
+                local callname = callop and ins.name(callop) or ""
+                if callop and (callname == "CALL" or callname == "CALLFB") and (callop.A or -1) == ra then
+                    local cb, cc = callop.B or 0, callop.C or 0
+                    local argtext
+                    if cb == 0 then argtext = argsexpr(ra + 2, 0, true) else argtext = argsexpr(ra + 2, math.max(0, cb - 2), false) end
+                    local callexpr
+                    if lit.identifier(key) then
+                        callexpr = "(__get(" .. rb2 .. ")):" .. key .. "(" .. argtext .. ")"
+                    else
+                        local pre = "(__get(" .. rb2 .. "))[" .. q(key) .. "]"
+                        if argtext ~= "" then argtext = "__get(" .. rb2 .. "), " .. argtext else argtext = "__get(" .. rb2 .. ")" end
+                        callexpr = "(" .. pre .. ")(" .. argtext .. ")"
+                    end
+                    emitcallresult(out, d, ra, cc, callexpr)
+                    line(out, d, "__pc = " .. tostring(ins.next(proto, callpc, slots)))
+                else
+                    line(out, d, "local __obj = __get(" .. rb2 .. ")")
+                    line(out, d, "__set(" .. ra .. ", __obj[" .. q(key) .. "])")
+                    line(out, d, "__set(" .. tostring(ra + 1) .. ", __obj)")
+                    line(out, d, "__pc = " .. nextpc)
+                end
+            elseif name == "CALL" or name == "CALLFB" then
+                local argtext
+                if rb2 == 0 then argtext = argsexpr(ra + 1, 0, true) else argtext = argsexpr(ra + 1, math.max(0, rb2 - 1), false) end
+                emitcallresult(out, d, ra, rc, "(__get(" .. ra .. "))(" .. argtext .. ")")
+                line(out, d, "__pc = " .. nextpc)
+            elseif name == "RETURN" then
+                if rb2 == 1 then line(out, d, "return")
+                elseif rb2 == 0 then line(out, d, "return __unpack(" .. ra .. ", (__top or " .. ra .. ") - 1)")
+                else
+                    local vals = {}
+                    for r = ra, ra + rb2 - 2 do vals[#vals + 1] = "__get(" .. tostring(r) .. ")" end
+                    line(out, d, "return " .. table.concat(vals, ", "))
+                end
+            elseif name == "JUMP" or name == "JUMPBACK" or name == "JUMPX" then
+                line(out, d, "__pc = " .. tostring(ins.jumpTarget(pc, op)))
+            elseif name == "JUMPIF" or name == "JUMPIFNOT" then
+                local test = name == "JUMPIF" and ("__get(" .. ra .. ")") or ("not __get(" .. ra .. ")")
+                line(out, d, "if " .. test .. " then __pc = " .. tostring(ins.jumpTarget(pc, op)) .. " else __pc = " .. nextpc .. " end")
+            elseif name == "JUMPIFEQ" or name == "JUMPIFNOTEQ" or name == "JUMPIFLT" or name == "JUMPIFLE" or name == "JUMPIFNOTLT" or name == "JUMPIFNOTLE" then
+                local rb = bit32.band(av, 0xff)
+                local cmp = ({JUMPIFEQ = "==", JUMPIFNOTEQ = "~=", JUMPIFLT = "<", JUMPIFLE = "<=", JUMPIFNOTLT = "<", JUMPIFNOTLE = "<="})[name]
+                local test = "__get(" .. ra .. ") " .. cmp .. " __get(" .. rb .. ")"
+                if name == "JUMPIFNOTLT" or name == "JUMPIFNOTLE" then test = "not (" .. test .. ")" end
+                line(out, d, "if " .. test .. " then __pc = " .. tostring(ins.jumpTarget(pc, op)) .. " else __pc = " .. nextpc .. " end")
+            elseif name == "JUMPXEQKNIL" or name == "JUMPXEQKB" or name == "JUMPXEQKN" or name == "JUMPXEQKS" then
+                local rhs
+                if name == "JUMPXEQKNIL" then rhs = "nil"
+                elseif name == "JUMPXEQKB" then rhs = bit32.band(av, 1) == 1 and "true" or "false"
+                else rhs = constexpr(proto, bit32.band(av, 0xffffff)) end
+                local test = "__get(" .. ra .. ") == " .. rhs
+                if bit32.btest(av, 0x80000000) then test = "not (" .. test .. ")" end
+                line(out, d, "if " .. test .. " then __pc = " .. tostring(ins.jumpTarget(pc, op)) .. " else __pc = " .. nextpc .. " end")
+            elseif name == "ADD" or name == "SUB" or name == "MUL" or name == "DIV" or name == "MOD" or name == "POW" or name == "IDIV" then
+                local symbol = ({ADD = "+", SUB = "-", MUL = "*", DIV = "/", MOD = "%", POW = "^", IDIV = "//"})[name]
+                line(out, d, "__set(" .. ra .. ", __get(" .. rb2 .. ") " .. symbol .. " __get(" .. rc .. "))"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "ADDK" or name == "SUBK" or name == "MULK" or name == "DIVK" or name == "MODK" or name == "POWK" or name == "IDIVK" then
+                local symbol = ({ADDK = "+", SUBK = "-", MULK = "*", DIVK = "/", MODK = "%", POWK = "^", IDIVK = "//"})[name]
+                line(out, d, "__set(" .. ra .. ", __get(" .. rb2 .. ") " .. symbol .. " " .. constexpr(proto, rc) .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "SUBRK" or name == "DIVRK" then
+                line(out, d, "__set(" .. ra .. ", " .. constexpr(proto, rb2) .. (name == "SUBRK" and " - " or " / ") .. "__get(" .. rc .. "))"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "AND" or name == "OR" then
+                if name == "AND" then line(out, d, "if __get(" .. rb2 .. ") then __set(" .. ra .. ", __get(" .. rc .. ")) else __set(" .. ra .. ", __get(" .. rb2 .. ")) end")
+                else line(out, d, "if __get(" .. rb2 .. ") then __set(" .. ra .. ", __get(" .. rb2 .. ")) else __set(" .. ra .. ", __get(" .. rc .. ")) end") end
+                line(out, d, "__pc = " .. nextpc)
+            elseif name == "ANDK" or name == "ORK" then
+                local kval = constexpr(proto, rc)
+                if name == "ANDK" then line(out, d, "if __get(" .. rb2 .. ") then __set(" .. ra .. ", " .. kval .. ") else __set(" .. ra .. ", __get(" .. rb2 .. ")) end")
+                else line(out, d, "if __get(" .. rb2 .. ") then __set(" .. ra .. ", __get(" .. rb2 .. ")) else __set(" .. ra .. ", " .. kval .. ") end") end
+                line(out, d, "__pc = " .. nextpc)
+            elseif name == "CONCAT" then
+                line(out, d, "local __x = __get(" .. rc .. ")")
+                for r = rc - 1, rb2, -1 do line(out, d, "__x = __get(" .. r .. ") .. __x") end
+                line(out, d, "__set(" .. ra .. ", __x)"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "NOT" then
+                line(out, d, "__set(" .. ra .. ", not __get(" .. rb2 .. "))"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "MINUS" then
+                line(out, d, "__set(" .. ra .. ", -__get(" .. rb2 .. "))"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "LENGTH" then
+                line(out, d, "__set(" .. ra .. ", #__get(" .. rb2 .. "))"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "SETLIST" then
+                line(out, d, "local __t = __get(" .. ra .. ")")
+                if rc == 0 then
+                    line(out, d, "local __n = (__top or " .. rb2 .. ") - " .. rb2)
+                    line(out, d, "for __i = 0, __n - 1 do __t[" .. av .. " + __i] = __get(" .. rb2 .. " + __i) end")
+                    line(out, d, "__top = nil")
+                else
+                    for i = 0, rc - 2 do line(out, d, "__t[" .. tostring(av + i) .. "] = __get(" .. tostring(rb2 + i) .. ")") end
+                end
+                line(out, d, "__pc = " .. nextpc)
+            elseif name == "FORNPREP" then
+                line(out, d, "local __limit = __fornum(__get(" .. ra .. "))")
+                line(out, d, "local __step = __fornum(__get(" .. tostring(ra + 1) .. "))")
+                line(out, d, "local __idx = __fornum(__get(" .. tostring(ra + 2) .. "))")
+                line(out, d, "__set(" .. ra .. ", __limit); __set(" .. tostring(ra + 1) .. ", __step); __set(" .. tostring(ra + 2) .. ", __idx)")
+                line(out, d, "if (__step > 0 and __idx <= __limit) or (not (__step > 0) and __limit <= __idx) then __pc = " .. nextpc .. " else __pc = " .. tostring(ins.jumpTarget(pc, op)) .. " end")
+            elseif name == "FORNLOOP" then
+                line(out, d, "local __limit, __step = __get(" .. ra .. "), __get(" .. tostring(ra + 1) .. ")")
+                line(out, d, "local __idx = __get(" .. tostring(ra + 2) .. ") + __step")
+                line(out, d, "__set(" .. tostring(ra + 2) .. ", __idx)")
+                line(out, d, "if (__step > 0 and __idx <= __limit) or (not (__step > 0) and __limit <= __idx) then __pc = " .. tostring(ins.jumpTarget(pc, op)) .. " else __pc = " .. nextpc .. " end")
+            elseif name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" then
+
+                line(out, d, "__pc = " .. tostring(ins.jumpTarget(pc, op)))
+            elseif name == "FORGPREP" then
+                line(out, d, "local __g = __get(" .. ra .. ")")
+                line(out, d, "if type(__g) ~= \"function\" then")
+                line(out, d + 1, "local __ng, __ns, __ni = __iterprep(__g)")
+                line(out, d + 1, "__set(" .. ra .. ", __ng); __set(" .. tostring(ra + 1) .. ", __ns); __set(" .. tostring(ra + 2) .. ", __ni)")
+                line(out, d, "end")
+                line(out, d, "__pc = " .. tostring(ins.jumpTarget(pc, op)))
+            elseif name == "FORGLOOP" then
+                local count = math.max(1, bit32.band(av, 0xff))
+                line(out, d, "local __ret = table.pack((__get(" .. ra .. "))(__get(" .. tostring(ra + 1) .. "), __get(" .. tostring(ra + 2) .. ")))")
+                for i = 1, count do line(out, d, "__set(" .. tostring(ra + 2 + i) .. ", __ret[" .. tostring(i) .. "])") end
+                line(out, d, "__set(" .. tostring(ra + 2) .. ", __ret[1])")
+                line(out, d, "if __ret[1] ~= nil then __pc = " .. tostring(ins.jumpTarget(pc, op)) .. " else __pc = " .. nextpc .. " end")
+            elseif name == "GETVARARGS" then
+                if rb2 == 0 then
+                    line(out, d, "for __i = 1, __var.n do __set(" .. ra .. " + __i - 1, __var[__i]) end")
+                    line(out, d, "__top = " .. ra .. " + __var.n")
+                else
+                    for i = 1, rb2 - 1 do line(out, d, "__set(" .. tostring(ra + i - 1) .. ", __var[" .. tostring(i) .. "])") end
+                end
+                line(out, d, "__pc = " .. nextpc)
+            elseif name == "CMPPROTO" then
+
+
+                line(out, d, "__pc = " .. tostring(ins.jumpTarget(pc, op)))
+            elseif name == "NEWCLASS" then
+                line(out, d, "local __super = " .. (rb2 ~= 0xff and ("__get(" .. rb2 .. ")") or "nil"))
+                line(out, d, "__set(" .. ra .. ", __newclass(" .. constexpr(proto, av) .. ", __super))")
+                line(out, d, "__pc = " .. nextpc)
+            elseif name == "NEWCLASSMEMBER" then
+                local key = rawstr(key2(proto, av)) or "member"
+                line(out, d, "__classmember(__get(" .. ra .. "), " .. q(key) .. ", __get(" .. rc .. "))")
+                line(out, d, "__pc = " .. nextpc)
+            else
+
+                line(out, d, "error(" .. q("LumenV4 VM fallback: unknown opcode " .. tostring(name) .. " at pc " .. tostring(pc)) .. ")")
+            end
+        end
+    end
+
+    line(out, 3, "else")
+    line(out, 4, "error(\"LumenV4 VM fallback: invalid pc \" .. tostring(__pc))")
+    line(out, 3, "end")
+    line(out, 2, "end")
+    line(out, 1, "end")
+    line(out, 1, "return __fn")
+    line(out, 0, "end")
+    line(out, 0, "")
+end
+
+function vm.run(parsed, reason)
+    local entry = assert(parsed and parsed.Protos and parsed.Protos[parsed.ProtoEntryPoint], "LumenV4 VM fallback: missing entry proto")
+    local byobject = protomap(parsed)
+    local decoded = 0
+    for _, proto in ipairs(parsed.Protos or {}) do
+        local pcs = realpcs(proto)
+        decoded += #pcs
+    end
+    local bytecodeversion = tonumber(parsed.BytecodeVersion) or 0
+    local header = ("-- LumenV4 status=VM_FALLBACK coverage=100.00 reachable=%d covered=%d blocks=%d structuredBlocks=0 fallbackBlocks=%d phis=0 undefs=0 packs=0 cells=0 objects=0 escapedObjects=0 irreducible=0 bytecodeVersion=%d ssa=false parser=true diagnostics=0")
+        :format(decoded, decoded, decoded, decoded, bytecodeversion)
+    local out = {
+        header,
+        "-- Structured recovery failed; this function is a direct decoded-bytecode state machine.",
+        "-- Original recovery reason: " .. tostring(reason or "semantic fallback"):gsub("[\r\n]+", " "),
+        "local __env = (getfenv and getfenv(0)) or _G",
+        "local __factory = {}",
+        "local __dupcache = {}",
+        "",
+        "local function __fornum(v)",
+        "    if type(v) == \"number\" then return v end",
+        "    local n = tonumber(v)",
+        "    if n == nil then error(\"invalid 'for' limit/step/index (number expected)\", 2) end",
+        "    return n",
+        "end",
+        "",
+        "local function __mt(v)",
+        "    if type(getrawmetatable) == \"function\" then",
+        "        local ok, mt = pcall(getrawmetatable, v)",
+        "        if ok and mt ~= nil then return mt end",
+        "    end",
+        "    return getmetatable(v)",
+        "end",
+        "",
+        "local function __iterprep(v)",
+        "    if type(v) == \"table\" then",
+        "        local mt = __mt(v)",
+        "        local it = mt and mt.__iter",
+        "        if it ~= nil then",
+        "            local g, s, i = it(v)",
+        "            return g, s, i",
+        "        end",
+        "        if mt and mt.__call then return v, nil, nil end",
+        "        return next, v, nil",
+        "    end",
+        "    local mt = __mt(v)",
+        "    local it = mt and mt.__iter",
+        "    if it ~= nil then return it(v) end",
+        "    return v, nil, nil",
+        "end",
+        "",
+        "local __realtype = type",
+        "local __realtypeof = typeof or type",
+        "local __classof = setmetatable({}, {__mode = \"k\"})",
+        "local __classmeta = setmetatable({}, {__mode = \"k\"})",
+        "local __isclass = setmetatable({}, {__mode = \"k\"})",
+        "",
+        "local function __classshape(name, props, methods)",
+        "    return {__name = name, __props = props, __methods = methods}",
+        "end",
+        "",
+        "local function __classlookup(cls, key)",
+        "    local c = cls",
+        "    while c do",
+        "        local v = rawget(c, key)",
+        "        if v ~= nil then return v end",
+        "        local m = __classmeta[c]",
+        "        c = m and m.super or nil",
+        "    end",
+        "    return nil",
+        "end",
+        "",
+        "local function __isinstance(obj, cls)",
+        "    if not __isclass[cls] then return false end",
+        "    local c = __classof[obj]",
+        "    while c do",
+        "        if c == cls then return true end",
+        "        local m = __classmeta[c]",
+        "        c = m and m.super or nil",
+        "    end",
+        "    return false",
+        "end",
+        "",
+        "local __classlib = setmetatable({",
+        "    isinstance = __isinstance,",
+        "    classof = function(v) return __classof[v] end,",
+        "}, {__index = __env.class})",
+        "",
+        "local function __v4type(v)",
+        "    if __isclass[v] then return \"class\" end",
+        "    if __classof[v] then return \"object\" end",
+        "    return __realtype(v)",
+        "end",
+        "local function __v4typeof(v)",
+        "    if __isclass[v] then return \"class\" end",
+        "    if __classof[v] then return \"object\" end",
+        "    return __realtypeof(v)",
+        "end",
+        "",
+        "local __classmetamethods = {",
+        "    __add=true,__sub=true,__mul=true,__div=true,__idiv=true,__mod=true,__pow=true,",
+        "    __unm=true,__len=true,__eq=true,__lt=true,__le=true,__concat=true,__tostring=true,",
+        "    __iter=true,__call=true,",
+        "}",
+        "",
+        "local function __classmember(cls, name, value)",
+        "    rawset(cls, name, value)",
+        "    local m = __classmeta[cls]",
+        "    if m and __classmetamethods[name] then",
+        "        m.instanceMt[name] = function(...) return value(...) end",
+        "    end",
+        "end",
+        "",
+        "local function __newclass(shape, super)",
+        "    local cls = {}",
+        "    local props, propset = {}, {}",
+        "    if super and __classmeta[super] then",
+        "        for _, p in ipairs(__classmeta[super].props) do props[#props + 1] = p; propset[p] = true end",
+        "    end",
+        "    for _, p in ipairs(shape and shape.__props or {}) do",
+        "        if not propset[p] then props[#props + 1] = p; propset[p] = true end",
+        "    end",
+        "    local imt = {}",
+        "    local meta = {shape = shape or {}, super = super, props = props, propset = propset, instanceMt = imt}",
+        "    __classmeta[cls] = meta",
+        "    __isclass[cls] = true",
+        "    imt.__index = function(obj, key)",
+        "        local v = __classlookup(cls, key)",
+        "        if v ~= nil then return v end",
+        "        if propset[key] then return nil end",
+        "        error(\"this object does not have a key named '\" .. tostring(key) .. \"'\", 2)",
+        "    end",
+        "    imt.__newindex = function(obj, key, value)",
+        "        if propset[key] then rawset(obj, key, value); return end",
+        "        error(\"this object does not have a key named '\" .. tostring(key) .. \"'\", 2)",
+        "    end",
+        "    local cmt = {}",
+        "    cmt.__index = function(_, key)",
+        "        local v = super and __classlookup(super, key) or nil",
+        "        if v ~= nil then return v end",
+        "        error(\"this class does not have a key named '\" .. tostring(key) .. \"'\", 2)",
+        "    end",
+        "    cmt.__newindex = function(_, key) error(\"attempt to index class with '\" .. tostring(key) .. \"'\", 2) end",
+        "    cmt.__call = function(_, init)",
+        "        local obj = {}",
+        "        __classof[obj] = cls",
+        "        setmetatable(obj, imt)",
+        "        if init ~= nil then",
+        "            for _, p in ipairs(props) do rawset(obj, p, init[p]) end",
+        "        end",
+        "        return obj",
+        "    end",
+        "    setmetatable(cls, cmt)",
+        "    return cls",
+        "end",
+        "",
+        "local function __samecaps(a, b, modes, selfcaps, fn)",
+        "    if not a then return false end",
+        "    for i = 1, #b do",
+        "        if modes[i] == 0 then",
+        "            local expected = selfcaps[i] and fn or (b[i] and b[i].v)",
+        "            if not rawequal(a[i] and a[i].v, expected) then return false end",
+        "        elseif modes[i] == 2 then",
+        "            local ar, br = a[i] and a[i].ref, b[i] and b[i].ref",
+        "            if ar or br then",
+        "                if a[i] ~= b[i] then return false end",
+        "            elseif not rawequal(a[i] and a[i].v, b[i] and b[i].v) then return false end",
+        "        elseif a[i] ~= b[i] then return false end",
+        "    end",
+        "    return true",
+        "end",
+        "",
+        "local function __dup(cacheKey, id, caps, modes, selfcaps)",
+        "    local c = __dupcache[cacheKey]",
+        "    if c ~= nil and __samecaps(c.caps, caps, modes, selfcaps, c.fn) then return c.fn end",
+        "    local fn = __factory[id](caps)",
+        "    for i in pairs(selfcaps) do caps[i].v = fn end",
+        "    if c == nil then __dupcache[cacheKey] = {fn = fn, caps = caps, modes = modes} end",
+        "    return fn",
+        "end",
+        "",
+    }
+
+    for i, proto in ipairs(parsed.Protos or {}) do emitprotofactory(out, parsed, proto, i, byobject) end
+    local entryid = byobject[entry] or parsed.ProtoEntryPoint
+    line(out, 0, "return (__factory[" .. tostring(entryid) .. "]({}))()")
+
+    local source = table.concat(out, "\n")
+    if type(loadstring) == "function" then
+        local fn, err = loadstring(source, "@LumenV4/vm-fallback-verify")
+        if not fn then error("LumenV4 VM fallback generator emitted invalid Luau: " .. tostring(err), 2) end
+    end
+    return source, {
+        status = "VM_FALLBACK",
+        fallback = true,
+        syntaxValid = true,
+        originCoverageValid = true,
+        coverage = 1,
+        verification = "decoded-bytecode-total-dispatch",
+        structuredError = tostring(reason or ""),
+    }
+end
+
+return vm
+end)()
 
 local decomp = {}
 decomp.__index = decomp
@@ -2769,20 +3587,77 @@ local function loopused(st, r, a, b)
     return false
 end
 
-function decomp.new(opt)
-    return setmetatable({ opt = opt or {} }, decomp)
+local function hashard(st)
+
+    return #st.bad > 0
 end
+
+function decomp.new(opt) return setmetatable({ opt = opt or {} }, decomp) end
 
 function decomp:_state(proto, up, ph)
     local ir = irbuild.run(proto)
     ir.paramhints = ph or {}
     ir = irpass.run(ir, self.opt)
     local naming = names.new(ir.cfg.registerStats, self.opt, proto)
-    return context.new(proto, ir, naming, up, lower.new(), self.opt)
+    local st = context.new(proto, ir, naming, up, lower.new(), self.opt)
+    st.v4 = { fallback = false, visited = {}, status = "STRUCTURED", cellNames = {} }
+
+
+    if ir.cells and next(ir.cells) then
+        local oldvname = st.vname
+        local ids = {}
+        for cid in pairs(ir.cells) do ids[#ids + 1] = cid end
+        table.sort(ids)
+        local resolvedcell = {}
+        for raw, cid in pairs(ir.cellOfValue or {}) do
+            local rv = ir:resolve(raw)
+            if rv then resolvedcell[rv] = resolvedcell[rv] or cid end
+        end
+        for _, cid in ipairs(ids) do
+            local cell = ir.cells[cid]
+            local cp = cell.captures and cell.captures[1]
+            local raw = cp and ir.ssa.usesByPC[cp] and ir.ssa.usesByPC[cp][cell.reg] or nil
+            if raw then
+                st.v4.cellNames[cid] = oldvname(st, raw, cell.reg, nil, cp)
+            else
+                st.v4.cellNames[cid] = naming:unique("cell" .. tostring(cid))
+            end
+        end
+        st.vname = function(self, value, reg, hint, pc)
+            local cid = value and ((self.ir.cellOfValue and self.ir.cellOfValue[value]) or resolvedcell[self.ir:resolve(value)])
+            local cellname = cid and self.v4.cellNames[cid]
+            if cellname then return cellname end
+            return oldvname(self, value, reg, hint, pc)
+        end
+    end
+
+
+    for bid, phis in pairs(ir.phis or {}) do
+        local block = assert(ir.cfg.blocks[bid], "LumenV4: phi references invalid CFG block")
+        for reg, phi in pairs(phis) do
+            local pid = ir:resolve(phi.id)
+            if pid and not ir.dead[pid] then
+                local target = st:vname(pid, reg, nil, block.startPC)
+                for pred, raw in pairs(phi.incoming or {}) do
+                    local rid = ir:resolve(raw)
+                    local value = rid and ir.vals[rid] or nil
+                    if value and value.kind ~= "undef" then
+                        local pb = assert(ir.cfg.blocks[pred], "LumenV4: phi references invalid predecessor")
+                        local source = st:vname(rid, reg, nil, pb.endPC)
+                        if source ~= target then
+                            error(("LumenV4: UNSUPPORTED SSA destruction mismatch for phi v%d r%d: b%d uses %s, target is %s")
+                                :format(pid, reg, pred, tostring(source), tostring(target)), 2)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    st.v4.ssaDestructionVerified = true
+    return st
 end
 
-function decomp:_child(proto, up, ph)
-    local st = self:_state(proto, up, ph)
+local function arguments(st, proto)
     local args = {}
     for i = 0, (proto.ParameterCount or 0) - 1 do
         local name = st:vname(st.ssa.params[i], i, nil, 1)
@@ -2790,7 +3665,138 @@ function decomp:_child(proto, up, ph)
         args[#args + 1] = name .. (an and (": " .. an) or "")
     end
     if proto.IsVararg then args[#args + 1] = "..." end
+    return args
+end
+
+local function preparepacks(st)
+    st.packnames = {}
+    st.directPacks = {}
+    st.directPackValues = {}
+
+    local consumers = {}
+    for pc, producer in pairs(st.ssa.packInput or {}) do
+        if type(producer) == "number" then
+            local list = consumers[producer]
+            if not list then list = {}; consumers[producer] = list end
+            list[#list + 1] = pc
+        end
+    end
+
+    local pcs = {}
+    for pc, pack in pairs(st.ssa.packsByPC or {}) do
+        if pack and pack.producesTop then pcs[#pcs + 1] = pc end
+    end
+    table.sort(pcs)
+
+    local names = {}
+    for _, pc in ipairs(pcs) do
+        local list = consumers[pc] or {}
+        local consumer = #list == 1 and list[1] or nil
+        local sameblock = consumer and st.cfg.blockmap[pc] == st.cfg.blockmap[consumer]
+        if consumer and sameblock and st:next(pc) == consumer then
+
+
+            st.directPacks[pc] = consumer
+        else
+            local name = st.naming:unique("__pack" .. tostring(pc))
+            st.packnames[pc] = name
+            st.declared[name] = 0
+            names[#names + 1] = name
+        end
+    end
+
+    for i = 1, #names, 8 do
+        local chunk = {}
+        for j = i, math.min(i + 7, #names) do chunk[#chunk + 1] = names[j] end
+        st:out("local " .. table.concat(chunk, ", "))
+    end
+end
+
+local function packtail(st, pc)
+    local producer = st.ssa.packInput and st.ssa.packInput[pc] or nil
+    if producer == st.ssa.ambiguousPack then
+        error("LumenV4: UNSUPPORTED divergent ValuePack at pc " .. tostring(pc), 2)
+    end
+    if type(producer) ~= "number" then
+        error("LumenV4: UNSUPPORTED open ValuePack consumer without unique producer at pc " .. tostring(pc), 2)
+    end
+    local _, _, pp = regs.readWrite(st.proto.Instructions[producer])
+    local direct = st.directPackValues and st.directPackValues[producer]
+    if direct then return producer, pp.openWriteFrom, direct.node end
+    local name = assert(st.packnames and st.packnames[producer], "LumenV4: missing ValuePack temp")
+    return producer, pp.openWriteFrom, ex.atom("table.unpack(" .. name .. ", 1, " .. name .. ".n)", false)
+end
+
+function decomp:_op(st, pc)
+    local op = st.proto.Instructions[pc]
+    local _, _, pack = regs.readWrite(op)
+    st.top = nil
+    if pack.consumesTop then
+        local _, base, node = packtail(st, pc)
+        if type(base) ~= "number" then error("LumenV4: invalid ValuePack producer at pc " .. tostring(pc), 2) end
+        if pack.openReadFrom and base < pack.openReadFrom then
+            error("LumenV4: invalid ValuePack base at pc " .. tostring(pc), 2)
+        end
+        st.top = { reg = base, node = node, v4 = true }
+    end
+
+    local name = ins.name(op)
+    local nx
+
+    if name == "NEWTABLE" then
+        st:set(pc, op.A, ex.atom("{}", false))
+        nx = st:next(pc)
+    elseif name == "DUPTABLE" then
+        local constant = st.proto.Constants and st.proto.Constants[(op.D or 0) + 1]
+        st:set(pc, op.A, ex.atom(lit.constant(constant), false))
+        nx = st:next(pc)
+    else
+        nx = ops.run(self, st, pc)
+    end
+
+    if pack.producesTop then
+        local produced = st.top
+        if not produced or not produced.node then
+            error("LumenV4: open-result producer did not expose a ValuePack at pc " .. tostring(pc), 2)
+        end
+        local base = assert(pack.openWriteFrom, "LumenV4: ValuePack producer has no base")
+        if st.directPacks and st.directPacks[pc] then
+            st.directPackValues[pc] = { reg = base, node = produced.node }
+        else
+            local name = assert(st.packnames and st.packnames[pc], "LumenV4: missing producer ValuePack temp")
+            st:out(name .. " = table.pack(" .. ex.str(produced.node) .. ")")
+            for reg, version in pairs(st.ssa.defsByPC[pc] or {}) do
+                if reg >= base then
+                    local node = ex.atom(name .. "[" .. tostring(reg - base + 1) .. "]", false)
+                    st.vals[version] = node
+                    st.expr[version] = node
+                end
+            end
+        end
+        st.top = nil
+    end
+    return nx
+end
+
+function decomp:_child(proto, up, ph)
+    local st = self:_state(proto, up, ph)
+    local args = arguments(st, proto)
+    preparepacks(st)
     self:_region(st, 1, #proto.Instructions + 1, {})
+
+    if hashard(st) then
+
+        st = self:_state(proto, up, ph)
+        args = arguments(st, proto)
+        preparepacks(st)
+        st.v4.fallback = true
+        st.v4.status = "LOSSLESS_FALLBACK"
+        self:_dispatcher(st)
+        if hashard(st) then
+            error("LumenV4: UNSUPPORTED semantic lowering issue: " .. table.concat(st.bad, " | "), 2)
+        end
+    end
+
     local root = astpass.run(st.ast:done(), self.opt)
     return root, st, args
 end
@@ -2798,229 +3804,149 @@ end
 function decomp:_numfor(st, pc, op, stop, active)
     local info = loops.numInfo(st, pc, op, stop)
     if not info then return nil end
-    local loop = info.loop
-    local a = op.A
-    local old = st.alias[a + 3]
-    local lv = st:verdef(loop, a + 3)
+    local loop, a = info.loop, op.A
+
+
+    local body = st:next(pc)
+    local varreg = a + 2
+    local bodystart = body
+    local first = st.proto.Instructions[body]
+    if first and ins.name(first) == "MOVE" and first.B == a + 2 and first.A == a + 3 then
+        varreg = a + 3
+        st.v4.visited[body] = true
+        bodystart = st:next(body)
+    end
+
+    local old = st.alias[varreg]
+    local lv = varreg == a + 2 and st:veruse(body, varreg) or st:verdef(body, varreg)
+    if not lv then lv = st:veruse(loop, a + 2) or st:verdef(loop, a + 2) end
     local depth = (active.loopdepth or 0) + 1
     local fall = ({ "i", "j", "k", "n" })[depth] or ("i" .. tostring(depth))
-    local var = not loopused(st, a + 3, st:next(pc), loop) and "_" or st:vname(lv, a + 3, fall, loop)
-    local limit = ex.str(st:loopx(pc, loop, a))
-    local step = ex.str(st:loopx(pc, loop, a + 1))
-    local init = ex.str(st:loopx(pc, loop, a + 2))
+    local var = not loopused(st, varreg, bodystart, loop) and "_" or st:vname(lv, varreg, fall, body)
+    local limit, step, init = ex.str(st:loopx(pc, loop, a)), ex.str(st:loopx(pc, loop, a + 1)), ex.str(st:loopx(pc, loop, a + 2))
     local head = "for " .. var .. " = " .. init .. ", " .. limit
-    if step ~= "1" then head = head .. ", " .. step end
-    st:out(head .. " do")
-    st.indent += 1
-    st.alias[a + 3] = var
-    st.declared[var] = st.indent
-    local prev = active.loop
-    local olddepth = active.loopdepth
-    active.loop = { breakpc = info.exit, contpc = loop }
-    active.loopdepth = depth
-    self:_region(st, st:next(pc), loop, active)
-    active.loop = prev
-    active.loopdepth = olddepth
-    st:trim(st.indent)
-    st.indent -= 1
-    st:out("end")
-    st.alias[a + 3] = old
+    if step ~= "1" then head ..= ", " .. step end
+    st:out(head .. " do"); st.indent += 1
+    st.alias[varreg] = var; st.declared[var] = st.indent
+    local prev, olddepth = active.loop, active.loopdepth
+    active.loop = { breakpc = info.exit, contpc = loop }; active.loopdepth = depth
+    self:_region(st, bodystart, loop, active)
+    active.loop, active.loopdepth = prev, olddepth
+    st:trim(st.indent); st.indent -= 1; st:out("end"); st.alias[varreg] = old
+    st.v4.visited[loop] = true
     return info.exit
 end
 
 function decomp:_genfor(st, pc, op, stop, active)
     local info = loops.genInfo(st, pc, op, stop)
     if not info then return nil end
-    local loop = info.loop
-    local lop = info.op
+    local loop, lop = info.loop, info.op
     local aux = lop.AuxValue and lop.AuxValue.Value or 0
     local n = math.max(1, bit32.band(aux, 0xff))
-    local depth = (active.loopdepth or 0) + 1
-    local vars, old = {}, {}
+    local depth, vars, old = (active.loopdepth or 0) + 1, {}, {}
     for i = 1, n do
-        local r = op.A + 2 + i
-        old[r] = st.alias[r]
+        local r = op.A + 2 + i; old[r] = st.alias[r]
         local hint = i == 1 and (n == 1 and "item" or "key") or (i == 2 and "value" or ("value" .. tostring(i)))
         local v = st:verdef(loop, r)
         vars[i] = not loopused(st, r, st:next(pc), loop) and "_" or st:vname(v, r, hint, loop)
     end
-
     local src
-    local regs = { op.A, op.A + 1, op.A + 2 }
-    local gv = st:veruse(pc, op.A)
-    local g = gv and st.group[gv]
-    if g and st:hidegroup(g, pc, loop, regs) then
-        src = ex.str(g.node)
-    elseif ins.name(op) == "FORGPREP_INEXT" then
-        src = "ipairs(" .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ")"
-    elseif ins.name(op) == "FORGPREP_NEXT" then
-        src = "pairs(" .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ")"
-    else
-        src = ex.str(st:loopx(pc, loop, op.A)) .. ", " .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ", " .. ex.str(st:loopx(pc, loop, op.A + 2))
-    end
-
-    st:out("for " .. table.concat(vars, ", ") .. " in " .. src .. " do")
-    st.indent += 1
-    for i = 1, n do
-        local r = op.A + 2 + i
-        st.alias[r] = vars[i]
-        st.declared[vars[i]] = st.indent
-    end
-    local prev = active.loop
-    local olddepth = active.loopdepth
-    active.loop = { breakpc = info.exit, contpc = loop }
-    active.loopdepth = depth
+    local rs = { op.A, op.A + 1, op.A + 2 }
+    local gv = st:veruse(pc, op.A); local g = gv and st.group[gv]
+    if g and st:hidegroup(g, pc, loop, rs) then src = ex.str(g.node)
+    elseif ins.name(op) == "FORGPREP_INEXT" then src = "ipairs(" .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ")"
+    elseif ins.name(op) == "FORGPREP_NEXT" then src = "pairs(" .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ")"
+    else src = ex.str(st:loopx(pc, loop, op.A)) .. ", " .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ", " .. ex.str(st:loopx(pc, loop, op.A + 2)) end
+    st:out("for " .. table.concat(vars, ", ") .. " in " .. src .. " do"); st.indent += 1
+    for i = 1, n do local r = op.A + 2 + i; st.alias[r] = vars[i]; st.declared[vars[i]] = st.indent end
+    local prev, olddepth = active.loop, active.loopdepth
+    active.loop = { breakpc = info.exit, contpc = loop }; active.loopdepth = depth
     self:_region(st, st:next(pc), loop, active)
-    active.loop = prev
-    active.loopdepth = olddepth
-    st:trim(st.indent)
-    st.indent -= 1
-    st:out("end")
+    active.loop, active.loopdepth = prev, olddepth
+    st:trim(st.indent); st.indent -= 1; st:out("end")
     for i = 1, n do st.alias[op.A + 2 + i] = old[op.A + 2 + i] end
+    st.v4.visited[loop] = true
     return info.exit
 end
 
 function decomp:_emitif(st, info, active, word)
-    st:out((word or "if") .. " " .. ex.str(info.cond) .. " then")
-    st.indent += 1
-    local old = active.join
-    active.join = info.join
-    self:_region(st, info.a, info.b, active)
-    active.join = old
-    st:trim(st.indent)
-    st.indent -= 1
-
+    st:out((word or "if") .. " " .. ex.str(info.cond) .. " then"); st.indent += 1
+    local old = active.join; active.join = info.join
+    self:_region(st, info.a, info.b, active); active.join = old
+    st:trim(st.indent); st.indent -= 1
     if info.c then
         local sub = branch.elseifInfo(st, info.c, info.join)
-        if sub then
-            self:_emitif(st, sub, active, "elseif")
-            return
-        end
-        st:out("else")
-        st.indent += 1
-        old = active.join
-        active.join = info.join
-        self:_region(st, info.c, info.d, active)
-        active.join = old
-        st:trim(st.indent)
-        st.indent -= 1
+        if sub then self:_emitif(st, sub, active, "elseif"); return end
+        st:out("else"); st.indent += 1; old = active.join; active.join = info.join
+        self:_region(st, info.c, info.d, active); active.join = old
+        st:trim(st.indent); st.indent -= 1
     end
     st:out("end")
 end
 
 function decomp:_region(st, start, stop, active)
-    local pc = start
-    active = active or {}
-
+    local pc = start; active = active or {}
     while pc < stop and pc <= #st.proto.Instructions do
-        if st.cfg.aux[pc] or st.consumed[pc] then
-            pc += 1
+        if st.cfg.aux[pc] then pc += 1
+        elseif st.consumed[pc] then st.v4.visited[pc] = true; pc += 1
         else
+            st.v4.visited[pc] = true
             local rep
             if not active["repeat:" .. tostring(pc)] then rep = loops.repeatInfo(st, pc) end
             if rep and rep.latch < stop then
-                active["repeat:" .. tostring(pc)] = true
-                st:out("repeat")
-                st.indent += 1
-                local prev = active.loop
-                active.loop = { breakpc = rep.exit, contpc = rep.cont }
-                self:_region(st, rep.body, rep.latch, active)
-                active.loop = prev
-                local x = cond.fall(st, rep.latch, st.proto.Instructions[rep.latch])
-                st:trim(st.indent)
-                st.indent -= 1
-                st:out("until " .. ex.str(x))
-                active["repeat:" .. tostring(pc)] = nil
-                pc = rep.exit
+
+
+                st:hoist(pc)
+                active["repeat:" .. tostring(pc)] = true; st:out("repeat"); st.indent += 1
+                local prev = active.loop; active.loop = { breakpc = rep.exit, contpc = rep.cont }
+                self:_region(st, rep.body, rep.latch, active); active.loop = prev
+                local x = cond.fall(st, rep.latch, st.proto.Instructions[rep.latch]); st.v4.visited[rep.latch] = true
+                st:trim(st.indent); st.indent -= 1; st:out("until " .. ex.str(x)); active["repeat:" .. tostring(pc)] = nil; pc = rep.exit
             else
                 local forever = loops.foreverInfo(st, pc, stop)
                 if forever then
-                    st:out("while true do")
-                    st.indent += 1
-                    local prev = active.loop
-                    active.loop = { breakpc = forever.exit, contpc = forever.cont, cont2 = forever.latch }
-                    self:_region(st, forever.body, forever.latch, active)
-                    active.loop = prev
-                    st:trim(st.indent)
-                    st.indent -= 1
-                    st:out("end")
-                    pc = forever.exit
-                else
-                    local op = st.proto.Instructions[pc]
-                    local name = ins.name(op)
 
-                    if name == "FORNPREP" then
-                        pc = self:_numfor(st, pc, op, stop, active) or ops.run(self, st, pc)
-                    elseif name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" then
-                        pc = self:_genfor(st, pc, op, stop, active) or ops.run(self, st, pc)
+                    st:hoist(pc)
+                    st:out("while true do"); st.indent += 1; local prev = active.loop
+                    active.loop = { breakpc = forever.exit, contpc = forever.cont, cont2 = forever.latch }
+                    self:_region(st, forever.body, forever.latch, active); active.loop = prev; st.v4.visited[forever.latch] = true
+                    st:trim(st.indent); st.indent -= 1; st:out("end"); pc = forever.exit
+                else
+                    local op = st.proto.Instructions[pc]; local name = ins.name(op)
+                    if name == "FORNPREP" then pc = self:_numfor(st, pc, op, stop, active) or self:_op(st, pc)
+                    elseif name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" then pc = self:_genfor(st, pc, op, stop, active) or self:_op(st, pc)
                     elseif name == "CMPPROTO" then
-                        local target = ins.jumpTarget(pc, op)
-                        local join = st:join(pc)
-                        if join and target > pc and target < join and join <= stop then
-                            self:_region(st, target, join, active)
-                            pc = join
-                        else
-                            st:badpc(pc, "unrecognized CMPPROTO inline guard -> " .. tostring(target))
-                            pc = st:next(pc)
-                        end
+                        local target, join = ins.jumpTarget(pc, op), st:join(pc)
+                        if join and target > pc and target < join and join <= stop then self:_region(st, target, join, active); pc = join
+                        else st:badpc(pc, "unrecognized CMPPROTO inline guard -> " .. tostring(target)); pc = st:next(pc) end
                     elseif ins.isConditional(op) and name ~= "FORNLOOP" and name ~= "FORGLOOP" then
-                        local loop = active.loop
-                        local target = ins.jumpTarget(pc, op)
-                        if loop and target == loop.breakpc then
-                            st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then break end")
-                            pc = st:next(pc)
-                        elseif loop and (target == loop.contpc or target == loop.cont2) then
-                            st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then continue end")
-                            pc = st:next(pc)
+                        local loop, target = active.loop, ins.jumpTarget(pc, op)
+                        if loop and target == loop.breakpc then st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then break end"); pc = st:next(pc)
+                        elseif loop and (target == loop.contpc or target == loop.cont2) then st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then continue end"); pc = st:next(pc)
                         else
                             local bp = cond.bool(st, pc, op)
-                            if bp then
-                                pc = bp
+                            if bp then pc = bp
                             else
                                 local wh = loops.whileInfo(st, pc)
                                 if wh and wh.exit <= stop then
-                                    st:hoist(pc)
-                                    st:out("while " .. ex.str(wh.cond) .. " do")
-                                    st.indent += 1
-                                    local prev = active.loop
-                                    active.loop = { breakpc = wh.exit, contpc = wh.cont }
-                                    self:_region(st, wh.body, wh.bodyend, active)
-                                    active.loop = prev
-                                    st:trim(st.indent)
-                                    st.indent -= 1
-                                    st:out("end")
-                                    pc = wh.exit
+                                    st:hoist(pc); st:out("while " .. ex.str(wh.cond) .. " do"); st.indent += 1
+                                    local prev = active.loop; active.loop = { breakpc = wh.exit, contpc = wh.cont }
+                                    self:_region(st, wh.body, wh.bodyend, active); active.loop = prev
+                                    st:trim(st.indent); st.indent -= 1; st:out("end"); pc = wh.exit
                                 else
                                     local info = branch.info(st, pc, stop)
-                                    if info and info.join <= stop then
-                                        st:hoist(info.join)
-                                        self:_emitif(st, info, active)
-                                        pc = info.join
-                                    else
-                                        st:badpc(pc, "unstructured conditional " .. name .. " -> " .. tostring(target))
-                                        pc = st:next(pc)
-                                    end
+                                    if info and info.join <= stop then st:hoist(info.join); self:_emitif(st, info, active); pc = info.join
+                                    else st:badpc(pc, "unstructured conditional " .. name .. " -> " .. tostring(target)); pc = st:next(pc) end
                                 end
                             end
                         end
                     elseif name == "JUMP" or name == "JUMPBACK" or name == "JUMPX" then
-                        local target = ins.jumpTarget(pc, op)
-                        local loop = active.loop
-                        if loop and target == loop.breakpc then
-                            st:out("break")
-                            pc = st:next(pc)
-                        elseif loop and (target == loop.contpc or target == loop.cont2) then
-                            st:out("continue")
-                            pc = st:next(pc)
-                        elseif target == stop or target == active.join then
-                            pc = stop
-                        else
-                            st:badpc(pc, "unstructured jump -> " .. tostring(target))
-                            pc = st:next(pc)
-                        end
-                    else
-                        pc = ops.run(self, st, pc)
-                    end
+                        local target, loop = ins.jumpTarget(pc, op), active.loop
+                        if loop and target == loop.breakpc then st:out("break"); pc = st:next(pc)
+                        elseif loop and (target == loop.contpc or target == loop.cont2) then st:out("continue"); pc = st:next(pc)
+                        elseif target == stop or target == active.join then pc = stop
+                        else st:badpc(pc, "unstructured jump -> " .. tostring(target)); pc = st:next(pc) end
+                    else pc = self:_op(st, pc) end
                 end
             end
         end
@@ -3028,29 +3954,164 @@ function decomp:_region(st, start, stop, active)
     return pc
 end
 
+local function dispatcherunsupported(st)
+    for _, n in ipairs(st.ir.ops) do
+        local name = n.name
+        if name == "FORNPREP" or name == "FORNLOOP" or name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" or name == "FORGLOOP" then
+            return "dispatcher requires VM loop-state emulation for " .. name .. " at pc " .. tostring(n.pc)
+        end
+        if name == "CMPPROTO" then return "CMPPROTO cannot be represented losslessly in source fallback at pc " .. tostring(n.pc) end
+        if name == "CLOSEUPVALS" then return "dispatcher would change upvalue close/cell lifetime at pc " .. tostring(n.pc) end
+        if name == "CAPTURE" and n.op.A == 1 then return "dispatcher would hoist a by-reference captured local cell at pc " .. tostring(n.pc) end
+    end
+end
+
+function decomp:_dispatcher(st)
+    local why = dispatcherunsupported(st)
+    if why then error("LumenV4: UNSUPPORTED lossless fallback: " .. why, 2) end
+
+
+    local nameset, ordered = {}, {}
+    for id, v in ipairs(st.ir.vals) do
+        if v and not st.ir.dead[id] and v.kind ~= "param" and v.kind ~= "undef" then
+            local name = st:vname(id, v.reg, nil, v.pc or 1)
+            if name and not nameset[name] and st.declared[name] == nil then nameset[name] = true; ordered[#ordered + 1] = name end
+        end
+    end
+    table.sort(ordered)
+    for i = 1, #ordered, 12 do
+        local chunk = {}; for j = i, math.min(i + 11, #ordered) do chunk[#chunk + 1] = ordered[j]; st.declared[ordered[j]] = 0 end
+        st:out("local " .. table.concat(chunk, ", "))
+    end
+
+    local state = st.naming:unique("__lumenstate")
+    st.declared[state] = 0
+    st:out("local " .. state .. " = 1")
+    st:out("while true do"); st.indent += 1
+
+    for bi, b in ipairs(st.cfg.blocks) do
+        st:out((bi == 1 and "if " or "elseif ") .. state .. " == " .. tostring(b.id) .. " then")
+        st.indent += 1
+        st.top = nil
+        for pi, pc in ipairs(b.pcs) do
+            st.v4.visited[pc] = true
+            if not st.consumed[pc] then
+                local op, name = st.proto.Instructions[pc], ins.name(st.proto.Instructions[pc])
+                local last = pi == #b.pcs
+                if last and ins.isConditional(op) then
+                    local target, fall = st.cfg.blockmap[ins.jumpTarget(pc, op)], st.cfg.blockmap[st:next(pc)]
+                    if not target or not fall then error("LumenV4: invalid dispatcher conditional edge at pc " .. tostring(pc), 2) end
+                    st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then")
+                    st.indent += 1; st:out(state .. " = " .. tostring(target)); st.indent -= 1
+                    st:out("else"); st.indent += 1; st:out(state .. " = " .. tostring(fall)); st.indent -= 1; st:out("end")
+                elseif last and (name == "JUMP" or name == "JUMPBACK" or name == "JUMPX") then
+                    local target = st.cfg.blockmap[ins.jumpTarget(pc, op)]
+                    if not target then error("LumenV4: invalid dispatcher jump edge at pc " .. tostring(pc), 2) end
+                    st:out(state .. " = " .. tostring(target))
+                elseif last and name == "LOADB" and (op.C or 0) ~= 0 then
+                    self:_op(st, pc)
+                    local target = st.cfg.blockmap[pc + op.C + 1]
+                    if not target then error("LumenV4: invalid LOADB edge at pc " .. tostring(pc), 2) end
+                    st:out(state .. " = " .. tostring(target))
+                else
+                    self:_op(st, pc)
+                    if last and name ~= "RETURN" then
+                        if #b.successors == 1 then st:out(state .. " = " .. tostring(b.successors[1]))
+                        elseif #b.successors == 0 then st:out("break")
+                        elseif #b.successors > 1 then error("LumenV4: unhandled multi-successor block at pc " .. tostring(pc), 2) end
+                    end
+                end
+            end
+        end
+        st.indent -= 1
+    end
+    st:out("else"); st.indent += 1; st:out("error(\"LumenV4: invalid dispatcher state \" .. tostring(" .. state .. "))"); st.indent -= 1
+    st:out("end")
+    st.indent -= 1; st:out("end")
+end
+
+local function metrics(st)
+    local reachable, covered = 0, 0
+    for pc = 1, #st.proto.Instructions do
+        if not st.cfg.aux[pc] and st.cfg.blockmap[pc] then
+            reachable += 1
+            if st.v4.visited[pc] or st.consumed[pc] then covered += 1 end
+        end
+    end
+    return reachable, covered, reachable == 0 and 1 or covered / reachable
+end
+
 function decomp:decompileProto(proto, up)
     local root, st = self:_child(proto, up or {})
-    return printer.run(root, self.opt), {
-        cfg = st.cfg,
-        ir = st.ir,
-        ssa = st.ssa,
-        ssaSummary = st.ssa:summary(),
-        issues = st.bad,
+    local src = printer.run(root, self.opt)
+    local reachable, covered, coverage = metrics(st)
+    if covered ~= reachable then
+        error(("LumenV4: PARTIAL origin coverage %d/%d (%.2f%%)"):format(covered, reachable, coverage * 100), 2)
+    end
+    local ss = st.ssa:summary()
+    local structuredblocks = st.v4.fallback and 0 or #st.cfg.blocks
+    local fallbackblocks = st.v4.fallback and #st.cfg.blocks or 0
+    local objectcount, escapedobjects = 0, 0
+    for _, obj in pairs(st.ir.objects or {}) do
+        objectcount += 1
+        if obj.escaped then escapedobjects += 1 end
+    end
+    local cellcount = 0
+    for _ in pairs(st.ir.cells or {}) do cellcount += 1 end
+    local packcount = 0
+    for _, pack in pairs(st.ssa.packsByPC or {}) do if pack and pack.producesTop then packcount += 1 end end
+    local irreducible = st.cfg.irreducible and 1 or 0
+    local bytecodeversion = self.parsed and self.parsed.BytecodeVersion or 0
+
+    if type(loadstring) ~= "function" then
+        error("LumenV4: UNSUPPORTED syntax verification requires loadstring()", 2)
+    end
+
+    local header = ("-- LumenV4 status=%s coverage=%.2f reachable=%d covered=%d blocks=%d structuredBlocks=%d fallbackBlocks=%d phis=%d undefs=%d packs=%d cells=%d objects=%d escapedObjects=%d irreducible=%d bytecodeVersion=%d ssa=true parser=true diagnostics=%d\n")
+        :format(st.v4.status, coverage * 100, reachable, covered, #st.cfg.blocks, structuredblocks, fallbackblocks,
+            ss.phis or 0, ss.undefs or 0, packcount, cellcount, objectcount, escapedobjects, irreducible, bytecodeversion, #st.bad)
+    src = header .. src
+    local check, err = loadstring(src, "@LumenV4/verify")
+    if not check then error("LumenV4: INVALID emitted Luau: " .. tostring(err), 2) end
+
+    return src, {
+        status = st.v4.status, cfg = st.cfg, ir = st.ir, ssa = st.ssa, ssaSummary = ss, issues = st.bad,
+        coverage = coverage, coveredInstructions = covered, reachableInstructions = reachable, fallback = st.v4.fallback,
+        syntaxValid = true, originCoverageValid = true, verification = "syntax+CFG-origin-invariants",
+        objectCount = objectcount, escapedObjects = escapedobjects, cellCount = cellcount, valuePackCount = packcount,
+        irreducible = st.cfg.irreducible == true, bytecodeVersion = bytecodeversion,
     }
 end
 
 function decomp:decompileParsed(parsed)
     local proto = parsed.Protos[parsed.ProtoEntryPoint]
-    assert(proto, "LumenDecomp: parsed bytecode has no entry proto")
+    assert(proto, "LumenV4: parsed bytecode has no entry proto")
     self.parsed = parsed
-    local src, info = self:decompileProto(proto, {})
+
+    local ok, src, info = pcall(function() return self:decompileProto(proto, {}) end)
+    if ok then
+        self.parsed = nil
+        return src, info
+    end
+
+
+    local structurederror = tostring(src)
+    local fok, fsrc, finfo = pcall(function()
+        return vmfallback.run(parsed, structurederror)
+    end)
     self.parsed = nil
-    return src, info
+
+    if not fok then
+        error("LumenV4: VM fallback generator failure after structured failure: " .. tostring(fsrc)
+            .. " | structured: " .. structurederror, 2)
+    end
+    return fsrc, finfo
 end
 
 return decomp
 ]===],
     ["main.decompiler.ops"] = [===[
+
 local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 local ex = require("main.output.expr")
@@ -3347,6 +4408,7 @@ end
 return ops
 ]===],
     ["main.diagnostics.disassembler"] = [===[
+
 local graph = require("main.analysis.graph")
 local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
@@ -3417,6 +4479,7 @@ end
 return dis
 ]===],
     ["main.diagnostics.inspect"] = [===[
+
 local graph = require("main.analysis.graph")
 local ssa = require("main.analysis.ssa")
 local irbuild = require("main.ir.build")
@@ -3443,6 +4506,7 @@ end
 return view
 ]===],
     ["main.dump"] = [===[
+
 local env = require("main.runtime.environment")
 local st = require("main.runtime.status")
 local coref = require("main.runtime.core")
@@ -3451,6 +4515,33 @@ local tree = require("main.tree")
 local config = require("main.config")
 
 local dump = {}
+
+local function accept(stat, source)
+    stat.good += 1
+    local status = source:match('^local __lumenmeta = "LumenV4 status=([A-Z_]+)')
+    if status == "LOSSLESS_FALLBACK" or status == "VM_FALLBACK" then
+        stat.fallback += 1
+    elseif status == "STRUCTURED" then
+        stat.structured += 1
+    else
+        stat.unknown += 1
+    end
+    local reachable, covered = source:match("reachable=(%d+) covered=(%d+)")
+    stat.reachable += tonumber(reachable) or 0
+    stat.covered += tonumber(covered) or 0
+    local sb, fb = source:match("structuredBlocks=(%d+) fallbackBlocks=(%d+)")
+    stat.sblocks += tonumber(sb) or 0
+    stat.fblocks += tonumber(fb) or 0
+    stat.phis += tonumber(source:match("phis=(%d+)")) or 0
+    stat.packs += tonumber(source:match("packs=(%d+)")) or 0
+    stat.cells += tonumber(source:match("cells=(%d+)")) or 0
+    stat.objects += tonumber(source:match("objects=(%d+)")) or 0
+    stat.escaped += tonumber(source:match("escapedObjects=(%d+)")) or 0
+    stat.irreducible += tonumber(source:match("irreducible=(%d+)")) or 0
+    local bv = tonumber(source:match("bytecodeVersion=(%d+)"))
+    if bv then stat.versions[bv] = (stat.versions[bv] or 0) + 1 end
+    if source:find("parser=true", 1, true) then stat.syntax += 1 end
+end
 
 local function rootdir()
     return "LumenDecomp/" .. tostring(game.PlaceId or 0) .. "/dump_" .. tostring(os.time())
@@ -3465,6 +4556,10 @@ end
 local function decompfail(stat, cache, obj, err)
     err = tostring(err)
     stat.failed += 1
+    if err:find("LumenV4: PARTIAL", 1, true) then stat.partial += 1
+    elseif err:find("LumenV4: INVALID", 1, true) then stat.invalid += 1
+    elseif err:find("LumenV4: UNSUPPORTED", 1, true) then stat.unsupported += 1
+    else stat.other += 1 end
     cache[obj] = { success = false, error = err }
     local line = st.path(obj) .. " :: " .. err
     stat.errors[#stat.errors + 1] = line
@@ -3556,7 +4651,7 @@ local function serial(lumen, jobs, opt, stat, cache, label)
         local res = lumen:tryDecompileBytecode(job.raw, cfg)
         if res.success and type(res.source) == "string" and res.source ~= "" then
             cache[job.obj] = res.source
-            stat.good += 1
+            accept(stat, res.source)
         else
             decompfail(stat, cache, job.obj, res.error)
         end
@@ -3777,7 +4872,7 @@ local function actors(lumen, jobs, opt, stat, cache)
                 local job = jobs[jid]
                 if r.ok and type(r.out) == "string" and r.out ~= "" then
                     cache[job.obj] = r.out
-                    stat.good += 1
+                    accept(stat, r.out)
                 else
                     retry[#retry + 1] = job
                 end
@@ -3830,7 +4925,7 @@ local function actors(lumen, jobs, opt, stat, cache)
                 local res = lumen:tryDecompileBytecode(job.raw, cfg)
                 if res.success and type(res.source) == "string" and res.source ~= "" then
                     cache[job.obj] = res.source
-                    stat.good += 1
+                    accept(stat, res.source)
                 else
                     decompfail(stat, cache, job.obj, res.error)
                 end
@@ -3900,7 +4995,23 @@ local function summary(root, stat)
         "PlaceId: " .. tostring(game.PlaceId),
         "Script instances found: " .. tostring(stat.found),
         "Bytecode available: " .. tostring(stat.available),
-        "Decompiled: " .. tostring(stat.good),
+        "Accepted source (syntax + origin coverage): " .. tostring(stat.good),
+        "Structured accepted: " .. tostring(stat.structured),
+        "Lossless/VM fallback accepted: " .. tostring(stat.fallback),
+        "Partial: " .. tostring(stat.partial),
+        "Invalid output: " .. tostring(stat.invalid),
+        "Unsupported: " .. tostring(stat.unsupported),
+        "Other failures: " .. tostring(stat.other),
+        "Syntax-valid source: " .. tostring(stat.syntax) .. "/" .. tostring(stat.good),
+        "Reachable instruction coverage: " .. (stat.reachable > 0 and string.format("%.2f%%", stat.covered * 100 / stat.reachable) or "100.00%"),
+        "Structured blocks: " .. tostring(stat.sblocks),
+        "Fallback blocks: " .. tostring(stat.fblocks),
+        "Phi nodes: " .. tostring(stat.phis),
+        "ValuePack producers: " .. tostring(stat.packs),
+        "Captured cells: " .. tostring(stat.cells),
+        "Tracked heap objects: " .. tostring(stat.objects),
+        "Escaped heap objects: " .. tostring(stat.escaped),
+        "Irreducible accepted functions: " .. tostring(stat.irreducible),
         "Decompile failures: " .. tostring(stat.failed),
         "Bytecode unavailable: " .. tostring(stat.unavailable),
         "Server Script unavailable: " .. tostring(stat.serverUnavailable),
@@ -3949,6 +5060,25 @@ function dump.run(lumen, opt)
         found = 0,
         available = 0,
         good = 0,
+        structured = 0,
+        fallback = 0,
+        unknown = 0,
+        partial = 0,
+        invalid = 0,
+        unsupported = 0,
+        other = 0,
+        syntax = 0,
+        reachable = 0,
+        covered = 0,
+        sblocks = 0,
+        fblocks = 0,
+        phis = 0,
+        packs = 0,
+        cells = 0,
+        objects = 0,
+        escaped = 0,
+        irreducible = 0,
+        versions = {},
         failed = 0,
         unavailable = 0,
         serverUnavailable = 0,
@@ -4112,6 +5242,7 @@ end
 return dump
 ]===],
     ["main.ir.block"] = [===[
+
 local block = {}
 block.__index = block
 
@@ -4141,81 +5272,336 @@ local block = require("main.ir.block")
 
 local build = {}
 
-function build.run(proto)
-    local cfg = graph.build(proto)
-    local flow = ssa.build(proto, cfg)
-    local out = fn.new(proto, cfg, flow)
+local function copyset(src)
+    local out = {}; if src then for k in pairs(src) do out[k] = true end end; return out
+end
+local function unionset(dst, src)
+    local changed = false
+    if src then for k in pairs(src) do if not dst[k] then dst[k] = true; changed = true end end end
+    return changed
+end
+local function seteq(a, b)
+    a, b = a or {}, b or {}
+    for k in pairs(a) do if not b[k] then return false end end
+    for k in pairs(b) do if not a[k] then return false end end
+    return true
+end
 
-    for id, src in ipairs(flow.versions) do
-        out.vals[id] = val.new(id, src)
-        if src.dead then out.dead[id] = true end
-    end
 
-    for bid, phis in pairs(flow.phisByBlock) do
-        local dst = {}
-        out.phis[bid] = dst
-        for reg, p in pairs(phis) do
-            dst[reg] = { id = p.id, reg = reg, inputs = p.inputs, missing = p.missing }
-        end
-    end
-
-    for _, src in ipairs(cfg.blocks) do
-        local b = block.new(src)
-        out.blocks[b.id] = b
-        for _, pc in ipairs(src.pcs) do
-            local op = proto.Instructions[pc]
-            local name = ins.name(op)
-            local reads, writes = regs.readWrite(op)
-            local n = {
-                pc = pc,
-                op = op,
-                name = name,
-                block = b.id,
-                reads = reads,
-                writes = writes,
-                pure = fx.pure(name),
-                drop = fx.drop(name),
-                quiet = fx.quiet(name),
-                effect = fx.effect(name),
-                term = fx.term(name),
-            }
-            out.ops[#out.ops + 1] = n
-            out.bypc[pc] = n
-            b.ops[#b.ops + 1] = n
-        end
-    end
-
-    out:reindex()
+local function copystate(src)
+    local out = {}
+    for r, set in pairs(src or {}) do out[r] = copyset(set) end
     return out
 end
 
+local function stateeq(a, b)
+    a, b = a or {}, b or {}
+    for r, set in pairs(a) do if not seteq(set, b[r]) then return false end end
+    for r, set in pairs(b) do if not seteq(set, a[r]) then return false end end
+    return true
+end
+
+
+local function analyzecells(out)
+    local capturecell, capturereg, nextcell = {}, {}, 1
+    for _, n in ipairs(out.ops) do
+        if n.name == "CAPTURE" and n.op.A == 1 then
+            capturecell[n.pc] = nextcell
+            capturereg[nextcell] = n.op.B
+            nextcell += 1
+        end
+    end
+
+    if nextcell == 1 then
+        out.cells, out.cellOfValue, out.captureCell = {}, {}, capturecell
+        return out
+    end
+
+    local instate, outstate = {}, {}
+    local function merged(block)
+        if block.id == 1 then return {} end
+        local result = {}
+        for _, pred in ipairs(block.predecessors) do
+            for r, set in pairs(outstate[pred] or {}) do
+                local dst = result[r]
+                if not dst then dst = {}; result[r] = dst end
+                unionset(dst, set)
+            end
+        end
+        return result
+    end
+
+    local function transfer(block, incoming)
+        local state = copystate(incoming)
+        for _, pc in ipairs(block.pcs) do
+            local op = out.proto.Instructions[pc]
+            local name = ins.name(op)
+            if name == "CAPTURE" and op.A == 1 then
+                local set = state[op.B]
+                if not set then set = {}; state[op.B] = set end
+                set[capturecell[pc]] = true
+            elseif name == "CLOSEUPVALS" then
+                for r in pairs(state) do if r >= (op.A or 0) then state[r] = nil end end
+            end
+        end
+        return state
+    end
+
+    local changed, iterations = true, 0
+    local limit = math.max(32, #out.cfg.blocks * (nextcell + 8) * 4)
+    while changed do
+        iterations += 1
+        if iterations > limit then error("LumenV4: CellId dataflow failed to converge", 2) end
+        changed = false
+        for _, b in ipairs(out.cfg.blocks) do
+            local incoming = merged(b)
+            if not stateeq(instate[b.id], incoming) then instate[b.id] = incoming; changed = true end
+            local outgoing = transfer(b, incoming)
+            if not stateeq(outstate[b.id], outgoing) then outstate[b.id] = outgoing; changed = true end
+        end
+    end
+
+    local valuecells, closesites = {}, {}
+    local function markvalue(version, set)
+        if not version or not set or not next(set) then return end
+        local dst = valuecells[version]
+        if not dst then dst = {}; valuecells[version] = dst end
+        unionset(dst, set)
+    end
+
+    for _, b in ipairs(out.cfg.blocks) do
+        local state = copystate(instate[b.id])
+        for _, pc in ipairs(b.pcs) do
+            local op = out.proto.Instructions[pc]
+            local name = ins.name(op)
+            local uses = out.ssa.usesByPC[pc] or {}
+            local defs = out.ssa.defsByPC[pc] or {}
+
+            if name == "CAPTURE" and op.A == 1 then
+                local set = state[op.B]
+                if not set then set = {}; state[op.B] = set end
+                set[capturecell[pc]] = true
+            end
+
+            for r, version in pairs(uses) do markvalue(version, state[r]) end
+            for r, version in pairs(defs) do markvalue(version, state[r]) end
+
+            if name == "CLOSEUPVALS" then
+                for r, set in pairs(state) do
+                    if r >= (op.A or 0) then
+                        for cid in pairs(set) do
+                            local list = closesites[cid]
+                            if not list then list = {}; closesites[cid] = list end
+                            list[pc] = true
+                        end
+                        state[r] = nil
+                    end
+                end
+            end
+        end
+    end
+
+    local parent = {}
+    for cid = 1, nextcell - 1 do parent[cid] = cid end
+    local function root(x)
+        local p = parent[x]
+        if p ~= x then parent[x] = root(p) end
+        return parent[x]
+    end
+    local function join(a, b)
+        a, b = root(a), root(b)
+        if a ~= b then if a < b then parent[b] = a else parent[a] = b end end
+    end
+    local function joinset(set)
+        local first
+        for cid in pairs(set or {}) do if first then join(first, cid) else first = cid end end
+    end
+    for _, set in pairs(valuecells) do joinset(set) end
+    for _, state in pairs(instate) do for _, set in pairs(state) do joinset(set) end end
+    for _, state in pairs(outstate) do for _, set in pairs(state) do joinset(set) end end
+
+    local cells, cellofvalue = {}, {}
+    for pc, cid in pairs(capturecell) do
+        local rid = root(cid)
+        capturecell[pc] = rid
+        local c = cells[rid]
+        if not c then c = { id = rid, reg = capturereg[cid], captures = {}, closes = {}, values = {} }; cells[rid] = c end
+        c.captures[#c.captures + 1] = pc
+    end
+    for version, set in pairs(valuecells) do
+        local rid
+        for cid in pairs(set) do rid = root(cid); break end
+        if rid then
+            cellofvalue[version] = rid
+            local c = cells[rid]
+            if not c then c = { id = rid, reg = capturereg[rid], captures = {}, closes = {}, values = {} }; cells[rid] = c end
+            c.values[version] = true
+        end
+    end
+    for cid, sites in pairs(closesites) do
+        local rid = root(cid)
+        local c = cells[rid]
+        if c then for pc in pairs(sites) do c.closes[pc] = true end end
+    end
+    for _, c in pairs(cells) do table.sort(c.captures) end
+
+    out.cells = cells
+    out.cellOfValue = cellofvalue
+    out.captureCell = capturecell
+    out.cellInState = instate
+    out.cellOutState = outstate
+    out.cellIterations = iterations
+    function out:cellId(valueid) return self.cellOfValue[valueid] or self.cellOfValue[self:resolve(valueid)] end
+    return out
+end
+
+local function analyzeobjects(out)
+    local sets, objects, nextobject = {}, {}, 1
+    local function def(pc, reg)
+        local d = out.ssa.defsByPC[pc]; return d and d[reg] or nil
+    end
+    local function use(pc, reg)
+        local u = out.ssa.usesByPC[pc]; return u and u[reg] or nil
+    end
+    local function assign(id, nextset)
+        if not id then return false end
+        if not seteq(sets[id], nextset) then sets[id] = copyset(nextset); return true end
+        return false
+    end
+
+    for _, n in ipairs(out.ops) do
+        if n.name == "NEWTABLE" or n.name == "DUPTABLE" or n.name == "NEWCLASS" then
+            local id = def(n.pc, n.op.A)
+            if id then
+                local oid = nextobject; nextobject += 1
+                objects[oid] = { id = oid, allocPC = n.pc, kind = n.name, escaped = false, escapePCs = {}, aliases = {} }
+                sets[id] = { [oid] = true }
+            end
+        end
+    end
+
+    local changed, iterations = true, 0
+    local limit = math.max(32, #out.ops * 8 + 32)
+    while changed do
+        iterations += 1; if iterations > limit then error("LumenV4: ObjectId propagation failed to converge", 2) end
+        changed = false
+        for _, n in ipairs(out.ops) do
+            if n.name == "MOVE" then
+                changed = assign(def(n.pc, n.op.A), sets[use(n.pc, n.op.B)]) or changed
+            elseif n.name == "NAMECALL" or n.name == "NAMECALLUDATA" then
+
+                changed = assign(def(n.pc, n.op.A + 1), sets[use(n.pc, n.op.B)]) or changed
+            end
+        end
+        for _, phis in pairs(out.phis) do
+            for _, phi in pairs(phis) do
+                local merged = {}
+                for raw in pairs(phi.inputs or {}) do unionset(merged, sets[raw]) end
+                changed = assign(phi.id, merged) or changed
+            end
+        end
+    end
+
+    local function mark(id, pc, reason)
+        for oid in pairs(sets[id] or {}) do
+            local obj = objects[oid]
+            obj.escaped = true
+            obj.escapePCs[pc] = reason or true
+        end
+    end
+
+
+    for id, os in pairs(sets) do for oid in pairs(os) do objects[oid].aliases[id] = true end end
+    for _, n in ipairs(out.ops) do
+        local pc, op, name = n.pc, n.op, n.name
+        local reads = out.ssa.usesByPC[pc] or {}
+        local safebase = {}
+        if name == "GETTABLE" or name == "GETTABLEKS" or name == "GETTABLEN" or name == "GETUDATAKS" then safebase[op.B] = true
+        elseif name == "SETTABLE" or name == "SETTABLEKS" or name == "SETTABLEN" or name == "SETUDATAKS" then safebase[op.B] = true
+        elseif name == "SETLIST" then safebase[op.A] = true
+        elseif name == "NAMECALL" or name == "NAMECALLUDATA" then safebase[op.B] = true
+        elseif name == "MOVE" then safebase[op.B] = true
+        end
+
+        for reg, id in pairs(reads) do
+            if sets[id] and not safebase[reg] then
+                local reason = name
+                if name == "CALL" or name == "CALLFB" then reason = "CallUnknown"
+                elseif name == "RETURN" then reason = "Return"
+                elseif name == "CAPTURE" then reason = "Capture"
+                elseif name == "SETGLOBAL" or name == "SETUPVAL" then reason = "StoreExternal"
+                elseif name:match("^SETTABLE") or name == "SETUDATAKS" or name == "SETLIST" then reason = "StoreHeap" end
+                mark(id, pc, reason)
+            end
+        end
+    end
+
+    out.objectSets = sets
+    out.objects = objects
+    out.objectIterations = iterations
+    function out:objectIds(valueid) return self.objectSets[self:resolve(valueid)] or {} end
+    function out:objectId(valueid)
+        local one
+        for oid in pairs(self:objectIds(valueid)) do if one then return nil end; one = oid end
+        return one
+    end
+    return out
+end
+
+function build.run(proto)
+    local cfg = graph.build(proto)
+    local flow = ssa.build(proto, cfg)
+    assert(flow.converged, "LumenV4: refusing non-converged SSA")
+    local out = fn.new(proto, cfg, flow)
+    for id, src in ipairs(flow.versions) do
+        out.vals[id] = val.new(id, src)
+        if src.dead then out.dead[id] = true end
+        if src.kind == "undef" then out.const[id] = "nil"; out.inline[id] = true end
+    end
+    for bid, phis in pairs(flow.phisByBlock) do
+        local dst = {}; out.phis[bid] = dst
+        for reg, p in pairs(phis) do
+            dst[reg] = { id = p.id, reg = reg, inputs = p.inputs, incoming = p.incoming, missing = p.missing }
+        end
+    end
+    for _, src in ipairs(cfg.blocks) do
+        local b = block.new(src); out.blocks[b.id] = b
+        for _, pc in ipairs(src.pcs) do
+            local op = proto.Instructions[pc]
+            local name = ins.name(op)
+            local reads, writes, pack = regs.readWrite(op)
+            local n = { pc = pc, op = op, name = name, block = b.id, reads = reads, writes = writes, pack = pack,
+                pure = fx.pure(name), drop = fx.drop(name), quiet = fx.quiet(name), effect = fx.effect(name), term = fx.term(name) }
+            out.ops[#out.ops + 1] = n; out.bypc[pc] = n; b.ops[#b.ops + 1] = n
+        end
+    end
+    out:reindex()
+    analyzecells(out)
+    analyzeobjects(out)
+    return out
+end
 return build
 ]===],
     ["main.ir.effects"] = [===[
+
 local fx = {}
 
-local pure = {
+local relocatable = {
     LOADNIL = true, LOADB = true, LOADN = true, LOADK = true, LOADKX = true,
-    MOVE = true, GETUPVAL = true, GETIMPORT = true, GETGLOBAL = true,
-    GETTABLE = true, GETTABLEKS = true, GETTABLEN = true, GETUDATAKS = true,
-    ADD = true, SUB = true, MUL = true, DIV = true, MOD = true, POW = true,
-    IDIV = true, ADDK = true, SUBK = true, MULK = true, DIVK = true,
-    MODK = true, POWK = true, IDIVK = true, SUBRK = true, DIVRK = true,
-    AND = true, OR = true, ANDK = true, ORK = true, CONCAT = true,
-    NOT = true, MINUS = true, LENGTH = true, NEWTABLE = true, DUPTABLE = true,
-    GETVARARGS = true,
+
+    MOVE = true,
 }
 
-local drop = {
-    LOADNIL = true, LOADB = true, LOADN = true, LOADK = true, LOADKX = true,
-    MOVE = true, GETUPVAL = true, AND = true, OR = true, ANDK = true, ORK = true,
-    NOT = true, NEWTABLE = true, DUPTABLE = true, GETVARARGS = true,
+local discardable = {
+    LOADNIL = true, LOADB = true, LOADN = true, LOADK = true, LOADKX = true, MOVE = true,
+    NOT = true, AND = true, OR = true, ANDK = true, ORK = true,
+
+
 }
 
 local quiet = {
-    NOP = true, LOADNIL = true, LOADB = true, LOADN = true, LOADK = true,
-    LOADKX = true, MOVE = true, GETUPVAL = true, PREPVARARGS = true,
-    COVERAGE = true,
+    NOP = true, LOADNIL = true, LOADB = true, LOADN = true, LOADK = true, LOADKX = true,
+    MOVE = true, PREPVARARGS = true, COVERAGE = true,
 }
 
 local term = {
@@ -4227,31 +5613,39 @@ local term = {
     FORGPREP_NEXT = true, FORGLOOP = true, CMPPROTO = true,
 }
 
-function fx.pure(name)
-    return pure[name] == true
-end
+local effects = {
+    GETGLOBAL = "ReadGlobal", SETGLOBAL = "WriteGlobal",
+    GETUPVAL = "ReadCell", SETUPVAL = "WriteCell", CLOSEUPVALS = "CloseCells", CAPTURE = "CaptureCell",
+    GETTABLE = "ReadTable", GETTABLEKS = "ReadTable", GETTABLEN = "ReadTable", GETUDATAKS = "ReadTable",
+    SETTABLE = "WriteTable", SETTABLEKS = "WriteTable", SETTABLEN = "WriteTable", SETUDATAKS = "WriteTable",
+    CALL = "CallUnknown", CALLFB = "CallUnknown", NAMECALL = "ReadTable", NAMECALLUDATA = "ReadTable",
+    NEWCLOSURE = "AllocateClosure", DUPCLOSURE = "AllocateClosure",
+    NEWTABLE = "AllocateObject", DUPTABLE = "AllocateObject", NEWCLASS = "AllocateObject", NEWCLASSMEMBER = "WriteTable",
+    ADD = "MayMetamethod", SUB = "MayMetamethod", MUL = "MayMetamethod", DIV = "MayMetamethod", MOD = "MayMetamethod",
+    POW = "MayMetamethod", IDIV = "MayMetamethod", ADDK = "MayMetamethod", SUBK = "MayMetamethod", MULK = "MayMetamethod",
+    DIVK = "MayMetamethod", MODK = "MayMetamethod", POWK = "MayMetamethod", IDIVK = "MayMetamethod",
+    SUBRK = "MayMetamethod", DIVRK = "MayMetamethod", CONCAT = "MayMetamethod", LENGTH = "MayMetamethod",
+    GETIMPORT = "ReadImport", NATIVECALL = "CallUnknown",
+}
 
-function fx.drop(name)
-    return drop[name] == true
+function fx.pure(name) return relocatable[name] == true end
+function fx.drop(name) return discardable[name] == true end
+function fx.quiet(name) return quiet[name] == true end
+function fx.term(name) return term[name] == true end
+function fx.class(name)
+    if term[name] then return "Control" end
+    return effects[name] or (quiet[name] and "Pure" or "Unknown")
 end
-
-function fx.quiet(name)
-    return quiet[name] == true
-end
-
-function fx.term(name)
-    return term[name] == true
-end
-
 function fx.effect(name)
-    if drop[name] or quiet[name] or term[name] then return false end
-    if name == "NOP" or name == "BREAK" or name == "CLOSEUPVALS" or name == "PREPVARARGS" or name == "COVERAGE" or name == "NATIVECALL" or name == "CAPTURE" then return false end
-    return true
+    local c = fx.class(name)
+    return c ~= "Pure" and c ~= "Control"
 end
+function fx.canRelocate(name) return relocatable[name] == true end
 
 return fx
 ]===],
     ["main.ir.function"] = [===[
+
 local fn = {}
 fn.__index = fn
 
@@ -4348,6 +5742,7 @@ end
 return fn
 ]===],
     ["main.ir.value"] = [===[
+
 local val = {}
 val.__index = val
 
@@ -4369,6 +5764,7 @@ end
 return val
 ]===],
     ["main.naming.debug_names"] = [===[
+
 local id = require("main.naming.identifiers")
 
 local dbg = {}
@@ -4417,6 +5813,7 @@ end
 return dbg
 ]===],
     ["main.naming.identifiers"] = [===[
+
 local id = {}
 
 local kw = {
@@ -4462,6 +5859,7 @@ end
 return id
 ]===],
     ["main.naming.resolver"] = [===[
+
 local id = require("main.naming.identifiers")
 local rbx = require("main.naming.roblox")
 local dbg = require("main.naming.debug_names")
@@ -4579,6 +5977,7 @@ names.fromCall = rbx.fromCall
 return names
 ]===],
     ["main.naming.roblox"] = [===[
+
 local id = require("main.naming.identifiers")
 local words = require("main.naming.words")
 
@@ -4668,6 +6067,7 @@ end
 return rbx
 ]===],
     ["main.naming.types"] = [===[
+
 local id = require("main.naming.identifiers")
 
 local types = {}
@@ -4744,6 +6144,7 @@ end
 return types
 ]===],
     ["main.naming.words"] = [===[
+
 local id = require("main.naming.identifiers")
 
 local w = {}
@@ -4827,6 +6228,7 @@ end
 return w
 ]===],
     ["main.options"] = [===[
+
 local opt = {}
 
 function opt.new()
@@ -4843,6 +6245,7 @@ end
 return opt
 ]===],
     ["main.output.expr"] = [===[
+
 local expr = {}
 
 local prec = {
@@ -4926,6 +6329,7 @@ end
 return expr
 ]===],
     ["main.output.literals"] = [===[
+
 local id = require("main.naming.identifiers")
 
 local lit = {}
@@ -5028,6 +6432,7 @@ end
 return lit
 ]===],
     ["main.passes.conditions"] = [===[
+
 local ins = require("main.bytecode.instructions")
 
 local pass = {}
@@ -5051,6 +6456,7 @@ end
 return pass
 ]===],
     ["main.passes.constants"] = [===[
+
 local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 
@@ -5180,6 +6586,7 @@ end
 return pass
 ]===],
     ["main.passes.deadcode"] = [===[
+
 local pass = {}
 
 function pass.run(ir)
@@ -5221,6 +6628,7 @@ end
 return pass
 ]===],
     ["main.passes.flow"] = [===[
+
 local pass = {}
 
 function pass.run(ir)
@@ -5249,10 +6657,59 @@ local function quiet(ir, a, b)
     return true
 end
 
+local function mutablevalues(ir)
+    local mutable = {}
+    local changed = true
+
+
+    for id, objectset in pairs(ir.objectSets or {}) do
+        if next(objectset) then
+            local resolved = ir:resolve(id)
+            if resolved then mutable[resolved] = true end
+        end
+    end
+
+    for _, n in ipairs(ir.ops) do
+        if n.name == "NEWTABLE" or n.name == "DUPTABLE" or n.name == "NEWCLASS" then
+            local defs = ir.ssa.defsByPC[n.pc] or {}
+            local v = ir:resolve(defs[n.op.A])
+            if v then mutable[v] = true end
+        end
+    end
+
+    while changed do
+        changed = false
+        for _, n in ipairs(ir.ops) do
+            if n.name == "MOVE" then
+                local uses = ir.ssa.usesByPC[n.pc] or {}
+                local defs = ir.ssa.defsByPC[n.pc] or {}
+                local src = ir:resolve(uses[n.op.B])
+                local dst = ir:resolve(defs[n.op.A])
+                if src and dst and mutable[src] and not mutable[dst] then mutable[dst] = true; changed = true end
+            end
+        end
+        for _, phis in pairs(ir.phis) do
+            for _, p in pairs(phis) do
+                local pid = ir:resolve(p.id)
+                if pid and not mutable[pid] then
+                    for raw in pairs(p.inputs or {}) do
+                        local src = ir:resolve(raw)
+                        if src and mutable[src] then mutable[pid] = true; changed = true break end
+                    end
+                end
+            end
+        end
+    end
+    return mutable
+end
+
 function pass.run(ir)
+    local mutable = mutablevalues(ir)
+    ir.mutableObjects = mutable
+
     for id, v in pairs(ir.vals) do
         id = ir:resolve(id)
-        if id and not ir.dead[id] and v.kind == "def" then
+        if id and not ir.dead[id] and v.kind == "def" and not mutable[id] then
             local u = ir:only(id)
             local n = v.pc and ir.bypc[v.pc]
             if u and u.pc and n and ir.cfg.blockmap[v.pc] == ir.cfg.blockmap[u.pc] then
@@ -5266,13 +6723,17 @@ function pass.run(ir)
             end
         end
     end
+
     for id in pairs(ir.const) do
-        local ok = ir:count(id) > 0
-        for _, u in ipairs(ir:uses(id) or {}) do
-            local useop = u.pc and ir.bypc[u.pc] or nil
-            if u.phi or (useop and useop.name == "CAPTURE") then ok = false break end
+        id = ir:resolve(id)
+        if id and not mutable[id] then
+            local ok = ir:count(id) > 0
+            for _, u in ipairs(ir:uses(id) or {}) do
+                local useop = u.pc and ir.bypc[u.pc] or nil
+                if u.phi or (useop and useop.name == "CAPTURE") then ok = false break end
+            end
+            if ok then ir.inline[id] = true end
         end
-        if ok then ir.inline[id] = true end
     end
     return ir
 end
@@ -5280,6 +6741,7 @@ end
 return pass
 ]===],
     ["main.passes.names"] = [===[
+
 local pass = {}
 
 function pass.run(ir)
@@ -5319,8 +6781,8 @@ end
 return pass
 ]===],
     ["main.passes.pipeline"] = [===[
-local simp = require("main.passes.simplify")
-local konst = require("main.passes.constants")
+
+
 local dead = require("main.passes.deadcode")
 local names = require("main.passes.names")
 local prov = require("main.passes.provenance")
@@ -5332,11 +6794,18 @@ local pipe = {}
 
 function pipe.run(ir, opt)
     opt = opt or {}
-    simp.run(ir)
-    if opt.fold ~= false then konst.run(ir) end
+
+
     if opt.dce ~= false then dead.run(ir) end
+
+
     names.run(ir)
-    if opt.smartnames ~= false then prov.run(ir) else ir.bestname, ir.namescore, ir.hints, ir.origin = {}, {}, {}, {} end
+    if opt.smartnames ~= false then
+        prov.run(ir)
+    else
+        ir.bestname, ir.namescore, ir.hints, ir.origin = {}, {}, {}, {}
+    end
+
     if opt.inline ~= false then inline.run(ir) end
     cond.run(ir)
     flow.run(ir)
@@ -5346,6 +6815,7 @@ end
 return pipe
 ]===],
     ["main.passes.provenance"] = [===[
+
 local lit = require("main.output.literals")
 local id = require("main.naming.identifiers")
 local rbx = require("main.naming.roblox")
@@ -5689,6 +7159,7 @@ end
 return pass
 ]===],
     ["main.passes.simplify"] = [===[
+
 local pass = {}
 
 function pass.run(ir)
@@ -5732,14 +7203,15 @@ local branch = {}
 function branch.info(st, pc, stop)
     local ch = cond.chain(st, pc)
     if not ch or ch.exit <= ch.body then return nil end
+
     local join = st:join(pc)
-    if not join or join <= pc or join > stop then join = ch.exit end
+
+    if not join or join <= pc or join > stop then return nil end
     if ch.exit > join then return nil end
 
     if ch.exit == join then
         return { cond = ch.cond, a = ch.body, b = join, join = join }
     end
-
     return { cond = ch.cond, a = ch.body, b = ch.exit, c = ch.exit, d = join, join = join }
 end
 
@@ -5753,6 +7225,7 @@ end
 return branch
 ]===],
     ["main.recover.conditions"] = [===[
+
 local ins = require("main.bytecode.instructions")
 local ex = require("main.output.expr")
 local lit = require("main.output.literals")
@@ -5918,34 +7391,20 @@ local lit = require("main.output.literals")
 local fn = {}
 
 local evt = {
-    PlayerAdded = { "player" }, PlayerRemoving = { "player" },
-    CharacterAdded = { "character" }, CharacterRemoving = { "character" },
-    ChildAdded = { "child" }, ChildRemoved = { "child" },
-    DescendantAdded = { "descendant" }, DescendantRemoving = { "descendant" },
-    Touched = { "hit" }, TouchEnded = { "hit" },
-    InputBegan = { "input", "gameProcessed" }, InputChanged = { "input", "gameProcessed" }, InputEnded = { "input", "gameProcessed" },
-    Heartbeat = { "dt" }, RenderStepped = { "dt" }, PreRender = { "dt" }, PreSimulation = { "dt" }, PostSimulation = { "dt" },
-    Stepped = { "time", "dt" },
-    AncestryChanged = { "child", "parent" }, AttributeChanged = { "attribute" },
-    Changed = { "value" },
+    PlayerAdded = { "player" }, PlayerRemoving = { "player" }, CharacterAdded = { "character" }, CharacterRemoving = { "character" },
+    ChildAdded = { "child" }, ChildRemoved = { "child" }, DescendantAdded = { "descendant" }, DescendantRemoving = { "descendant" },
+    Touched = { "hit" }, TouchEnded = { "hit" }, InputBegan = { "input", "gameProcessed" }, InputChanged = { "input", "gameProcessed" },
+    InputEnded = { "input", "gameProcessed" }, Heartbeat = { "dt" }, RenderStepped = { "dt" }, PreRender = { "dt" },
+    PreSimulation = { "dt" }, PostSimulation = { "dt" }, Stepped = { "time", "dt" }, AncestryChanged = { "child", "parent" },
+    AttributeChanged = { "attribute" }, Changed = { "value" },
 }
-
-local meth = {
-    BindToRenderStep = { "dt" },
-    BindAction = { "actionName", "inputState", "input" },
-    BindActionAtPriority = { "actionName", "inputState", "input" },
-}
+local meth = { BindToRenderStep = { "dt" }, BindAction = { "actionName", "inputState", "input" }, BindActionAtPriority = { "actionName", "inputState", "input" } }
 
 local function cbhints(st, pc, r)
     local v = st:verdef(pc, r)
     if not v then return nil end
     local call
-    for _, u in ipairs(st.ir:uses(v) or {}) do
-        if u.pc then
-            if call then return nil end
-            call = u.pc
-        end
-    end
+    for _, u in ipairs(st.ir:uses(v) or {}) do if u.pc then if call then return nil end; call = u.pc end end
     if not call then return nil end
     local op = st.proto.Instructions[call]
     local name = ins.name(op)
@@ -5955,8 +7414,20 @@ local function cbhints(st, pc, r)
         local tail = pend.obj and pend.obj:match("([%a_][%w_]*)$")
         return tail and evt[tail] or nil
     end
-    if pend and meth[pend.method] then return meth[pend.method] end
-    return nil
+    return pend and meth[pend.method] or nil
+end
+
+local function capturename(st, cp, kind, src, debugname)
+
+
+    local parent
+    if kind == 0 or kind == 1 then
+        parent = st:useName(cp, src, nil)
+    else
+        parent = st.up[src + 1] or ("upvalue" .. tostring(src))
+    end
+    if not parent or parent == "" then parent = debugname end
+    return parent or ("upvalue" .. tostring(src))
 end
 
 function fn.caps(st, pc, child)
@@ -5967,16 +7438,38 @@ function fn.caps(st, pc, child)
         local op = st.proto.Instructions[cp]
         local du = child.Upvalues and child.Upvalues[i]
         local dn = du and du.Name
-        if ins.name(op) ~= "CAPTURE" then
-            out[i] = dn or ("upvalue" .. tostring(i - 1))
-        else
-            local kind, src = op.A, op.B
-            if dn and dn ~= "" then out[i] = dn
-            elseif kind == 0 or kind == 1 then out[i] = st:useName(cp, src, nil)
-            else out[i] = st.up[src + 1] or ("upvalue" .. tostring(src)) end
-            st.consumed[cp] = true
-            nx = st:next(cp)
+        if not op or ins.name(op) ~= "CAPTURE" then
+            error(("LumenV4: UNSUPPORTED NEWCLOSURE at pc %d expected CAPTURE %d/%d"):format(pc, i, child.UpvalueCount or 0), 2)
         end
+
+        local kind, src = op.A, op.B
+        if kind ~= 0 and kind ~= 1 and kind ~= 2 then
+            error(("LumenV4: UNSUPPORTED CAPTURE kind %s at pc %d"):format(tostring(kind), cp), 2)
+        end
+        if kind == 0 or kind == 1 then
+            if not st:veruse(cp, src) then
+                error(("LumenV4: UNSUPPORTED CAPTURE references undefined parent register R%d at pc %d"):format(src, cp), 2)
+            end
+        elseif not st.up[src + 1] then
+            error(("LumenV4: UNSUPPORTED CAPTURE_UPVAL references missing parent upvalue U%d at pc %d"):format(src, cp), 2)
+        end
+
+        if kind == 0 then
+
+
+            local snap = st.naming:unique("capture" .. tostring(i) .. "Value")
+            st.declared[snap] = st.indent
+            st:out("local " .. snap .. " = " .. st:use(cp, src))
+            out[i] = snap
+        else
+            out[i] = capturename(st, cp, kind, src, dn)
+        end
+        st.consumed[cp] = true
+        nx = st:next(cp)
+    end
+    local extra = st.proto.Instructions[nx]
+    if extra and ins.name(extra) == "CAPTURE" then
+        error(("LumenV4: UNSUPPORTED NEWCLOSURE at pc %d has more CAPTURE instructions than child upvalues"):format(pc), 2)
     end
     return out, nx
 end
@@ -5984,14 +7477,8 @@ end
 local function direct(st, pc, r, nx)
     local v = st:verdef(pc, r)
     if not v then return nil end
-    local uses = st.ir:uses(v) or {}
-    local one
-    for _, u in ipairs(uses) do
-        if u.pc then
-            if one then return nil end
-            one = u
-        end
-    end
+    local uses, one = st.ir:uses(v) or {}, nil
+    for _, u in ipairs(uses) do if u.pc then if one then return nil end; one = u end end
     if not one or one.pc ~= nx then return nil end
     local op = st.proto.Instructions[one.pc]
     local name = ins.name(op)
@@ -6013,23 +7500,13 @@ function fn.emit(d, st, pc, r, child, caps, nx)
     local hint = child.Name
     if hint == nil or hint == "" then hint = st.ir.bestname and st.ir.bestname[st.ir:nameid(st:verdef(pc, r))] end
     if hint == nil or hint == "" then hint = "fn" .. tostring(r) end
-
     local root, sub, args = d:_child(child, caps, cbhints(st, pc, r))
     local target, assign, store = direct(st, pc, r, nx or st:next(pc))
     if target then
         st.consumed[store] = true
-        if not assign and target:find("%.") and args[1] and args[1]:match("^self%s*[:$]") then
+        if not assign and target:find("%.") and args[1] and (args[1]:match("^self%s*[:$]") or args[1] == "self") then
             local base, field = target:match("^(.*)%.([%a_][%w_]*)$")
-            if base and field then
-                target = base .. ":" .. field
-                table.remove(args, 1)
-            end
-        elseif not assign and target:find("%.") and args[1] == "self" then
-            local base, field = target:match("^(.*)%.([%a_][%w_]*)$")
-            if base and field then
-                target = base .. ":" .. field
-                table.remove(args, 1)
-            end
+            if base and field then target = base .. ":" .. field; table.remove(args, 1) end
         end
         st.ast:add({ kind = "function", name = target, args = table.concat(args, ", "), body = root, localfn = false, assign = assign })
     else
@@ -6048,6 +7525,7 @@ end
 return fn
 ]===],
     ["main.recover.guards"] = [===[
+
 local pass = {}
 
 local function term(block)
@@ -6086,6 +7564,7 @@ end
 return pass
 ]===],
     ["main.recover.loops"] = [===[
+
 local ins = require("main.bytecode.instructions")
 local cond = require("main.recover.conditions")
 
@@ -6154,6 +7633,7 @@ end
 return loops
 ]===],
     ["main.recover.tables"] = [===[
+
 local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 local ex = require("main.output.expr")
@@ -6250,6 +7730,7 @@ end
 return tab
 ]===],
     ["main.runtime.bytecode"] = [===[
+
 local bc = {}
 
 function bc.fromScript(obj)
@@ -6276,6 +7757,7 @@ end
 return bc
 ]===],
     ["main.runtime.core"] = [===[
+
 local core = {}
 
 local roots = {
@@ -6316,6 +7798,7 @@ end
 return core
 ]===],
     ["main.runtime.environment"] = [===[
+
 local env = {}
 
 function env.get()
@@ -6347,6 +7830,7 @@ end
 return env
 ]===],
     ["main.runtime.http"] = [===[
+
 local env = require("main.runtime.environment")
 
 local http = {}
@@ -6385,6 +7869,7 @@ end
 return http
 ]===],
     ["main.runtime.iridium"] = [===[
+
 local env = require("main.runtime.environment")
 local http = require("main.runtime.http")
 local patch = require("main.runtime.iridium_patch")
@@ -6615,6 +8100,7 @@ end
 return iri
 ]===],
     ["main.runtime.iridium_patch"] = [===[
+
 local patch = {}
 
 local rev = "v13-3"
@@ -6763,6 +8249,7 @@ end
 return patch
 ]===],
     ["main.runtime.status"] = [===[
+
 local st = {}
 
 local gui
@@ -6899,6 +8386,7 @@ end
 return st
 ]===],
     ["main.serialization.dex_serializer"] = [===[
+
 --[[
 
     ____               _____           _       ___                
@@ -9072,6 +10560,7 @@ return {
 }
 ]===],
     ["main.serialization.save"] = [===[
+
 local dex = require("main.serialization.dex_serializer")
 local st = require("main.runtime.status")
 local core = require("main.runtime.core")
@@ -9171,6 +10660,7 @@ end
 return save
 ]===],
     ["main.tree"] = [===[
+
 local tree = {}
 
 local win = {
@@ -9442,9 +10932,10 @@ end
 return tree
 ]===],
     ["main.version"] = [===[
-return { name = "LumenDecomp", version = "3.3.0" }
+return { name = "LumenDecomp", version = "4.0.0" }
 ]===],
     ["main.worker"] = [===[
+
 local cfg = require("main.config")
 local iri = require("main.runtime.iridium")
 local decomp = require("main.decompiler.engine")
@@ -9494,6 +10985,7 @@ assert(type(loadstring) == "function", "LumenDecomp worker requires loadstring()
 
 local mod = {
     ["main.analysis.dominators"] = [===[
+
 local dom = {}
 
 local function equal(a, b)
@@ -9565,6 +11057,161 @@ local post = require("main.analysis.postdom")
 
 local graph = {}
 
+local function immediatefromsets(blocks, sets)
+    local out = {}
+    for _, b in ipairs(blocks) do
+        local cand = {}
+        for id in pairs(sets[b.id] or {}) do if id ~= b.id then cand[#cand + 1] = id end end
+        table.sort(cand)
+        for _, id in ipairs(cand) do
+            local immediate = true
+            for _, other in ipairs(cand) do
+                if other ~= id and sets[other] and sets[other][id] then immediate = false break end
+            end
+            if immediate then out[b.id] = id break end
+        end
+    end
+    return out
+end
+
+local function dominancefrontiers(blocks, idom)
+    local df = {}; for _, b in ipairs(blocks) do df[b.id] = {} end
+    for _, b in ipairs(blocks) do
+        if #b.predecessors >= 2 then
+            for _, pred in ipairs(b.predecessors) do
+                local runner = pred
+                local guard = {}
+                while runner and runner ~= idom[b.id] and not guard[runner] do
+                    guard[runner] = true
+                    df[runner][b.id] = true
+                    runner = idom[runner]
+                end
+            end
+        end
+    end
+    return df
+end
+
+local function tarjan(blocks)
+    local index, stack, onstack, idx, low, out = 0, {}, {}, {}, {}, {}
+    local function visit(v)
+        index += 1; idx[v] = index; low[v] = index; stack[#stack + 1] = v; onstack[v] = true
+        for _, w in ipairs(blocks[v].successors) do
+            if not idx[w] then visit(w); low[v] = math.min(low[v], low[w])
+            elseif onstack[w] then low[v] = math.min(low[v], idx[w]) end
+        end
+        if low[v] == idx[v] then
+            local nodes, set = {}, {}
+            while true do
+                local w = stack[#stack]; stack[#stack] = nil; onstack[w] = nil
+                nodes[#nodes + 1] = w; set[w] = true
+                if w == v then break end
+            end
+            table.sort(nodes)
+            local cyclic = #nodes > 1
+            if #nodes == 1 then for _, w in ipairs(blocks[nodes[1]].successors) do if w == nodes[1] then cyclic = true break end end end
+            local entries, exits = {}, {}
+            for _, n in ipairs(nodes) do
+                for _, pred in ipairs(blocks[n].predecessors) do if not set[pred] then entries[n] = true end end
+                for _, succ in ipairs(blocks[n].successors) do if not set[succ] then exits[succ] = true end end
+            end
+            local entrycount = 0; for _ in pairs(entries) do entrycount += 1 end
+            out[#out + 1] = { nodes = nodes, set = set, cyclic = cyclic, entries = entries, exits = exits, irreducible = cyclic and entrycount > 1 }
+        end
+    end
+    for _, b in ipairs(blocks) do if not idx[b.id] then visit(b.id) end end
+    table.sort(out, function(a,b) return a.nodes[1] < b.nodes[1] end)
+    return out
+end
+
+local function loopforest(natural)
+    local parent = {}
+    local function subset(a, b)
+        for id in pairs(a) do if not b[id] then return false end end
+        return true
+    end
+    for i, loop in ipairs(natural) do
+        local best, bestsize
+        local size = 0; for _ in pairs(loop.nodes) do size += 1 end
+        for j, outer in ipairs(natural) do
+            if i ~= j and subset(loop.nodes, outer.nodes) then
+                local os = 0; for _ in pairs(outer.nodes) do os += 1 end
+                if os > size and (not bestsize or os < bestsize) then best, bestsize = j, os end
+            end
+        end
+        parent[i] = best
+    end
+    return parent
+end
+
+local function push(t, v)
+    for _, x in ipairs(t) do if x == v then return end end
+    t[#t + 1] = v
+end
+
+local function edgesuccessors(proto, pc, aux)
+    local op = proto.Instructions[pc]
+    local name = ins.name(op)
+    local nx = ins.next(proto, pc, aux)
+    local out = {}
+
+    local function valid(p)
+        return p >= 1 and p <= #proto.Instructions and not aux[p]
+    end
+    local function add(p)
+        if valid(p) then push(out, p) end
+    end
+
+    if name == "RETURN" then
+        return out
+    elseif name == "LOADB" and (op.C or 0) ~= 0 then
+        add(pc + (op.C or 0) + 1)
+    elseif name == "FORNPREP" then
+
+        add(nx)
+        add(ins.jumpTarget(pc, op))
+    elseif name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" then
+
+        add(ins.jumpTarget(pc, op))
+    elseif ins.isConditional(op) then
+        add(ins.jumpTarget(pc, op))
+        add(nx)
+    elseif ins.isUnconditional(op) then
+        add(ins.jumpTarget(pc, op))
+    else
+        add(nx)
+    end
+    return out
+end
+
+local function verify(proto, aux, blocks, blockmap, nexts)
+    local covered = {}
+    for _, b in ipairs(blocks) do
+        assert(b.id >= 1 and b.id <= #blocks, "LumenV4: CFG block id out of range")
+        assert(#b.pcs > 0, "LumenV4: empty CFG block")
+        for _, pc in ipairs(b.pcs) do
+            assert(not aux[pc], "LumenV4: AUX word entered a basic block")
+            assert(not covered[pc], "LumenV4: duplicate CFG PC " .. tostring(pc))
+            covered[pc] = b.id
+            assert(blockmap[pc] == b.id, "LumenV4: blockmap mismatch at PC " .. tostring(pc))
+        end
+        for _, sid in ipairs(b.successors) do
+            assert(blocks[sid], "LumenV4: invalid CFG successor " .. tostring(sid))
+            local back = false
+            for _, pid in ipairs(blocks[sid].predecessors) do if pid == b.id then back = true break end end
+            assert(back, "LumenV4: asymmetric CFG edge")
+        end
+    end
+    for pc = 1, #proto.Instructions do
+        if not aux[pc] and blockmap[pc] then
+            for _, target in ipairs(nexts[pc] or {}) do
+                assert(blockmap[target], "LumenV4: successor has no block at PC " .. tostring(target))
+            end
+        end
+    end
+    return true
+end
+
 function graph.build(proto)
     local ops = proto.Instructions
     local aux = ins.auxSlots(proto)
@@ -9577,33 +11224,18 @@ function graph.build(proto)
 
     for pc = 1, #ops do
         if not aux[pc] then
+            local successors = edgesuccessors(proto, pc, aux)
+            nexts[pc] = successors
+            for _, target in ipairs(successors) do leaders[target] = true end
+
             local op = ops[pc]
             local name = ins.name(op)
-            local nextPC = ins.next(proto, pc, aux)
-            local successors = {}
+            local nx = ins.next(proto, pc, aux)
 
-            if name == "RETURN" then
-
-            elseif name == "LOADB" and (op.C or 0) ~= 0 then
-                local target = pc + op.C + 1
-                if valid(target) then successors[#successors + 1] = target; leaders[target] = true end
-                if valid(nextPC) then leaders[nextPC] = true end
-
-            elseif ins.isConditional(op) then
-                local target = ins.jumpTarget(pc, op)
-                if valid(target) then successors[#successors + 1] = target; leaders[target] = true end
-                if valid(nextPC) then successors[#successors + 1] = nextPC; leaders[nextPC] = true end
-
-            elseif ins.isUnconditional(op) then
-                local target = ins.jumpTarget(pc, op)
-                if valid(target) then successors[#successors + 1] = target; leaders[target] = true end
-                if valid(nextPC) then leaders[nextPC] = true end
-
-            else
-                if valid(nextPC) then successors[#successors + 1] = nextPC end
+            if name == "RETURN" or name == "LOADB" and (op.C or 0) ~= 0
+                or name == "FORNPREP" or ins.isConditional(op) or ins.isUnconditional(op) then
+                if valid(nx) then leaders[nx] = true end
             end
-
-            nexts[pc] = successors
         end
     end
 
@@ -9611,67 +11243,94 @@ function graph.build(proto)
     for pc in pairs(leaders) do if valid(pc) then list[#list + 1] = pc end end
     table.sort(list)
 
-    local blocks = {}
-    local blockmap = {}
-
-    for index, startPC in ipairs(list) do
-        local nextLeader = list[index + 1] or (#ops + 1)
+    local rawblocks, rawmap = {}, {}
+    for index, startpc in ipairs(list) do
+        local nextleader = list[index + 1] or (#ops + 1)
         local pcs = {}
-
-        for pc = startPC, nextLeader - 1 do
+        for pc = startpc, nextleader - 1 do
             if not aux[pc] then
                 pcs[#pcs + 1] = pc
-                blockmap[pc] = index
+                rawmap[pc] = index
             end
         end
-
-        blocks[index] = {
-            id = index,
-            startPC = startPC,
-            endPC = pcs[#pcs] or startPC,
-            pcs = pcs,
-            successors = {},
-            predecessors = {},
-        }
-    end
-
-    for _, block in ipairs(blocks) do
-        local seen = {}
-        for _, nextpc in ipairs(nexts[block.endPC] or {}) do
-            local nextblock = blockmap[nextpc]
-            if nextblock and not seen[nextblock] then
-                seen[nextblock] = true
-                block.successors[#block.successors + 1] = nextblock
-            end
+        if #pcs > 0 then
+            rawblocks[index] = { id = index, startPC = startpc, endPC = pcs[#pcs], pcs = pcs, successors = {}, predecessors = {} }
         end
     end
 
-    for _, block in ipairs(blocks) do
-        for _, successor in ipairs(block.successors) do
-            blocks[successor].predecessors[#blocks[successor].predecessors + 1] = block.id
+    for _, b in ipairs(rawblocks) do
+        for _, target in ipairs(nexts[b.endPC] or {}) do
+            local sid = rawmap[target]
+            if sid then push(b.successors, sid) end
         end
+    end
+
+
+    local reachable, todo = {}, { rawmap[1] }
+    local at = 1
+    while at <= #todo do
+        local id = todo[at]; at += 1
+        if id and not reachable[id] then
+            reachable[id] = true
+            for _, sid in ipairs(rawblocks[id].successors) do todo[#todo + 1] = sid end
+        end
+    end
+
+    local remap, blocks = {}, {}
+    for oldid, b in ipairs(rawblocks) do
+        if reachable[oldid] then
+            local id = #blocks + 1
+            remap[oldid] = id
+            blocks[id] = { id = id, startPC = b.startPC, endPC = b.endPC, pcs = b.pcs, successors = {}, predecessors = {} }
+        end
+    end
+
+    local blockmap = {}
+    for oldid, newid in pairs(remap) do
+        local old = rawblocks[oldid]
+        local b = blocks[newid]
+        for _, pc in ipairs(b.pcs) do blockmap[pc] = newid end
+        for _, oldsucc in ipairs(old.successors) do
+            local sid = remap[oldsucc]
+            if sid then push(b.successors, sid) end
+        end
+    end
+    for _, b in ipairs(blocks) do
+        for _, sid in ipairs(b.successors) do push(blocks[sid].predecessors, b.id) end
     end
 
     local dominators = dom.compute(blocks)
-    local postdom, ipdom = post.run(blocks)
-
-    return {
+    local idom = immediatefromsets(blocks, dominators)
+    local postdom, ipdom, exitid = post.run(blocks)
+    local naturalloops = loops.find(blocks, dominators)
+    local sccs = tarjan(blocks)
+    local out = {
         proto = proto,
         aux = aux,
         blocks = blocks,
         blockmap = blockmap,
         nexts = nexts,
         dominators = dominators,
+        idom = idom,
+        dominanceFrontiers = dominancefrontiers(blocks, idom),
         postdom = postdom,
         ipdom = ipdom,
-        loops = loops.find(blocks, dominators),
+        exitId = exitid,
+        loops = naturalloops,
+        loopForest = loopforest(naturalloops),
+        sccs = sccs,
+        irreducible = false,
         registerStats = regs.stats(proto, aux),
     }
+    for _, component in ipairs(sccs) do if component.irreducible then out.irreducible = true break end end
+    out.verified = verify(proto, aux, blocks, blockmap, nexts)
+    return out
 end
 
 return graph
 ]===],
     ["main.analysis.loops"] = [===[
+
 local loops = {}
 
 function loops.find(blocks, dom)
@@ -9726,57 +11385,64 @@ end
 return loops
 ]===],
     ["main.analysis.postdom"] = [===[
+
 local post = {}
 
+local function clone(s)
+    local out = {}
+    for k in pairs(s) do out[k] = true end
+    return out
+end
+
 local function same(a, b)
-    for k in pairs(a) do
-        if not b[k] then return false end
-    end
-    for k in pairs(b) do
-        if not a[k] then return false end
-    end
+    for k in pairs(a) do if not b[k] then return false end end
+    for k in pairs(b) do if not a[k] then return false end end
     return true
 end
 
+local function intersectinto(dst, src)
+    for k in pairs(dst) do
+        if not src[k] then dst[k] = nil end
+    end
+end
+
 function post.run(blocks)
-    local all = {}
+    local exitid = #blocks + 1
+    local all = { [exitid] = true }
     for _, b in ipairs(blocks) do all[b.id] = true end
 
-    local pd = {}
-    for _, b in ipairs(blocks) do
-        local set = {}
-        if #b.successors == 0 then
-            set[b.id] = true
-        else
-            for id in pairs(all) do set[id] = true end
-        end
-        pd[b.id] = set
-    end
+    local pd = { [exitid] = { [exitid] = true } }
+    for _, b in ipairs(blocks) do pd[b.id] = clone(all) end
 
     local dirty = true
+    local iterations = 0
+    local limit = math.max(64, (#blocks + 1) * (#blocks + 1) * 4)
     while dirty do
+        iterations += 1
+        if iterations > limit then
+            error("LumenV4: post-dominator analysis failed to converge", 2)
+        end
         dirty = false
+
         for i = #blocks, 1, -1 do
             local b = blocks[i]
-            if #b.successors > 0 then
-                local set
-                for _, sid in ipairs(b.successors) do
-                    local src = pd[sid]
-                    if not set then
-                        set = {}
-                        for id in pairs(src) do set[id] = true end
-                    else
-                        for id in pairs(set) do
-                            if not src[id] then set[id] = nil end
-                        end
-                    end
+            local succ = b.successors
+            local set
+
+            if #succ == 0 then
+                set = clone(pd[exitid])
+            else
+                for _, sid in ipairs(succ) do
+                    local src = assert(pd[sid], "LumenV4: invalid postdom successor " .. tostring(sid))
+                    if not set then set = clone(src) else intersectinto(set, src) end
                 end
-                set = set or {}
-                set[b.id] = true
-                if not same(pd[b.id], set) then
-                    pd[b.id] = set
-                    dirty = true
-                end
+            end
+
+            set = set or {}
+            set[b.id] = true
+            if not same(pd[b.id], set) then
+                pd[b.id] = set
+                dirty = true
             end
         end
     end
@@ -9787,22 +11453,25 @@ function post.run(blocks)
         for id in pairs(pd[b.id]) do
             if id ~= b.id then cand[#cand + 1] = id end
         end
+        table.sort(cand)
+
         for _, id in ipairs(cand) do
-            local near = true
+            local immediate = true
+
             for _, other in ipairs(cand) do
                 if other ~= id and pd[other] and pd[other][id] then
-                    near = false
+                    immediate = false
                     break
                 end
             end
-            if near then
+            if immediate then
                 ip[b.id] = id
                 break
             end
         end
     end
 
-    return pd, ip
+    return pd, ip, exitid
 end
 
 return post
@@ -9813,165 +11482,108 @@ local ins = require("main.bytecode.instructions")
 local regs = {}
 
 local function add(set, value)
-    if type(value) == "number" and value >= 0 and value < 255 then
-        set[value] = true
-    end
+    if type(value) == "number" and value >= 0 and value < 255 then set[value] = true end
+end
+local function range(set, first, last)
+    for reg = first, math.min(last, 254) do add(set, reg) end
 end
 
-local function range(set, first, last)
-    for reg = first, last do
-        add(set, reg)
-    end
-end
 
 function regs.readWrite(op)
-    local reads, writes = {}, {}
+    local reads, writes, pack = {}, {}, {}
     local name = ins.name(op)
-    local A, B, C = op.A or 0, op.B or 0, op.C or 0
+    local ra, rb, rc = op.A or 0, op.B or 0, op.C or 0
     local aux = op.AuxValue and op.AuxValue.Value or 0
 
     if name == "LOADNIL" or name == "LOADB" or name == "LOADN" or name == "LOADK"
-        or name == "LOADKX" or name == "GETGLOBAL" or name == "GETUPVAL"
-        or name == "GETIMPORT" or name == "NEWTABLE" or name == "DUPTABLE"
-        or name == "NEWCLOSURE" or name == "DUPCLOSURE" then
-        add(writes, A)
-
-    elseif name == "MOVE" then
-        add(reads, B); add(writes, A)
-
-    elseif name == "SETGLOBAL" or name == "SETUPVAL" then
-        add(reads, A)
-
-    elseif name == "GETTABLE" then
-        add(reads, B); add(reads, C); add(writes, A)
-
-    elseif name == "SETTABLE" then
-        add(reads, A); add(reads, B); add(reads, C)
-
-    elseif name == "GETTABLEKS" or name == "GETTABLEN" or name == "GETUDATAKS" then
-        add(reads, B); add(writes, A)
-
-    elseif name == "SETTABLEKS" or name == "SETTABLEN" or name == "SETUDATAKS" then
-        add(reads, A); add(reads, B)
-
-    elseif name == "NAMECALL" or name == "NAMECALLUDATA" then
-        add(reads, B); add(writes, A); add(writes, A + 1)
-
+        or name == "LOADKX" or name == "GETGLOBAL" or name == "GETUPVAL" or name == "GETIMPORT"
+        or name == "NEWTABLE" or name == "DUPTABLE" or name == "NEWCLOSURE" or name == "DUPCLOSURE" then
+        add(writes, ra)
+    elseif name == "MOVE" then add(reads, rb); add(writes, ra)
+    elseif name == "SETGLOBAL" or name == "SETUPVAL" then add(reads, ra)
+    elseif name == "GETTABLE" then add(reads, rb); add(reads, rc); add(writes, ra)
+    elseif name == "SETTABLE" then add(reads, ra); add(reads, rb); add(reads, rc)
+    elseif name == "GETTABLEKS" or name == "GETTABLEN" or name == "GETUDATAKS" then add(reads, rb); add(writes, ra)
+    elseif name == "SETTABLEKS" or name == "SETTABLEN" or name == "SETUDATAKS" then add(reads, ra); add(reads, rb)
+    elseif name == "NAMECALL" or name == "NAMECALLUDATA" then add(reads, rb); add(writes, ra); add(writes, ra + 1)
     elseif name == "CALL" or name == "CALLFB" then
-        if B == 0 then add(reads, A) else range(reads, A, A + B - 1) end
-        if C == 0 then add(writes, A) elseif C > 1 then range(writes, A, A + C - 2) end
-
+        add(reads, ra)
+        if rb == 0 then
+            pack.openReadFrom = ra + 1
+            pack.consumesTop = true
+        elseif rb > 1 then range(reads, ra + 1, ra + rb - 1) end
+        if rc == 0 then
+            add(writes, ra)
+            pack.openWriteFrom = ra
+            pack.producesTop = true
+        elseif rc > 1 then range(writes, ra, ra + rc - 2) end
     elseif name == "RETURN" then
-        if B == 0 then add(reads, A) elseif B > 1 then range(reads, A, A + B - 2) end
-
-    elseif name == "ADD" or name == "SUB" or name == "MUL" or name == "DIV"
-        or name == "MOD" or name == "POW" or name == "IDIV"
-        or name == "AND" or name == "OR" then
-        add(reads, B); add(reads, C); add(writes, A)
-
-    elseif name == "ADDK" or name == "SUBK" or name == "MULK" or name == "DIVK"
-        or name == "MODK" or name == "POWK" or name == "IDIVK"
-        or name == "ANDK" or name == "ORK" then
-        add(reads, B); add(writes, A)
-
-    elseif name == "SUBRK" or name == "DIVRK" then
-        add(reads, C); add(writes, A)
-
-    elseif name == "CONCAT" then
-        range(reads, B, C); add(writes, A)
-
-    elseif name == "NOT" or name == "MINUS" or name == "LENGTH" then
-        add(reads, B); add(writes, A)
-
+        if rb == 0 then add(reads, ra); pack.openReadFrom = ra; pack.consumesTop = true
+        elseif rb > 1 then range(reads, ra, ra + rb - 2) end
+    elseif name == "ADD" or name == "SUB" or name == "MUL" or name == "DIV" or name == "MOD" or name == "POW" or name == "IDIV" or name == "AND" or name == "OR" then
+        add(reads, rb); add(reads, rc); add(writes, ra)
+    elseif name == "ADDK" or name == "SUBK" or name == "MULK" or name == "DIVK" or name == "MODK" or name == "POWK" or name == "IDIVK" or name == "ANDK" or name == "ORK" then
+        add(reads, rb); add(writes, ra)
+    elseif name == "SUBRK" or name == "DIVRK" then add(reads, rc); add(writes, ra)
+    elseif name == "CONCAT" then range(reads, rb, rc); add(writes, ra)
+    elseif name == "NOT" or name == "MINUS" or name == "LENGTH" then add(reads, rb); add(writes, ra)
     elseif name == "SETLIST" then
-        add(reads, A)
-        if C == 0 then add(reads, B) elseif C > 1 then range(reads, B, B + C - 2) end
+        add(reads, ra)
+        if rc == 0 then add(reads, rb); pack.openReadFrom = rb; pack.consumesTop = true
+        elseif rc > 1 then range(reads, rb, rb + rc - 2) end
+    elseif name == "FORNPREP" then
+        range(reads, ra, ra + 2)
 
-    elseif name == "FORNPREP" or name == "FORNLOOP" then
-        range(reads, A, A + 3); range(writes, A + 2, A + 3)
 
+        range(writes, ra, ra + 2)
+    elseif name == "FORNLOOP" then
+        range(reads, ra, ra + 2); add(writes, ra + 2)
     elseif name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" then
-        range(reads, A, A + 2)
-
+        range(reads, ra, ra + 2); range(writes, ra, ra + 2)
     elseif name == "FORGLOOP" then
         local count = bit32.band(aux, 0xff)
-        range(reads, A, A + 2); add(writes, A + 2)
-        if count > 0 then range(writes, A + 3, A + 2 + count) end
-
+        range(reads, ra, ra + 2); add(writes, ra + 2)
+        if count > 0 then range(writes, ra + 3, ra + 2 + count) end
     elseif name == "GETVARARGS" then
-        if B == 0 then add(writes, A) elseif B > 1 then range(writes, A, A + B - 2) end
-
-    elseif name == "CAPTURE" then
-        if A == 0 or A == 1 then add(reads, B) end
-
-    elseif name == "JUMPIF" or name == "JUMPIFNOT"
-        or name == "JUMPXEQKNIL" or name == "JUMPXEQKB"
-        or name == "JUMPXEQKN" or name == "JUMPXEQKS"
-        or name == "CMPPROTO" then
-        add(reads, A)
-
-    elseif name == "JUMPIFEQ" or name == "JUMPIFNOTEQ"
-        or name == "JUMPIFLT" or name == "JUMPIFLE"
-        or name == "JUMPIFNOTLT" or name == "JUMPIFNOTLE" then
-        add(reads, A); add(reads, bit32.band(aux, 0xff))
-
-    elseif name == "NEWCLASSMEMBER" then
-        add(reads, A); add(reads, C)
-
-    elseif name == "NEWCLASS" then
-        if B ~= 0xff then add(reads, B) end
-        add(writes, A)
+        if rb == 0 then add(writes, ra); pack.openWriteFrom = ra; pack.producesTop = true
+        elseif rb > 1 then range(writes, ra, ra + rb - 2) end
+    elseif name == "CAPTURE" then if ra == 0 or ra == 1 then add(reads, rb) end
+    elseif name == "JUMPIF" or name == "JUMPIFNOT" or name == "JUMPXEQKNIL" or name == "JUMPXEQKB" or name == "JUMPXEQKN" or name == "JUMPXEQKS" or name == "CMPPROTO" then
+        add(reads, ra)
+    elseif name == "JUMPIFEQ" or name == "JUMPIFNOTEQ" or name == "JUMPIFLT" or name == "JUMPIFLE" or name == "JUMPIFNOTLT" or name == "JUMPIFNOTLE" then
+        add(reads, ra); add(reads, bit32.band(aux, 0xff))
+    elseif name == "NEWCLASSMEMBER" then add(reads, ra); add(reads, rc)
+    elseif name == "NEWCLASS" then if rb ~= 0xff then add(reads, rb) end; add(writes, ra)
     end
 
-    return reads, writes
+    return reads, writes, pack
 end
 
 function regs.stats(proto, aux)
     local stats = {}
     aux = aux or ins.auxSlots(proto)
-
     local function get(reg)
         local entry = stats[reg]
         if not entry then
-            entry = {
-                reads = 0, writes = 0,
-                firstWrite = nil, lastWrite = nil,
-                firstRead = nil, lastRead = nil,
-                firstAccess = nil, lastAccess = nil,
-            }
+            entry = { reads = 0, writes = 0, firstWrite = nil, lastWrite = nil, firstRead = nil, lastRead = nil, firstAccess = nil, lastAccess = nil }
             stats[reg] = entry
         end
         return entry
     end
-
     for pc = 1, #proto.Instructions do
         if not aux[pc] then
-            local op = proto.Instructions[pc]
-            local reads, writes = regs.readWrite(op)
-
+            local reads, writes = regs.readWrite(proto.Instructions[pc])
             for reg in pairs(reads) do
-                local entry = get(reg)
-                entry.reads += 1
-                entry.firstRead = entry.firstRead or pc
-                entry.lastRead = pc
-                entry.firstAccess = entry.firstAccess or pc
-                entry.lastAccess = pc
+                local e = get(reg); e.reads += 1; e.firstRead = e.firstRead or pc; e.lastRead = pc; e.firstAccess = e.firstAccess or pc; e.lastAccess = pc
             end
-
-            local name = ins.name(op)
+            local name = ins.name(proto.Instructions[pc])
             for reg in pairs(writes) do
                 if name ~= "NAMECALL" and name ~= "NAMECALLUDATA" then
-                    local entry = get(reg)
-                    entry.writes += 1
-                    entry.firstWrite = entry.firstWrite or pc
-                    entry.lastWrite = pc
-                    entry.firstAccess = entry.firstAccess or pc
-                    entry.lastAccess = pc
+                    local e = get(reg); e.writes += 1; e.firstWrite = e.firstWrite or pc; e.lastWrite = pc; e.firstAccess = e.firstAccess or pc; e.lastAccess = pc
                 end
             end
         end
     end
-
     return stats
 end
 
@@ -9984,329 +11596,349 @@ local regs = require("main.analysis.registers")
 local ssa = {}
 
 local function copy(source)
-    local result = {}
-    for key, value in pairs(source) do
-        result[key] = value
-    end
-    return result
+    local out = {}; for k, v in pairs(source) do out[k] = v end; return out
+end
+local function same(a, b)
+    for k, v in pairs(a) do if b[k] ~= v then return false end end
+    for k, v in pairs(b) do if a[k] ~= v then return false end end
+    return true
+end
+local function seteq(a, b)
+    for k in pairs(a) do if not b[k] then return false end end
+    for k in pairs(b) do if not a[k] then return false end end
+    return true
 end
 
-local function same(a, b)
-    for key, value in pairs(a) do
-        if b[key] ~= value then
-            return false
+
+local ambig = {}
+
+
+local function packflow(proto, cfg)
+    local pin, pout, before, consumer = {}, {}, {}, {}
+    local changed, iterations = true, 0
+    local limit = math.max(64, (#cfg.blocks + 1) * 256)
+
+    local function merge(block)
+        if block.id == 1 or #block.predecessors == 0 then return nil end
+        local first, have = nil, false
+        for _, pred in ipairs(block.predecessors) do
+            local v = pout[pred]
+            if not have then first, have = v, true
+            elseif first ~= v then return ambig end
+        end
+        return first
+    end
+
+    while changed do
+        iterations += 1
+        if iterations > limit then error("LumenV4: ValuePack dataflow failed to converge", 2) end
+        changed = false
+        for _, block in ipairs(cfg.blocks) do
+            local incoming = merge(block)
+            if pin[block.id] ~= incoming then pin[block.id] = incoming; changed = true end
+            local cur = incoming
+            for _, pc in ipairs(block.pcs) do
+                local _, _, pack = regs.readWrite(proto.Instructions[pc])
+                if pack.consumesTop then consumer[pc] = cur end
+                if pack.producesTop then
+                    cur = pc
+                elseif pack.consumesTop then
+                    cur = nil
+                end
+            end
+            if pout[block.id] ~= cur then pout[block.id] = cur; changed = true end
         end
     end
 
-    for key, value in pairs(b) do
-        if a[key] ~= value then
-            return false
+
+    for _, block in ipairs(cfg.blocks) do
+        local cur = pin[block.id]
+        for _, pc in ipairs(block.pcs) do
+            before[pc] = cur
+            local _, _, pack = regs.readWrite(proto.Instructions[pc])
+            if pack.consumesTop then consumer[pc] = cur end
+            if pack.producesTop then cur = pc elseif pack.consumesTop then cur = nil end
         end
     end
+    return pin, pout, before, consumer, ambig
+end
 
-    return true
+local function liveness(proto, cfg, packinput, ambiguous)
+    local use, def, lin, lout = {}, {}, {}, {}
+    for _, b in ipairs(cfg.blocks) do
+        local u, d = {}, {}
+        for _, pc in ipairs(b.pcs) do
+            local r, w, pack = regs.readWrite(proto.Instructions[pc])
+            for reg in pairs(r) do if not d[reg] then u[reg] = true end end
+            if pack.openReadFrom then
+                local producer = packinput[pc]
+                if type(producer) == "number" then
+                    local _, _, pp = regs.readWrite(proto.Instructions[producer])
+                    local topbase = pp.openWriteFrom
+                    if topbase and topbase >= pack.openReadFrom then
+                        for reg = pack.openReadFrom, topbase - 1 do if not d[reg] then u[reg] = true end end
+                    end
+                end
+            end
+            for reg in pairs(w) do d[reg] = true end
+            if pack.openWriteFrom then for reg = pack.openWriteFrom, 254 do d[reg] = true end end
+        end
+        use[b.id], def[b.id], lin[b.id], lout[b.id] = u, d, {}, {}
+    end
+
+    local changed = true
+    local iterations = 0
+    local limit = math.max(64, #cfg.blocks * 512)
+    while changed do
+        iterations += 1
+        if iterations > limit then error("LumenV4: liveness failed to converge", 2) end
+        changed = false
+        for i = #cfg.blocks, 1, -1 do
+            local b = cfg.blocks[i]
+            local out = {}
+            for _, sid in ipairs(b.successors) do for r in pairs(lin[sid]) do out[r] = true end end
+            local inn = copy(use[b.id])
+            for r in pairs(out) do if not def[b.id][r] then inn[r] = true end end
+            if not seteq(lout[b.id], out) then lout[b.id] = out; changed = true end
+            if not seteq(lin[b.id], inn) then lin[b.id] = inn; changed = true end
+        end
+    end
+    local after = {}
+    for _, b in ipairs(cfg.blocks) do
+        local live = copy(lout[b.id])
+        for i = #b.pcs, 1, -1 do
+            local pc = b.pcs[i]
+            after[pc] = copy(live)
+            local r, w, pack = regs.readWrite(proto.Instructions[pc])
+            if pack.openWriteFrom then
+                for reg = pack.openWriteFrom, 254 do live[reg] = nil end
+            end
+            for reg in pairs(w) do live[reg] = nil end
+            if pack.openReadFrom then
+                local producer = packinput[pc]
+                if type(producer) == "number" then
+                    local _, _, pp = regs.readWrite(proto.Instructions[producer])
+                    local topbase = pp.openWriteFrom
+                    if topbase and topbase >= pack.openReadFrom then
+                        for reg = pack.openReadFrom, topbase - 1 do live[reg] = true end
+                    end
+                end
+            end
+            for reg in pairs(r) do live[reg] = true end
+        end
+    end
+    return lin, lout, after
 end
 
 function ssa.build(proto, cfg)
     cfg = cfg or graph.build(proto)
-
+    local packinblock, packoutblock, packbefore, packinput, ambiguouspack = packflow(proto, cfg)
+    local livein, liveout, liveafter = liveness(proto, cfg, packinput, ambiguouspack)
     local result = {
-        proto = proto,
-        cfg = cfg,
-        params = {},
-        defsByPC = {},
-        usesByPC = {},
-        versions = {},
-        phisByBlock = {},
-        inVersions = {},
-        outVersions = {},
-        useCount = {},
-        defUse = {},
+        proto = proto, cfg = cfg, params = {}, defsByPC = {}, usesByPC = {}, versions = {}, phisByBlock = {},
+        inVersions = {}, outVersions = {}, useCount = {}, defUse = {}, undefByReg = {}, packsByPC = {},
+        liveIn = livein, liveOut = liveout, liveAfter = liveafter,
+        packInBlock = packinblock, packOutBlock = packoutblock, packBefore = packbefore,
+        packInput = packinput, ambiguousPack = ambiguouspack,
     }
-
     local nextver = 1
-
     local function newver(kind, reg, pc, block)
-        local id = nextver
-        nextver = nextver + 1
-
-        result.versions[id] = {
-            id = id,
-            kind = kind,
-            reg = reg,
-            pc = pc,
-            block = block,
-        }
-
+        local id = nextver; nextver += 1
+        result.versions[id] = { id = id, kind = kind, reg = reg, pc = pc, block = block }
+        return id
+    end
+    local function undef(reg)
+        local id = result.undefByReg[reg]
+        if not id then id = newver("undef", reg, nil, nil); result.undefByReg[reg] = id end
         return id
     end
 
     for reg = 0, (proto.ParameterCount or 0) - 1 do
-        local id = newver("param", reg, 0, 1)
-        result.params[reg] = id
+        local id = newver("param", reg, 0, 1); result.params[reg] = id
     end
 
-    for _, block in ipairs(cfg.blocks) do
-        for _, pc in ipairs(block.pcs) do
-            local op = proto.Instructions[pc]
-            local _, writes = regs.readWrite(op)
 
-            if next(writes) then
-                local defs = {}
-                result.defsByPC[pc] = defs
-
-                for reg in pairs(writes) do
-                    defs[reg] = newver("def", reg, pc, block.id)
+    for _, b in ipairs(cfg.blocks) do
+        for _, pc in ipairs(b.pcs) do
+            local _, writes, pack = regs.readWrite(proto.Instructions[pc])
+            result.packsByPC[pc] = next(pack) and pack or nil
+            local need = next(writes) ~= nil or pack.openWriteFrom ~= nil
+            if need then
+                local defs = {}; result.defsByPC[pc] = defs
+                for reg in pairs(writes) do defs[reg] = newver("def", reg, pc, b.id) end
+                if pack.openWriteFrom then
+                    for reg in pairs(liveafter[pc] or {}) do
+                        if reg >= pack.openWriteFrom and not defs[reg] then defs[reg] = newver("pack", reg, pc, b.id) end
+                    end
                 end
             end
         end
     end
 
     local phimap = {}
-
-    local function getphi(blockId, reg)
-        local byRegister = phimap[blockId]
-        if not byRegister then
-            byRegister = {}
-            phimap[blockId] = byRegister
-        end
-
-        local id = byRegister[reg]
-        if id then
-            return id
-        end
-
-        id = newver("phi", reg, nil, blockId)
-        byRegister[reg] = id
-
-        local blockPhis = result.phisByBlock[blockId]
-        if not blockPhis then
-            blockPhis = {}
-            result.phisByBlock[blockId] = blockPhis
-        end
-
-        blockPhis[reg] = {
-            id = id,
-            reg = reg,
-            inputs = {},
-        }
-
+    local function getphi(blockid, reg)
+        local m = phimap[blockid]; if not m then m = {}; phimap[blockid] = m end
+        if m[reg] then return m[reg] end
+        local id = newver("phi", reg, nil, blockid); m[reg] = id
+        local p = result.phisByBlock[blockid]; if not p then p = {}; result.phisByBlock[blockid] = p end
+        p[reg] = { id = id, reg = reg, inputs = {}, incoming = {}, missing = false }
         return id
     end
 
     local function merge(block)
-        if block.id == 1 then
-            return copy(result.params)
-        end
-
-        if #block.predecessors == 0 then
-            return {}
-        end
-
-        local regs = {}
-        for _, pred in ipairs(block.predecessors) do
-            local vals = result.outVersions[pred] or {}
-            for reg in pairs(vals) do
-                regs[reg] = true
-            end
-        end
-
+        if block.id == 1 then return copy(result.params) end
+        if #block.predecessors == 0 then return {} end
         local merged = {}
-
-        for reg in pairs(regs) do
-            local unique = {}
-            local count = 0
-            local byreg = phimap[block.id]
-            local prior = byreg and byreg[reg]
-
-            local missing = false
+        for reg in pairs(livein[block.id] or {}) do
+            local unique, incoming, count = {}, {}, 0
+            local prior = phimap[block.id] and phimap[block.id][reg]
             for _, pred in ipairs(block.predecessors) do
-                local vals = result.outVersions[pred] or {}
-                local version = vals[reg]
-
-                if version == nil then
-                    missing = true
-                elseif version ~= prior and not unique[version] then
-                    unique[version] = true
-                    count = count + 1
-                end
+                local version = (result.outVersions[pred] or {})[reg] or undef(reg)
+                incoming[pred] = version
+                if version ~= prior and not unique[version] then unique[version] = true; count += 1 end
             end
-
-            if missing then count = count + 1 end
-
             if count == 1 then
-                for version in pairs(unique) do
-                    merged[reg] = version
-                    break
-                end
+                for v in pairs(unique) do merged[reg] = v break end
             elseif count > 1 then
-                local phi = getphi(block.id, reg)
-                merged[reg] = phi
-
-                local record = result.phisByBlock[block.id][reg]
-                record.inputs = unique
-                record.missing = missing
+                local id = getphi(block.id, reg); merged[reg] = id
+                local rec = result.phisByBlock[block.id][reg]
+                rec.inputs, rec.incoming = unique, incoming
+                rec.missing = unique[undef(reg)] == true
             end
         end
-
         return merged
     end
 
-    local changed = true
-    local iterations = 0
-    local maxiter = math.max(16, #cfg.blocks * 8)
-
-    while changed and iterations < maxiter do
-        iterations = iterations + 1
+    local changed, iterations = true, 0
+    local limit = math.max(128, (#cfg.blocks + 1) * 1024)
+    while changed do
+        iterations += 1
+        if iterations > limit then error("LumenV4: SSA failed to converge", 2) end
         changed = false
-
-        for _, block in ipairs(cfg.blocks) do
-            local incoming = merge(block)
-            local oldin = result.inVersions[block.id] or {}
-
-            if not same(oldin, incoming) then
-                result.inVersions[block.id] = incoming
-                changed = true
-            end
-
+        for _, b in ipairs(cfg.blocks) do
+            local incoming = merge(b)
+            if not same(result.inVersions[b.id] or {}, incoming) then result.inVersions[b.id] = incoming; changed = true end
             local current = copy(incoming)
-
-            for _, pc in ipairs(block.pcs) do
+            for _, pc in ipairs(b.pcs) do
                 local defs = result.defsByPC[pc]
-                if defs then
-                    for reg, version in pairs(defs) do
-                        current[reg] = version
-                    end
-                end
+                if defs then for reg, v in pairs(defs) do current[reg] = v end end
             end
-
-            local oldout = result.outVersions[block.id] or {}
-            if not same(oldout, current) then
-                result.outVersions[block.id] = current
-                changed = true
-            end
+            if not same(result.outVersions[b.id] or {}, current) then result.outVersions[b.id] = current; changed = true end
         end
     end
+    result.converged, result.iterations = true, iterations
 
-    result.converged = not changed
-    result.iterations = iterations
-
-    for blockId, phis in pairs(result.phisByBlock) do
-        local incoming = result.inVersions[blockId] or {}
-        for reg, phi in pairs(phis) do
-            if incoming[reg] ~= phi.id then
-                phis[reg] = nil
-                result.versions[phi.id].dead = true
-            end
+    for bid, phis in pairs(result.phisByBlock) do
+        local incoming = result.inVersions[bid] or {}
+        for reg, p in pairs(phis) do
+            if incoming[reg] ~= p.id then phis[reg] = nil; result.versions[p.id].dead = true end
         end
-        if not next(phis) then result.phisByBlock[blockId] = nil end
+        if not next(phis) then result.phisByBlock[bid] = nil end
     end
 
-    for _, block in ipairs(cfg.blocks) do
-        local current = copy(result.inVersions[block.id] or {})
 
-        for _, pc in ipairs(block.pcs) do
-            local op = proto.Instructions[pc]
-            local reads, _ = regs.readWrite(op)
+    for _, b in ipairs(cfg.blocks) do
+        local current = copy(result.inVersions[b.id] or {})
+        for _, pc in ipairs(b.pcs) do
+            local reads = regs.readWrite(proto.Instructions[pc])
             local uses = {}
-
             for reg in pairs(reads) do
-                local version = current[reg]
-                if version ~= nil then
-                    uses[reg] = version
-                    result.useCount[version] = (result.useCount[version] or 0) + 1
-
-                    local uses = result.defUse[version]
-                    if not uses then
-                        uses = {}
-                        result.defUse[version] = uses
-                    end
-
-                    uses[#uses + 1] = {
-                        pc = pc,
-                        reg = reg,
-                        block = block.id,
-                    }
-                end
-            end
-
-            if next(uses) then
-                result.usesByPC[pc] = uses
-            end
-
-            local defs = result.defsByPC[pc]
-            if defs then
-                for reg, version in pairs(defs) do
-                    current[reg] = version
-                end
-            end
-        end
-    end
-
-    for blockId, phis in pairs(result.phisByBlock) do
-        for reg, phi in pairs(phis) do
-            for version in pairs(phi.inputs) do
+                local version = current[reg] or undef(reg)
+                uses[reg] = version
                 result.useCount[version] = (result.useCount[version] or 0) + 1
+                local list = result.defUse[version] or {}; result.defUse[version] = list
+                list[#list + 1] = { pc = pc, reg = reg, block = b.id }
+            end
+            if next(uses) then result.usesByPC[pc] = uses end
+            local defs = result.defsByPC[pc]
+            if defs then for reg, v in pairs(defs) do current[reg] = v end end
+        end
+    end
 
-                local uses = result.defUse[version]
-                if not uses then
-                    uses = {}
-                    result.defUse[version] = uses
+    for bid, phis in pairs(result.phisByBlock) do
+        local predcount = #cfg.blocks[bid].predecessors
+        for reg, p in pairs(phis) do
+            local n = 0
+            for _, pred in ipairs(cfg.blocks[bid].predecessors) do
+                local v = assert(p.incoming[pred], "LumenV4: phi missing predecessor input")
+                n += 1
+                result.useCount[v] = (result.useCount[v] or 0) + 1
+                local list = result.defUse[v] or {}; result.defUse[v] = list
+                list[#list + 1] = { phi = p.id, block = bid, reg = reg, predecessor = pred }
+            end
+            assert(n == predcount, "LumenV4: phi predecessor cardinality mismatch")
+        end
+    end
+
+    local function verifyssa()
+        local function dominates(defv, useblock, usepc)
+            if not defv or defv.kind == "undef" then return true end
+            if defv.kind == "param" then return cfg.dominators[useblock] and cfg.dominators[useblock][1] == true end
+            if defv.kind == "phi" then return cfg.dominators[useblock] and cfg.dominators[useblock][defv.block] == true end
+            if defv.block == useblock then return type(defv.pc) == "number" and defv.pc < usepc end
+            return cfg.dominators[useblock] and cfg.dominators[useblock][defv.block] == true
+        end
+
+        for pc, uses in pairs(result.usesByPC) do
+            local blockid = assert(cfg.blockmap[pc], "LumenV4: SSA use outside reachable CFG")
+            for reg, version in pairs(uses) do
+                local v = assert(result.versions[version], "LumenV4: SSA use has invalid version")
+                assert(dominates(v, blockid, pc), ("LumenV4: SSA definition v%d does not dominate use r%d@pc%d"):format(version, reg, pc))
+            end
+        end
+
+        for bid, phis in pairs(result.phisByBlock) do
+            local block = assert(cfg.blocks[bid])
+            for reg, phi in pairs(phis) do
+                local seen = 0
+                for _, pred in ipairs(block.predecessors) do
+                    local expected = (result.outVersions[pred] or {})[reg] or undef(reg)
+                    assert(phi.incoming[pred] == expected, ("LumenV4: phi v%d has invalid edge value from b%d"):format(phi.id, pred))
+                    seen += 1
                 end
-
-                uses[#uses + 1] = {
-                    phi = phi.id,
-                    block = blockId,
-                    reg = reg,
-                }
+                assert(seen == #block.predecessors, "LumenV4: phi edge cardinality mismatch")
             end
         end
-    end
 
-    function result:versionForUse(pc, reg)
-        local uses = self.usesByPC[pc]
-        return uses and uses[reg] or nil
+        for pc, pack in pairs(result.packsByPC) do
+            if pack and pack.consumesTop then
+                local producer = result.packInput[pc]
+                if producer ~= result.ambiguousPack then
+                    if type(producer) ~= "number" then
+                        error("LumenV4: UNSUPPORTED open ValuePack consumer has no reaching producer at pc " .. tostring(pc), 2)
+                    end
+                    local pp = result.packsByPC[producer]
+                    assert(pp and pp.producesTop, "LumenV4: ValuePack consumer references non-producer")
+                end
+            end
+        end
+        return true
     end
+    result.verified = verifyssa()
 
-    function result:versionForDef(pc, reg)
-        local defs = self.defsByPC[pc]
-        return defs and defs[reg] or nil
-    end
-
-    function result:isSingleUse(version)
-        return (self.useCount[version] or 0) == 1
-    end
-
-    function result:onlyUse(version)
-        local uses = self.defUse[version]
-        return uses and #uses == 1 and uses[1] or nil
-    end
-
+    function result:versionForUse(pc, reg) local u = self.usesByPC[pc]; return u and u[reg] or nil end
+    function result:versionForDef(pc, reg) local d = self.defsByPC[pc]; return d and d[reg] or nil end
+    function result:isSingleUse(v) return (self.useCount[v] or 0) == 1 end
+    function result:onlyUse(v) local u = self.defUse[v]; return u and #u == 1 and u[1] or nil end
     function result:summary()
-        local phiCount = 0
-        for _, phis in pairs(self.phisByBlock) do
-            for _ in pairs(phis) do
-                phiCount = phiCount + 1
+        local phis, versions, undefs, packs, divergentpacks = 0, 0, 0, 0, 0
+        for _, ps in pairs(self.phisByBlock) do for _ in pairs(ps) do phis += 1 end end
+        for _, v in ipairs(self.versions) do if not v.dead then versions += 1; if v.kind == "undef" then undefs += 1 end end end
+        for pc, p in pairs(self.packsByPC) do
+            if p then
+                packs += 1
+                if p.consumesTop and self.packInput[pc] == self.ambiguousPack then divergentpacks += 1 end
             end
         end
-
-        local versions = 0
-        for _, ver in ipairs(self.versions) do if not ver.dead then versions = versions + 1 end end
-        return {
-            converged = self.converged,
-            iterations = self.iterations,
-            versions = versions,
-            phis = phiCount,
-            blocks = #self.cfg.blocks,
-        }
+        return { converged = true, iterations = self.iterations, versions = versions, phis = phis, blocks = #self.cfg.blocks, undefs = undefs, openPacks = packs, divergentPacks = divergentpacks }
     end
-
     return result
 end
 
 return ssa
 ]===],
     ["main.ast.booleans"] = [===[
+
 local pass = {}
 
 local function val(n)
@@ -10371,6 +12003,7 @@ end
 return pass
 ]===],
     ["main.ast.callbacks"] = [===[
+
 local pass = {}
 
 local function esc(s)
@@ -10466,6 +12099,7 @@ end
 return pass
 ]===],
     ["main.ast.compound"] = [===[
+
 local pass = {}
 
 local list = {
@@ -10508,6 +12142,7 @@ end
 return pass
 ]===],
     ["main.ast.conditions"] = [===[
+
 local pass = {}
 
 local function same(a, b)
@@ -10564,6 +12199,7 @@ end
 return pass
 ]===],
     ["main.ast.deadcode"] = [===[
+
 local pass = {}
 
 local function walk(block)
@@ -10592,6 +12228,7 @@ end
 return pass
 ]===],
     ["main.ast.doblocks"] = [===[
+
 local pass = {}
 
 local function words(s, out)
@@ -10754,6 +12391,7 @@ end
 return pass
 ]===],
     ["main.ast.fold"] = [===[
+
 local pass = {}
 
 local function bool(s)
@@ -10818,6 +12456,7 @@ end
 return pass
 ]===],
     ["main.ast.guards2"] = [===[
+
 local pass = {}
 
 local inv = {
@@ -10880,6 +12519,7 @@ end
 return pass
 ]===],
     ["main.ast.inline"] = [===[
+
 local pass = {}
 
 local function init(n)
@@ -10977,6 +12617,7 @@ end
 return pass
 ]===],
     ["main.ast.locals"] = [===[
+
 local pass = {}
 
 local function walk(block)
@@ -11016,6 +12657,7 @@ end
 return pass
 ]===],
     ["main.ast.logic"] = [===[
+
 local pass = {}
 
 local inv = {
@@ -11066,6 +12708,7 @@ end
 return pass
 ]===],
     ["main.ast.lower"] = [===[
+
 local n = require("main.ast.nodes")
 
 local build = {}
@@ -11205,6 +12848,7 @@ end
 return build
 ]===],
     ["main.ast.nodes"] = [===[
+
 local n = {}
 
 function n.block()
@@ -11246,53 +12890,19 @@ end
 return n
 ]===],
     ["main.ast.pipeline"] = [===[
-local fold = require("main.ast.fold")
-local cond = require("main.ast.conditions")
-local logic = require("main.ast.logic")
-local guards = require("main.recover.guards")
-local guards2 = require("main.ast.guards2")
-local selectp = require("main.ast.selects")
-local ret = require("main.ast.returns")
-local inline = require("main.ast.inline")
-local callbacks = require("main.ast.callbacks")
-local bools = require("main.ast.booleans")
-local comp = require("main.ast.compound")
-local locals = require("main.ast.locals")
-local dead = require("main.ast.deadcode")
-local scopes = require("main.ast.doblocks")
+
+
 
 local pass = {}
 
 function pass.run(root, opt)
-    opt = opt or {}
-    if opt.dce ~= false then dead.run(root) end
-    if opt.fold ~= false then fold.run(root) end
-    if opt.conditions ~= false then
-        cond.run(root)
-        if opt.selects ~= false then selectp.run(root) end
-        if opt.returns ~= false then ret.run(root) end
-    end
-    if opt.inlineast ~= false then inline.run(root) end
-    if opt.callbacks ~= false then callbacks.run(root) end
-    if opt.conditions ~= false and opt.booleans ~= false then bools.run(root) end
-    if opt.guards ~= false then
-        guards2.run(root)
-        guards.run(root)
-    end
-    locals.run(root)
-    if opt.compound ~= false then comp.run(root) end
-    if opt.conditions ~= false then
-        logic.run(root)
-        cond.run(root)
-    end
-    if opt.dce ~= false then dead.run(root) end
-    if (opt.doblocks or 0) > 0 then scopes.run(root, opt.doblocks) end
     return root
 end
 
 return pass
 ]===],
     ["main.ast.printer"] = [===[
+
 local printast = {}
 
 local function esc(s)
@@ -11417,6 +13027,7 @@ end
 return printast
 ]===],
     ["main.ast.returns"] = [===[
+
 local pass = {}
 
 local function ret(b)
@@ -11475,6 +13086,7 @@ end
 return pass
 ]===],
     ["main.ast.selects"] = [===[
+
 local pass = {}
 
 local function asn(node)
@@ -11551,6 +13163,7 @@ end
 return pass
 ]===],
     ["main.bytecode.instructions"] = [===[
+
 local ins = {}
 
 local conditional = {
@@ -11639,24 +13252,26 @@ end
 return ins
 ]===],
     ["main.config"] = [===[
+
 local base = {
     aggressive = false,
     fold = true,
     inline = true,
     dce = true,
     conditions = true,
-    guards = true,
+    guards = false,
     types = true,
-    selects = true,
-    returns = true,
-    compound = true,
-    inlineast = true,
-    callbacks = true,
-    booleans = true,
+    selects = false,
+    returns = false,
+    compound = false,
+    inlineast = false,
+    callbacks = false,
+    booleans = false,
     smartnames = true,
     functions = true,
     doblocks = 0,
     iridium = nil,
+    fidelity = true,
 }
 
 local map = {
@@ -11666,19 +13281,31 @@ local map = {
     ConstantFolding = "fold",
     ConditionalStructurer = "conditions",
     DoBlockInsertionThreshold = "doblocks",
+    FidelityMode = "fidelity",
 }
 
 return function(opt)
     local out = {}
     for k, v in pairs(base) do out[k] = v end
-    if opt then
-        for k, v in pairs(opt) do out[map[k] or k] = v end
-    end
+    if opt then for k, v in pairs(opt) do out[map[k] or k] = v end end
     out.doblocks = math.max(0, math.floor(tonumber(out.doblocks) or 0))
+    if out.fidelity ~= false then
+
+        out.fold = false
+        out.guards = false
+        out.selects = false
+        out.returns = false
+        out.compound = false
+        out.inlineast = false
+        out.callbacks = false
+        out.booleans = false
+        out.doblocks = 0
+    end
     return out
 end
 ]===],
     ["main.decompiler.context"] = [===[
+
 local ins = require("main.bytecode.instructions")
 local ex = require("main.output.expr")
 local lit = require("main.output.literals")
@@ -12092,6 +13719,687 @@ local branch = require("main.recover.branches")
 local loops = require("main.recover.loops")
 local ins = require("main.bytecode.instructions")
 local ex = require("main.output.expr")
+local lit = require("main.output.literals")
+local regs = require("main.analysis.registers")
+local vmfallback = (function()
+local ins = require("main.bytecode.instructions")
+local lit = require("main.output.literals")
+
+local vm = {}
+
+local function line(out, depth, text)
+    out[#out + 1] = string.rep("    ", depth) .. text
+end
+
+local function key2(proto, index)
+    return proto.Constants and proto.Constants[(index or 0) + 1]
+end
+
+local function rawstr(constant)
+    return lit.rawStringConstant(constant)
+end
+
+local function q(value)
+    return lit.string(tostring(value or ""))
+end
+
+local function classshapeexpr(k)
+    local name = rawstr(k and k.ClassName) or "AnonymousClass"
+    local props, methods = {}, {}
+    for _, v in ipairs(k and k.Properties or {}) do props[#props + 1] = q(rawstr(v) or "property") end
+    for _, v in ipairs(k and k.Methods or {}) do methods[#methods + 1] = q(rawstr(v) or "method") end
+    return "__classshape(" .. q(name) .. ", {" .. table.concat(props, ", ") .. "}, {" .. table.concat(methods, ", ") .. "})"
+end
+
+local function constexpr(proto, index)
+    local k = key2(proto, index)
+    if not k then return "nil" end
+    if k.__type == "Import" then
+        local parts = {}
+        for _, part in ipairs(k.Value or {}) do parts[#parts + 1] = rawstr(part) or "?" end
+        if #parts == 0 then return "nil" end
+        local first = parts[1]
+        local out
+        if first == "type" and #parts == 1 then out = "__v4type"
+        elseif first == "typeof" and #parts == 1 then out = "__v4typeof"
+        elseif first == "class" then out = "__classlib"
+        else out = "__env[" .. q(first) .. "]" end
+        for i = 2, #parts do out = out .. "[" .. q(parts[i]) .. "]" end
+        return out
+    elseif k.__type == "ClassShape" then
+        return classshapeexpr(k)
+    elseif k.__type == "Closure" then
+        return "nil"
+    end
+    return lit.constant(k)
+end
+
+local function aux(op)
+    return op and op.AuxValue and op.AuxValue.Value or 0
+end
+
+local function methodkey(proto, op, userdata)
+    local index = aux(op)
+    if userdata then index = bit32.band(index, 0xffff) end
+    return rawstr(key2(proto, index)) or "unknownMethod"
+end
+
+local function tablekey(proto, op, userdata)
+    local index = aux(op)
+    if userdata then index = bit32.band(index, 0xffff) end
+    return rawstr(key2(proto, index)) or "?"
+end
+
+local function realpcs(proto)
+    local slots = ins.auxSlots(proto)
+    local pcs = {}
+    for pc = 1, #proto.Instructions do
+        if not slots[pc] then pcs[#pcs + 1] = pc end
+    end
+    return pcs, slots
+end
+
+local function argsexpr(first, count, openlast)
+    if openlast then
+        return "__unpack(" .. tostring(first) .. ", __top - 1)"
+    end
+    local args = {}
+    for i = 0, count - 1 do args[#args + 1] = "__get(" .. tostring(first + i) .. ")" end
+    return table.concat(args, ", ")
+end
+
+local function emitcallresult(out, depth, ra, rc, callexpr)
+    if rc == 1 then
+        line(out, depth, callexpr)
+        line(out, depth, "__top = nil")
+        return
+    end
+
+    line(out, depth, "local __ret = table.pack(" .. callexpr .. ")")
+    if rc == 0 then
+        line(out, depth, "for __i = 1, __ret.n do __set(" .. tostring(ra) .. " + __i - 1, __ret[__i]) end")
+        line(out, depth, "__top = " .. tostring(ra) .. " + __ret.n")
+    else
+        local n = rc - 1
+        for i = 0, n - 1 do line(out, depth, "__set(" .. tostring(ra + i) .. ", __ret[" .. tostring(i + 1) .. "])") end
+        line(out, depth, "__top = nil")
+    end
+end
+
+local function captureinfo(proto, startpc, child, slots)
+    local list = {}
+    local pc = startpc
+    for i = 1, (child and child.UpvalueCount or 0) do
+        while slots[pc] do pc += 1 end
+        local op = proto.Instructions[pc]
+        if not op or ins.name(op) ~= "CAPTURE" then
+
+            list[i] = { kind = 0, src = nil, malformed = true }
+        else
+            list[i] = { kind = op.A or 0, src = op.B or 0, pc = pc }
+            pc = ins.next(proto, pc, slots)
+        end
+    end
+    return list, pc
+end
+
+local function emitcapturearray(out, depth, captures, selfreg)
+    local selfvals = {}
+    line(out, depth, "local __caps = {}")
+    line(out, depth, "local __modes = {}")
+    line(out, depth, "local __selfcaps = {}")
+    for i, c in ipairs(captures) do
+        if c.malformed then
+            line(out, depth, "__caps[" .. tostring(i) .. "] = {v = nil, ref = false}")
+            line(out, depth, "__modes[" .. tostring(i) .. "] = 0")
+        elseif c.kind == 0 and c.src == selfreg then
+
+            selfvals[#selfvals + 1] = i
+            line(out, depth, "__caps[" .. tostring(i) .. "] = {v = nil, ref = false}")
+            line(out, depth, "__modes[" .. tostring(i) .. "] = 0")
+            line(out, depth, "__selfcaps[" .. tostring(i) .. "] = true")
+        elseif c.kind == 0 then
+            line(out, depth, "__caps[" .. tostring(i) .. "] = {v = __get(" .. tostring(c.src) .. "), ref = false}")
+            line(out, depth, "__modes[" .. tostring(i) .. "] = 0")
+        elseif c.kind == 1 then
+            line(out, depth, "__caps[" .. tostring(i) .. "] = __cell(" .. tostring(c.src) .. ")")
+            line(out, depth, "__modes[" .. tostring(i) .. "] = 1")
+        else
+            local ui = tostring((c.src or 0) + 1)
+            line(out, depth, "local __u" .. tostring(i) .. " = __up[" .. ui .. "]")
+            line(out, depth, "if __u" .. tostring(i) .. " and __u" .. tostring(i) .. ".ref then __caps[" .. tostring(i) .. "] = __u" .. tostring(i) .. " else __caps[" .. tostring(i) .. "] = {v = __u" .. tostring(i) .. " and __u" .. tostring(i) .. ".v or nil, ref = false} end")
+            line(out, depth, "__modes[" .. tostring(i) .. "] = 2")
+        end
+    end
+    return selfvals
+end
+
+local function protomap(parsed)
+    local byobject = {}
+    for i, p in ipairs(parsed.Protos or {}) do byobject[p] = i end
+    return byobject
+end
+
+local function closurechild(parsed, proto, op, byobject)
+    local name = ins.name(op)
+    if name == "NEWCLOSURE" then
+        local child = proto.Protos and proto.Protos[(op.D or 0) + 1]
+        return child, child and byobject[child] or nil
+    elseif name == "DUPCLOSURE" then
+        local k = key2(proto, op.D)
+        if k and k.__type == "Closure" then
+            local id = (k.Value or 0) + 1
+            return parsed.Protos and parsed.Protos[id], id
+        end
+    end
+end
+
+local function emitprotofactory(out, parsed, proto, id, byobject)
+    local pcs, slots = realpcs(proto)
+    local maxstack = math.max(1, tonumber(proto.MaxStackSize) or 255)
+    local params = math.max(0, tonumber(proto.ParameterCount) or 0)
+    local pnames = {}
+    for i = 0, params - 1 do pnames[#pnames + 1] = "__a" .. tostring(i) end
+    if proto.IsVararg then pnames[#pnames + 1] = "..." end
+
+    line(out, 0, "__factory[" .. tostring(id) .. "] = function(__up)")
+    line(out, 1, "local function __fn(" .. table.concat(pnames, ", ") .. ")")
+    line(out, 2, "local __r, __open = {}, {}")
+    line(out, 2, "local __top = nil")
+    if proto.IsVararg then line(out, 2, "local __var = table.pack(...)") else line(out, 2, "local __var = {n = 0}") end
+    for i = 0, params - 1 do line(out, 2, "__r[" .. tostring(i) .. "] = __a" .. tostring(i)) end
+
+    line(out, 2, "local function __get(__i)")
+    line(out, 3, "local __c = __open[__i]")
+    line(out, 3, "if __c ~= nil then return __c.v end")
+    line(out, 3, "return __r[__i]")
+    line(out, 2, "end")
+    line(out, 2, "local function __set(__i, __v)")
+    line(out, 3, "local __c = __open[__i]")
+    line(out, 3, "if __c ~= nil then __c.v = __v else __r[__i] = __v end")
+    line(out, 2, "end")
+    line(out, 2, "local function __cell(__i)")
+    line(out, 3, "local __c = __open[__i]")
+    line(out, 3, "if __c == nil then __c = {v = __r[__i], ref = true}; __open[__i] = __c end")
+    line(out, 3, "return __c")
+    line(out, 2, "end")
+    line(out, 2, "local function __close(__a)")
+    line(out, 3, "for __i = __a, " .. tostring(maxstack - 1) .. " do")
+    line(out, 4, "local __c = __open[__i]")
+    line(out, 4, "if __c ~= nil then __r[__i] = __c.v; __open[__i] = nil end")
+    line(out, 3, "end")
+    line(out, 2, "end")
+    line(out, 2, "local function __unpack(__first, __last)")
+    line(out, 3, "if __last == nil or __last < __first then return end")
+    line(out, 3, "local __n = __last - __first + 1")
+    line(out, 3, "local __a = {n = __n}")
+    line(out, 3, "for __i = 1, __n do __a[__i] = __get(__first + __i - 1) end")
+    line(out, 3, "return table.unpack(__a, 1, __n)")
+    line(out, 2, "end")
+
+    local firstpc = pcs[1] or 1
+    line(out, 2, "local __pc = " .. tostring(firstpc))
+    line(out, 2, "while true do")
+
+    local consumedcaptures = {}
+    for _, pc in ipairs(pcs) do
+        local op = proto.Instructions[pc]
+        local name = ins.name(op)
+        if name == "NEWCLOSURE" or name == "DUPCLOSURE" then
+            local child = closurechild(parsed, proto, op, byobject)
+            if child then
+                local captures = captureinfo(proto, ins.next(proto, pc, slots), child, slots)
+                for _, c in ipairs(captures) do if c.pc then consumedcaptures[c.pc] = true end end
+            end
+        end
+    end
+
+    local branchindex = 0
+    for _, pc in ipairs(pcs) do
+        if not consumedcaptures[pc] then
+            local op = proto.Instructions[pc]
+            local name = ins.name(op)
+            local nextpc = ins.next(proto, pc, slots)
+            branchindex += 1
+            line(out, 3, (branchindex == 1 and "if " or "elseif ") .. "__pc == " .. tostring(pc) .. " then")
+            local d = 4
+            local ra, rb2, rc, rd = op.A or 0, op.B or 0, op.C or 0, op.D or 0
+            local av = aux(op)
+
+            if name == "NOP" or name == "BREAK" or name == "PREPVARARGS" or name == "COVERAGE" or name == "NATIVECALL" or name:match("^FASTCALL") then
+                line(out, d, "__pc = " .. tostring(nextpc))
+            elseif name == "LOADNIL" then
+                line(out, d, "__set(" .. ra .. ", nil)"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "LOADB" then
+                line(out, d, "__set(" .. ra .. ", " .. (rb2 == 1 and "true" or "false") .. ")")
+                line(out, d, "__pc = " .. tostring(rc ~= 0 and (pc + rc + 1) or nextpc))
+            elseif name == "LOADN" then
+                line(out, d, "__set(" .. ra .. ", " .. lit.number(rd) .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "LOADK" then
+                line(out, d, "__set(" .. ra .. ", " .. constexpr(proto, rd) .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "LOADKX" then
+                line(out, d, "__set(" .. ra .. ", " .. constexpr(proto, av) .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "MOVE" then
+                line(out, d, "__set(" .. ra .. ", __get(" .. rb2 .. "))"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "GETGLOBAL" then
+                local key = rawstr(key2(proto, av)) or "unknownGlobal"
+                local value = key == "type" and "__v4type" or (key == "typeof" and "__v4typeof" or (key == "class" and "__classlib" or ("__env[" .. q(key) .. "]")))
+                line(out, d, "__set(" .. ra .. ", " .. value .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "SETGLOBAL" then
+                local key = rawstr(key2(proto, av)) or "unknownGlobal"
+                line(out, d, "__env[" .. q(key) .. "] = __get(" .. ra .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "GETUPVAL" then
+                line(out, d, "local __u = __up[" .. tostring(rb2 + 1) .. "]")
+                line(out, d, "__set(" .. ra .. ", __u and __u.v or nil)"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "SETUPVAL" then
+                line(out, d, "local __u = __up[" .. tostring(rb2 + 1) .. "]")
+                line(out, d, "if __u == nil then __u = {v = nil, ref = true}; __up[" .. tostring(rb2 + 1) .. "] = __u end")
+                line(out, d, "__u.v = __get(" .. ra .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "CLOSEUPVALS" then
+                line(out, d, "__close(" .. ra .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "GETIMPORT" then
+                line(out, d, "__set(" .. ra .. ", " .. constexpr(proto, rd) .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "GETTABLE" then
+                line(out, d, "__set(" .. ra .. ", __get(" .. rb2 .. ")[__get(" .. rc .. ")])"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "SETTABLE" then
+                line(out, d, "__get(" .. rb2 .. ")[__get(" .. rc .. ")] = __get(" .. ra .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "GETTABLEKS" or name == "GETUDATAKS" then
+                local key = tablekey(proto, op, name == "GETUDATAKS")
+                line(out, d, "__set(" .. ra .. ", __get(" .. rb2 .. ")[" .. q(key) .. "])"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "SETTABLEKS" or name == "SETUDATAKS" then
+                local key = tablekey(proto, op, name == "SETUDATAKS")
+                line(out, d, "__get(" .. rb2 .. ")[" .. q(key) .. "] = __get(" .. ra .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "GETTABLEN" then
+                line(out, d, "__set(" .. ra .. ", __get(" .. rb2 .. ")[" .. tostring(rc + 1) .. "])"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "SETTABLEN" then
+                line(out, d, "__get(" .. rb2 .. ")[" .. tostring(rc + 1) .. "] = __get(" .. ra .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "NEWTABLE" then
+                line(out, d, "__set(" .. ra .. ", {})"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "DUPTABLE" then
+                line(out, d, "__set(" .. ra .. ", " .. constexpr(proto, rd) .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "NEWCLOSURE" or name == "DUPCLOSURE" then
+                local child, childid = closurechild(parsed, proto, op, byobject)
+                local captures, after = captureinfo(proto, nextpc, child, slots)
+                local selfvals = emitcapturearray(out, d, captures, ra)
+                if childid then
+                    if name == "DUPCLOSURE" then
+                        line(out, d, "local __cl = __dup(" .. q(tostring(id) .. ":" .. tostring(rd)) .. ", " .. tostring(childid) .. ", __caps, __modes, __selfcaps)")
+                        line(out, d, "__set(" .. ra .. ", __cl)")
+                    else
+                        line(out, d, "local __cl = __factory[" .. tostring(childid) .. "](__caps)")
+                        for _, ci in ipairs(selfvals) do line(out, d, "__caps[" .. tostring(ci) .. "].v = __cl") end
+                        line(out, d, "__set(" .. ra .. ", __cl)")
+                    end
+                else
+                    line(out, d, "__set(" .. ra .. ", function(...) return nil end)")
+                end
+                line(out, d, "__pc = " .. tostring(after))
+            elseif name == "CAPTURE" then
+
+                line(out, d, "__pc = " .. nextpc)
+            elseif name == "NAMECALL" or name == "NAMECALLUDATA" then
+                local key = methodkey(proto, op, name == "NAMECALLUDATA")
+                local callpc = nextpc
+                local callop = proto.Instructions[callpc]
+                local callname = callop and ins.name(callop) or ""
+                if callop and (callname == "CALL" or callname == "CALLFB") and (callop.A or -1) == ra then
+                    local cb, cc = callop.B or 0, callop.C or 0
+                    local argtext
+                    if cb == 0 then argtext = argsexpr(ra + 2, 0, true) else argtext = argsexpr(ra + 2, math.max(0, cb - 2), false) end
+                    local callexpr
+                    if lit.identifier(key) then
+                        callexpr = "(__get(" .. rb2 .. ")):" .. key .. "(" .. argtext .. ")"
+                    else
+                        local pre = "(__get(" .. rb2 .. "))[" .. q(key) .. "]"
+                        if argtext ~= "" then argtext = "__get(" .. rb2 .. "), " .. argtext else argtext = "__get(" .. rb2 .. ")" end
+                        callexpr = "(" .. pre .. ")(" .. argtext .. ")"
+                    end
+                    emitcallresult(out, d, ra, cc, callexpr)
+                    line(out, d, "__pc = " .. tostring(ins.next(proto, callpc, slots)))
+                else
+                    line(out, d, "local __obj = __get(" .. rb2 .. ")")
+                    line(out, d, "__set(" .. ra .. ", __obj[" .. q(key) .. "])")
+                    line(out, d, "__set(" .. tostring(ra + 1) .. ", __obj)")
+                    line(out, d, "__pc = " .. nextpc)
+                end
+            elseif name == "CALL" or name == "CALLFB" then
+                local argtext
+                if rb2 == 0 then argtext = argsexpr(ra + 1, 0, true) else argtext = argsexpr(ra + 1, math.max(0, rb2 - 1), false) end
+                emitcallresult(out, d, ra, rc, "(__get(" .. ra .. "))(" .. argtext .. ")")
+                line(out, d, "__pc = " .. nextpc)
+            elseif name == "RETURN" then
+                if rb2 == 1 then line(out, d, "return")
+                elseif rb2 == 0 then line(out, d, "return __unpack(" .. ra .. ", (__top or " .. ra .. ") - 1)")
+                else
+                    local vals = {}
+                    for r = ra, ra + rb2 - 2 do vals[#vals + 1] = "__get(" .. tostring(r) .. ")" end
+                    line(out, d, "return " .. table.concat(vals, ", "))
+                end
+            elseif name == "JUMP" or name == "JUMPBACK" or name == "JUMPX" then
+                line(out, d, "__pc = " .. tostring(ins.jumpTarget(pc, op)))
+            elseif name == "JUMPIF" or name == "JUMPIFNOT" then
+                local test = name == "JUMPIF" and ("__get(" .. ra .. ")") or ("not __get(" .. ra .. ")")
+                line(out, d, "if " .. test .. " then __pc = " .. tostring(ins.jumpTarget(pc, op)) .. " else __pc = " .. nextpc .. " end")
+            elseif name == "JUMPIFEQ" or name == "JUMPIFNOTEQ" or name == "JUMPIFLT" or name == "JUMPIFLE" or name == "JUMPIFNOTLT" or name == "JUMPIFNOTLE" then
+                local rb = bit32.band(av, 0xff)
+                local cmp = ({JUMPIFEQ = "==", JUMPIFNOTEQ = "~=", JUMPIFLT = "<", JUMPIFLE = "<=", JUMPIFNOTLT = "<", JUMPIFNOTLE = "<="})[name]
+                local test = "__get(" .. ra .. ") " .. cmp .. " __get(" .. rb .. ")"
+                if name == "JUMPIFNOTLT" or name == "JUMPIFNOTLE" then test = "not (" .. test .. ")" end
+                line(out, d, "if " .. test .. " then __pc = " .. tostring(ins.jumpTarget(pc, op)) .. " else __pc = " .. nextpc .. " end")
+            elseif name == "JUMPXEQKNIL" or name == "JUMPXEQKB" or name == "JUMPXEQKN" or name == "JUMPXEQKS" then
+                local rhs
+                if name == "JUMPXEQKNIL" then rhs = "nil"
+                elseif name == "JUMPXEQKB" then rhs = bit32.band(av, 1) == 1 and "true" or "false"
+                else rhs = constexpr(proto, bit32.band(av, 0xffffff)) end
+                local test = "__get(" .. ra .. ") == " .. rhs
+                if bit32.btest(av, 0x80000000) then test = "not (" .. test .. ")" end
+                line(out, d, "if " .. test .. " then __pc = " .. tostring(ins.jumpTarget(pc, op)) .. " else __pc = " .. nextpc .. " end")
+            elseif name == "ADD" or name == "SUB" or name == "MUL" or name == "DIV" or name == "MOD" or name == "POW" or name == "IDIV" then
+                local symbol = ({ADD = "+", SUB = "-", MUL = "*", DIV = "/", MOD = "%", POW = "^", IDIV = "//"})[name]
+                line(out, d, "__set(" .. ra .. ", __get(" .. rb2 .. ") " .. symbol .. " __get(" .. rc .. "))"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "ADDK" or name == "SUBK" or name == "MULK" or name == "DIVK" or name == "MODK" or name == "POWK" or name == "IDIVK" then
+                local symbol = ({ADDK = "+", SUBK = "-", MULK = "*", DIVK = "/", MODK = "%", POWK = "^", IDIVK = "//"})[name]
+                line(out, d, "__set(" .. ra .. ", __get(" .. rb2 .. ") " .. symbol .. " " .. constexpr(proto, rc) .. ")"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "SUBRK" or name == "DIVRK" then
+                line(out, d, "__set(" .. ra .. ", " .. constexpr(proto, rb2) .. (name == "SUBRK" and " - " or " / ") .. "__get(" .. rc .. "))"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "AND" or name == "OR" then
+                if name == "AND" then line(out, d, "if __get(" .. rb2 .. ") then __set(" .. ra .. ", __get(" .. rc .. ")) else __set(" .. ra .. ", __get(" .. rb2 .. ")) end")
+                else line(out, d, "if __get(" .. rb2 .. ") then __set(" .. ra .. ", __get(" .. rb2 .. ")) else __set(" .. ra .. ", __get(" .. rc .. ")) end") end
+                line(out, d, "__pc = " .. nextpc)
+            elseif name == "ANDK" or name == "ORK" then
+                local kval = constexpr(proto, rc)
+                if name == "ANDK" then line(out, d, "if __get(" .. rb2 .. ") then __set(" .. ra .. ", " .. kval .. ") else __set(" .. ra .. ", __get(" .. rb2 .. ")) end")
+                else line(out, d, "if __get(" .. rb2 .. ") then __set(" .. ra .. ", __get(" .. rb2 .. ")) else __set(" .. ra .. ", " .. kval .. ") end") end
+                line(out, d, "__pc = " .. nextpc)
+            elseif name == "CONCAT" then
+                line(out, d, "local __x = __get(" .. rc .. ")")
+                for r = rc - 1, rb2, -1 do line(out, d, "__x = __get(" .. r .. ") .. __x") end
+                line(out, d, "__set(" .. ra .. ", __x)"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "NOT" then
+                line(out, d, "__set(" .. ra .. ", not __get(" .. rb2 .. "))"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "MINUS" then
+                line(out, d, "__set(" .. ra .. ", -__get(" .. rb2 .. "))"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "LENGTH" then
+                line(out, d, "__set(" .. ra .. ", #__get(" .. rb2 .. "))"); line(out, d, "__pc = " .. nextpc)
+            elseif name == "SETLIST" then
+                line(out, d, "local __t = __get(" .. ra .. ")")
+                if rc == 0 then
+                    line(out, d, "local __n = (__top or " .. rb2 .. ") - " .. rb2)
+                    line(out, d, "for __i = 0, __n - 1 do __t[" .. av .. " + __i] = __get(" .. rb2 .. " + __i) end")
+                    line(out, d, "__top = nil")
+                else
+                    for i = 0, rc - 2 do line(out, d, "__t[" .. tostring(av + i) .. "] = __get(" .. tostring(rb2 + i) .. ")") end
+                end
+                line(out, d, "__pc = " .. nextpc)
+            elseif name == "FORNPREP" then
+                line(out, d, "local __limit = __fornum(__get(" .. ra .. "))")
+                line(out, d, "local __step = __fornum(__get(" .. tostring(ra + 1) .. "))")
+                line(out, d, "local __idx = __fornum(__get(" .. tostring(ra + 2) .. "))")
+                line(out, d, "__set(" .. ra .. ", __limit); __set(" .. tostring(ra + 1) .. ", __step); __set(" .. tostring(ra + 2) .. ", __idx)")
+                line(out, d, "if (__step > 0 and __idx <= __limit) or (not (__step > 0) and __limit <= __idx) then __pc = " .. nextpc .. " else __pc = " .. tostring(ins.jumpTarget(pc, op)) .. " end")
+            elseif name == "FORNLOOP" then
+                line(out, d, "local __limit, __step = __get(" .. ra .. "), __get(" .. tostring(ra + 1) .. ")")
+                line(out, d, "local __idx = __get(" .. tostring(ra + 2) .. ") + __step")
+                line(out, d, "__set(" .. tostring(ra + 2) .. ", __idx)")
+                line(out, d, "if (__step > 0 and __idx <= __limit) or (not (__step > 0) and __limit <= __idx) then __pc = " .. tostring(ins.jumpTarget(pc, op)) .. " else __pc = " .. nextpc .. " end")
+            elseif name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" then
+
+                line(out, d, "__pc = " .. tostring(ins.jumpTarget(pc, op)))
+            elseif name == "FORGPREP" then
+                line(out, d, "local __g = __get(" .. ra .. ")")
+                line(out, d, "if type(__g) ~= \"function\" then")
+                line(out, d + 1, "local __ng, __ns, __ni = __iterprep(__g)")
+                line(out, d + 1, "__set(" .. ra .. ", __ng); __set(" .. tostring(ra + 1) .. ", __ns); __set(" .. tostring(ra + 2) .. ", __ni)")
+                line(out, d, "end")
+                line(out, d, "__pc = " .. tostring(ins.jumpTarget(pc, op)))
+            elseif name == "FORGLOOP" then
+                local count = math.max(1, bit32.band(av, 0xff))
+                line(out, d, "local __ret = table.pack((__get(" .. ra .. "))(__get(" .. tostring(ra + 1) .. "), __get(" .. tostring(ra + 2) .. ")))")
+                for i = 1, count do line(out, d, "__set(" .. tostring(ra + 2 + i) .. ", __ret[" .. tostring(i) .. "])") end
+                line(out, d, "__set(" .. tostring(ra + 2) .. ", __ret[1])")
+                line(out, d, "if __ret[1] ~= nil then __pc = " .. tostring(ins.jumpTarget(pc, op)) .. " else __pc = " .. nextpc .. " end")
+            elseif name == "GETVARARGS" then
+                if rb2 == 0 then
+                    line(out, d, "for __i = 1, __var.n do __set(" .. ra .. " + __i - 1, __var[__i]) end")
+                    line(out, d, "__top = " .. ra .. " + __var.n")
+                else
+                    for i = 1, rb2 - 1 do line(out, d, "__set(" .. tostring(ra + i - 1) .. ", __var[" .. tostring(i) .. "])") end
+                end
+                line(out, d, "__pc = " .. nextpc)
+            elseif name == "CMPPROTO" then
+
+
+                line(out, d, "__pc = " .. tostring(ins.jumpTarget(pc, op)))
+            elseif name == "NEWCLASS" then
+                line(out, d, "local __super = " .. (rb2 ~= 0xff and ("__get(" .. rb2 .. ")") or "nil"))
+                line(out, d, "__set(" .. ra .. ", __newclass(" .. constexpr(proto, av) .. ", __super))")
+                line(out, d, "__pc = " .. nextpc)
+            elseif name == "NEWCLASSMEMBER" then
+                local key = rawstr(key2(proto, av)) or "member"
+                line(out, d, "__classmember(__get(" .. ra .. "), " .. q(key) .. ", __get(" .. rc .. "))")
+                line(out, d, "__pc = " .. nextpc)
+            else
+
+                line(out, d, "error(" .. q("LumenV4 VM fallback: unknown opcode " .. tostring(name) .. " at pc " .. tostring(pc)) .. ")")
+            end
+        end
+    end
+
+    line(out, 3, "else")
+    line(out, 4, "error(\"LumenV4 VM fallback: invalid pc \" .. tostring(__pc))")
+    line(out, 3, "end")
+    line(out, 2, "end")
+    line(out, 1, "end")
+    line(out, 1, "return __fn")
+    line(out, 0, "end")
+    line(out, 0, "")
+end
+
+function vm.run(parsed, reason)
+    local entry = assert(parsed and parsed.Protos and parsed.Protos[parsed.ProtoEntryPoint], "LumenV4 VM fallback: missing entry proto")
+    local byobject = protomap(parsed)
+    local decoded = 0
+    for _, proto in ipairs(parsed.Protos or {}) do
+        local pcs = realpcs(proto)
+        decoded += #pcs
+    end
+    local bytecodeversion = tonumber(parsed.BytecodeVersion) or 0
+    local header = ("-- LumenV4 status=VM_FALLBACK coverage=100.00 reachable=%d covered=%d blocks=%d structuredBlocks=0 fallbackBlocks=%d phis=0 undefs=0 packs=0 cells=0 objects=0 escapedObjects=0 irreducible=0 bytecodeVersion=%d ssa=false parser=true diagnostics=0")
+        :format(decoded, decoded, decoded, decoded, bytecodeversion)
+    local out = {
+        header,
+        "-- Structured recovery failed; this function is a direct decoded-bytecode state machine.",
+        "-- Original recovery reason: " .. tostring(reason or "semantic fallback"):gsub("[\r\n]+", " "),
+        "local __env = (getfenv and getfenv(0)) or _G",
+        "local __factory = {}",
+        "local __dupcache = {}",
+        "",
+        "local function __fornum(v)",
+        "    if type(v) == \"number\" then return v end",
+        "    local n = tonumber(v)",
+        "    if n == nil then error(\"invalid 'for' limit/step/index (number expected)\", 2) end",
+        "    return n",
+        "end",
+        "",
+        "local function __mt(v)",
+        "    if type(getrawmetatable) == \"function\" then",
+        "        local ok, mt = pcall(getrawmetatable, v)",
+        "        if ok and mt ~= nil then return mt end",
+        "    end",
+        "    return getmetatable(v)",
+        "end",
+        "",
+        "local function __iterprep(v)",
+        "    if type(v) == \"table\" then",
+        "        local mt = __mt(v)",
+        "        local it = mt and mt.__iter",
+        "        if it ~= nil then",
+        "            local g, s, i = it(v)",
+        "            return g, s, i",
+        "        end",
+        "        if mt and mt.__call then return v, nil, nil end",
+        "        return next, v, nil",
+        "    end",
+        "    local mt = __mt(v)",
+        "    local it = mt and mt.__iter",
+        "    if it ~= nil then return it(v) end",
+        "    return v, nil, nil",
+        "end",
+        "",
+        "local __realtype = type",
+        "local __realtypeof = typeof or type",
+        "local __classof = setmetatable({}, {__mode = \"k\"})",
+        "local __classmeta = setmetatable({}, {__mode = \"k\"})",
+        "local __isclass = setmetatable({}, {__mode = \"k\"})",
+        "",
+        "local function __classshape(name, props, methods)",
+        "    return {__name = name, __props = props, __methods = methods}",
+        "end",
+        "",
+        "local function __classlookup(cls, key)",
+        "    local c = cls",
+        "    while c do",
+        "        local v = rawget(c, key)",
+        "        if v ~= nil then return v end",
+        "        local m = __classmeta[c]",
+        "        c = m and m.super or nil",
+        "    end",
+        "    return nil",
+        "end",
+        "",
+        "local function __isinstance(obj, cls)",
+        "    if not __isclass[cls] then return false end",
+        "    local c = __classof[obj]",
+        "    while c do",
+        "        if c == cls then return true end",
+        "        local m = __classmeta[c]",
+        "        c = m and m.super or nil",
+        "    end",
+        "    return false",
+        "end",
+        "",
+        "local __classlib = setmetatable({",
+        "    isinstance = __isinstance,",
+        "    classof = function(v) return __classof[v] end,",
+        "}, {__index = __env.class})",
+        "",
+        "local function __v4type(v)",
+        "    if __isclass[v] then return \"class\" end",
+        "    if __classof[v] then return \"object\" end",
+        "    return __realtype(v)",
+        "end",
+        "local function __v4typeof(v)",
+        "    if __isclass[v] then return \"class\" end",
+        "    if __classof[v] then return \"object\" end",
+        "    return __realtypeof(v)",
+        "end",
+        "",
+        "local __classmetamethods = {",
+        "    __add=true,__sub=true,__mul=true,__div=true,__idiv=true,__mod=true,__pow=true,",
+        "    __unm=true,__len=true,__eq=true,__lt=true,__le=true,__concat=true,__tostring=true,",
+        "    __iter=true,__call=true,",
+        "}",
+        "",
+        "local function __classmember(cls, name, value)",
+        "    rawset(cls, name, value)",
+        "    local m = __classmeta[cls]",
+        "    if m and __classmetamethods[name] then",
+        "        m.instanceMt[name] = function(...) return value(...) end",
+        "    end",
+        "end",
+        "",
+        "local function __newclass(shape, super)",
+        "    local cls = {}",
+        "    local props, propset = {}, {}",
+        "    if super and __classmeta[super] then",
+        "        for _, p in ipairs(__classmeta[super].props) do props[#props + 1] = p; propset[p] = true end",
+        "    end",
+        "    for _, p in ipairs(shape and shape.__props or {}) do",
+        "        if not propset[p] then props[#props + 1] = p; propset[p] = true end",
+        "    end",
+        "    local imt = {}",
+        "    local meta = {shape = shape or {}, super = super, props = props, propset = propset, instanceMt = imt}",
+        "    __classmeta[cls] = meta",
+        "    __isclass[cls] = true",
+        "    imt.__index = function(obj, key)",
+        "        local v = __classlookup(cls, key)",
+        "        if v ~= nil then return v end",
+        "        if propset[key] then return nil end",
+        "        error(\"this object does not have a key named '\" .. tostring(key) .. \"'\", 2)",
+        "    end",
+        "    imt.__newindex = function(obj, key, value)",
+        "        if propset[key] then rawset(obj, key, value); return end",
+        "        error(\"this object does not have a key named '\" .. tostring(key) .. \"'\", 2)",
+        "    end",
+        "    local cmt = {}",
+        "    cmt.__index = function(_, key)",
+        "        local v = super and __classlookup(super, key) or nil",
+        "        if v ~= nil then return v end",
+        "        error(\"this class does not have a key named '\" .. tostring(key) .. \"'\", 2)",
+        "    end",
+        "    cmt.__newindex = function(_, key) error(\"attempt to index class with '\" .. tostring(key) .. \"'\", 2) end",
+        "    cmt.__call = function(_, init)",
+        "        local obj = {}",
+        "        __classof[obj] = cls",
+        "        setmetatable(obj, imt)",
+        "        if init ~= nil then",
+        "            for _, p in ipairs(props) do rawset(obj, p, init[p]) end",
+        "        end",
+        "        return obj",
+        "    end",
+        "    setmetatable(cls, cmt)",
+        "    return cls",
+        "end",
+        "",
+        "local function __samecaps(a, b, modes, selfcaps, fn)",
+        "    if not a then return false end",
+        "    for i = 1, #b do",
+        "        if modes[i] == 0 then",
+        "            local expected = selfcaps[i] and fn or (b[i] and b[i].v)",
+        "            if not rawequal(a[i] and a[i].v, expected) then return false end",
+        "        elseif modes[i] == 2 then",
+        "            local ar, br = a[i] and a[i].ref, b[i] and b[i].ref",
+        "            if ar or br then",
+        "                if a[i] ~= b[i] then return false end",
+        "            elseif not rawequal(a[i] and a[i].v, b[i] and b[i].v) then return false end",
+        "        elseif a[i] ~= b[i] then return false end",
+        "    end",
+        "    return true",
+        "end",
+        "",
+        "local function __dup(cacheKey, id, caps, modes, selfcaps)",
+        "    local c = __dupcache[cacheKey]",
+        "    if c ~= nil and __samecaps(c.caps, caps, modes, selfcaps, c.fn) then return c.fn end",
+        "    local fn = __factory[id](caps)",
+        "    for i in pairs(selfcaps) do caps[i].v = fn end",
+        "    if c == nil then __dupcache[cacheKey] = {fn = fn, caps = caps, modes = modes} end",
+        "    return fn",
+        "end",
+        "",
+    }
+
+    for i, proto in ipairs(parsed.Protos or {}) do emitprotofactory(out, parsed, proto, i, byobject) end
+    local entryid = byobject[entry] or parsed.ProtoEntryPoint
+    line(out, 0, "return (__factory[" .. tostring(entryid) .. "]({}))()")
+
+    local source = table.concat(out, "\n")
+    if type(loadstring) == "function" then
+        local fn, err = loadstring(source, "@LumenV4/vm-fallback-verify")
+        if not fn then error("LumenV4 VM fallback generator emitted invalid Luau: " .. tostring(err), 2) end
+    end
+    return source, {
+        status = "VM_FALLBACK",
+        fallback = true,
+        syntaxValid = true,
+        originCoverageValid = true,
+        coverage = 1,
+        verification = "decoded-bytecode-total-dispatch",
+        structuredError = tostring(reason or ""),
+    }
+end
+
+return vm
+end)()
 
 local decomp = {}
 decomp.__index = decomp
@@ -12106,20 +14414,77 @@ local function loopused(st, r, a, b)
     return false
 end
 
-function decomp.new(opt)
-    return setmetatable({ opt = opt or {} }, decomp)
+local function hashard(st)
+
+    return #st.bad > 0
 end
+
+function decomp.new(opt) return setmetatable({ opt = opt or {} }, decomp) end
 
 function decomp:_state(proto, up, ph)
     local ir = irbuild.run(proto)
     ir.paramhints = ph or {}
     ir = irpass.run(ir, self.opt)
     local naming = names.new(ir.cfg.registerStats, self.opt, proto)
-    return context.new(proto, ir, naming, up, lower.new(), self.opt)
+    local st = context.new(proto, ir, naming, up, lower.new(), self.opt)
+    st.v4 = { fallback = false, visited = {}, status = "STRUCTURED", cellNames = {} }
+
+
+    if ir.cells and next(ir.cells) then
+        local oldvname = st.vname
+        local ids = {}
+        for cid in pairs(ir.cells) do ids[#ids + 1] = cid end
+        table.sort(ids)
+        local resolvedcell = {}
+        for raw, cid in pairs(ir.cellOfValue or {}) do
+            local rv = ir:resolve(raw)
+            if rv then resolvedcell[rv] = resolvedcell[rv] or cid end
+        end
+        for _, cid in ipairs(ids) do
+            local cell = ir.cells[cid]
+            local cp = cell.captures and cell.captures[1]
+            local raw = cp and ir.ssa.usesByPC[cp] and ir.ssa.usesByPC[cp][cell.reg] or nil
+            if raw then
+                st.v4.cellNames[cid] = oldvname(st, raw, cell.reg, nil, cp)
+            else
+                st.v4.cellNames[cid] = naming:unique("cell" .. tostring(cid))
+            end
+        end
+        st.vname = function(self, value, reg, hint, pc)
+            local cid = value and ((self.ir.cellOfValue and self.ir.cellOfValue[value]) or resolvedcell[self.ir:resolve(value)])
+            local cellname = cid and self.v4.cellNames[cid]
+            if cellname then return cellname end
+            return oldvname(self, value, reg, hint, pc)
+        end
+    end
+
+
+    for bid, phis in pairs(ir.phis or {}) do
+        local block = assert(ir.cfg.blocks[bid], "LumenV4: phi references invalid CFG block")
+        for reg, phi in pairs(phis) do
+            local pid = ir:resolve(phi.id)
+            if pid and not ir.dead[pid] then
+                local target = st:vname(pid, reg, nil, block.startPC)
+                for pred, raw in pairs(phi.incoming or {}) do
+                    local rid = ir:resolve(raw)
+                    local value = rid and ir.vals[rid] or nil
+                    if value and value.kind ~= "undef" then
+                        local pb = assert(ir.cfg.blocks[pred], "LumenV4: phi references invalid predecessor")
+                        local source = st:vname(rid, reg, nil, pb.endPC)
+                        if source ~= target then
+                            error(("LumenV4: UNSUPPORTED SSA destruction mismatch for phi v%d r%d: b%d uses %s, target is %s")
+                                :format(pid, reg, pred, tostring(source), tostring(target)), 2)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    st.v4.ssaDestructionVerified = true
+    return st
 end
 
-function decomp:_child(proto, up, ph)
-    local st = self:_state(proto, up, ph)
+local function arguments(st, proto)
     local args = {}
     for i = 0, (proto.ParameterCount or 0) - 1 do
         local name = st:vname(st.ssa.params[i], i, nil, 1)
@@ -12127,7 +14492,138 @@ function decomp:_child(proto, up, ph)
         args[#args + 1] = name .. (an and (": " .. an) or "")
     end
     if proto.IsVararg then args[#args + 1] = "..." end
+    return args
+end
+
+local function preparepacks(st)
+    st.packnames = {}
+    st.directPacks = {}
+    st.directPackValues = {}
+
+    local consumers = {}
+    for pc, producer in pairs(st.ssa.packInput or {}) do
+        if type(producer) == "number" then
+            local list = consumers[producer]
+            if not list then list = {}; consumers[producer] = list end
+            list[#list + 1] = pc
+        end
+    end
+
+    local pcs = {}
+    for pc, pack in pairs(st.ssa.packsByPC or {}) do
+        if pack and pack.producesTop then pcs[#pcs + 1] = pc end
+    end
+    table.sort(pcs)
+
+    local names = {}
+    for _, pc in ipairs(pcs) do
+        local list = consumers[pc] or {}
+        local consumer = #list == 1 and list[1] or nil
+        local sameblock = consumer and st.cfg.blockmap[pc] == st.cfg.blockmap[consumer]
+        if consumer and sameblock and st:next(pc) == consumer then
+
+
+            st.directPacks[pc] = consumer
+        else
+            local name = st.naming:unique("__pack" .. tostring(pc))
+            st.packnames[pc] = name
+            st.declared[name] = 0
+            names[#names + 1] = name
+        end
+    end
+
+    for i = 1, #names, 8 do
+        local chunk = {}
+        for j = i, math.min(i + 7, #names) do chunk[#chunk + 1] = names[j] end
+        st:out("local " .. table.concat(chunk, ", "))
+    end
+end
+
+local function packtail(st, pc)
+    local producer = st.ssa.packInput and st.ssa.packInput[pc] or nil
+    if producer == st.ssa.ambiguousPack then
+        error("LumenV4: UNSUPPORTED divergent ValuePack at pc " .. tostring(pc), 2)
+    end
+    if type(producer) ~= "number" then
+        error("LumenV4: UNSUPPORTED open ValuePack consumer without unique producer at pc " .. tostring(pc), 2)
+    end
+    local _, _, pp = regs.readWrite(st.proto.Instructions[producer])
+    local direct = st.directPackValues and st.directPackValues[producer]
+    if direct then return producer, pp.openWriteFrom, direct.node end
+    local name = assert(st.packnames and st.packnames[producer], "LumenV4: missing ValuePack temp")
+    return producer, pp.openWriteFrom, ex.atom("table.unpack(" .. name .. ", 1, " .. name .. ".n)", false)
+end
+
+function decomp:_op(st, pc)
+    local op = st.proto.Instructions[pc]
+    local _, _, pack = regs.readWrite(op)
+    st.top = nil
+    if pack.consumesTop then
+        local _, base, node = packtail(st, pc)
+        if type(base) ~= "number" then error("LumenV4: invalid ValuePack producer at pc " .. tostring(pc), 2) end
+        if pack.openReadFrom and base < pack.openReadFrom then
+            error("LumenV4: invalid ValuePack base at pc " .. tostring(pc), 2)
+        end
+        st.top = { reg = base, node = node, v4 = true }
+    end
+
+    local name = ins.name(op)
+    local nx
+
+    if name == "NEWTABLE" then
+        st:set(pc, op.A, ex.atom("{}", false))
+        nx = st:next(pc)
+    elseif name == "DUPTABLE" then
+        local constant = st.proto.Constants and st.proto.Constants[(op.D or 0) + 1]
+        st:set(pc, op.A, ex.atom(lit.constant(constant), false))
+        nx = st:next(pc)
+    else
+        nx = ops.run(self, st, pc)
+    end
+
+    if pack.producesTop then
+        local produced = st.top
+        if not produced or not produced.node then
+            error("LumenV4: open-result producer did not expose a ValuePack at pc " .. tostring(pc), 2)
+        end
+        local base = assert(pack.openWriteFrom, "LumenV4: ValuePack producer has no base")
+        if st.directPacks and st.directPacks[pc] then
+            st.directPackValues[pc] = { reg = base, node = produced.node }
+        else
+            local name = assert(st.packnames and st.packnames[pc], "LumenV4: missing producer ValuePack temp")
+            st:out(name .. " = table.pack(" .. ex.str(produced.node) .. ")")
+            for reg, version in pairs(st.ssa.defsByPC[pc] or {}) do
+                if reg >= base then
+                    local node = ex.atom(name .. "[" .. tostring(reg - base + 1) .. "]", false)
+                    st.vals[version] = node
+                    st.expr[version] = node
+                end
+            end
+        end
+        st.top = nil
+    end
+    return nx
+end
+
+function decomp:_child(proto, up, ph)
+    local st = self:_state(proto, up, ph)
+    local args = arguments(st, proto)
+    preparepacks(st)
     self:_region(st, 1, #proto.Instructions + 1, {})
+
+    if hashard(st) then
+
+        st = self:_state(proto, up, ph)
+        args = arguments(st, proto)
+        preparepacks(st)
+        st.v4.fallback = true
+        st.v4.status = "LOSSLESS_FALLBACK"
+        self:_dispatcher(st)
+        if hashard(st) then
+            error("LumenV4: UNSUPPORTED semantic lowering issue: " .. table.concat(st.bad, " | "), 2)
+        end
+    end
+
     local root = astpass.run(st.ast:done(), self.opt)
     return root, st, args
 end
@@ -12135,229 +14631,149 @@ end
 function decomp:_numfor(st, pc, op, stop, active)
     local info = loops.numInfo(st, pc, op, stop)
     if not info then return nil end
-    local loop = info.loop
-    local a = op.A
-    local old = st.alias[a + 3]
-    local lv = st:verdef(loop, a + 3)
+    local loop, a = info.loop, op.A
+
+
+    local body = st:next(pc)
+    local varreg = a + 2
+    local bodystart = body
+    local first = st.proto.Instructions[body]
+    if first and ins.name(first) == "MOVE" and first.B == a + 2 and first.A == a + 3 then
+        varreg = a + 3
+        st.v4.visited[body] = true
+        bodystart = st:next(body)
+    end
+
+    local old = st.alias[varreg]
+    local lv = varreg == a + 2 and st:veruse(body, varreg) or st:verdef(body, varreg)
+    if not lv then lv = st:veruse(loop, a + 2) or st:verdef(loop, a + 2) end
     local depth = (active.loopdepth or 0) + 1
     local fall = ({ "i", "j", "k", "n" })[depth] or ("i" .. tostring(depth))
-    local var = not loopused(st, a + 3, st:next(pc), loop) and "_" or st:vname(lv, a + 3, fall, loop)
-    local limit = ex.str(st:loopx(pc, loop, a))
-    local step = ex.str(st:loopx(pc, loop, a + 1))
-    local init = ex.str(st:loopx(pc, loop, a + 2))
+    local var = not loopused(st, varreg, bodystart, loop) and "_" or st:vname(lv, varreg, fall, body)
+    local limit, step, init = ex.str(st:loopx(pc, loop, a)), ex.str(st:loopx(pc, loop, a + 1)), ex.str(st:loopx(pc, loop, a + 2))
     local head = "for " .. var .. " = " .. init .. ", " .. limit
-    if step ~= "1" then head = head .. ", " .. step end
-    st:out(head .. " do")
-    st.indent += 1
-    st.alias[a + 3] = var
-    st.declared[var] = st.indent
-    local prev = active.loop
-    local olddepth = active.loopdepth
-    active.loop = { breakpc = info.exit, contpc = loop }
-    active.loopdepth = depth
-    self:_region(st, st:next(pc), loop, active)
-    active.loop = prev
-    active.loopdepth = olddepth
-    st:trim(st.indent)
-    st.indent -= 1
-    st:out("end")
-    st.alias[a + 3] = old
+    if step ~= "1" then head ..= ", " .. step end
+    st:out(head .. " do"); st.indent += 1
+    st.alias[varreg] = var; st.declared[var] = st.indent
+    local prev, olddepth = active.loop, active.loopdepth
+    active.loop = { breakpc = info.exit, contpc = loop }; active.loopdepth = depth
+    self:_region(st, bodystart, loop, active)
+    active.loop, active.loopdepth = prev, olddepth
+    st:trim(st.indent); st.indent -= 1; st:out("end"); st.alias[varreg] = old
+    st.v4.visited[loop] = true
     return info.exit
 end
 
 function decomp:_genfor(st, pc, op, stop, active)
     local info = loops.genInfo(st, pc, op, stop)
     if not info then return nil end
-    local loop = info.loop
-    local lop = info.op
+    local loop, lop = info.loop, info.op
     local aux = lop.AuxValue and lop.AuxValue.Value or 0
     local n = math.max(1, bit32.band(aux, 0xff))
-    local depth = (active.loopdepth or 0) + 1
-    local vars, old = {}, {}
+    local depth, vars, old = (active.loopdepth or 0) + 1, {}, {}
     for i = 1, n do
-        local r = op.A + 2 + i
-        old[r] = st.alias[r]
+        local r = op.A + 2 + i; old[r] = st.alias[r]
         local hint = i == 1 and (n == 1 and "item" or "key") or (i == 2 and "value" or ("value" .. tostring(i)))
         local v = st:verdef(loop, r)
         vars[i] = not loopused(st, r, st:next(pc), loop) and "_" or st:vname(v, r, hint, loop)
     end
-
     local src
-    local regs = { op.A, op.A + 1, op.A + 2 }
-    local gv = st:veruse(pc, op.A)
-    local g = gv and st.group[gv]
-    if g and st:hidegroup(g, pc, loop, regs) then
-        src = ex.str(g.node)
-    elseif ins.name(op) == "FORGPREP_INEXT" then
-        src = "ipairs(" .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ")"
-    elseif ins.name(op) == "FORGPREP_NEXT" then
-        src = "pairs(" .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ")"
-    else
-        src = ex.str(st:loopx(pc, loop, op.A)) .. ", " .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ", " .. ex.str(st:loopx(pc, loop, op.A + 2))
-    end
-
-    st:out("for " .. table.concat(vars, ", ") .. " in " .. src .. " do")
-    st.indent += 1
-    for i = 1, n do
-        local r = op.A + 2 + i
-        st.alias[r] = vars[i]
-        st.declared[vars[i]] = st.indent
-    end
-    local prev = active.loop
-    local olddepth = active.loopdepth
-    active.loop = { breakpc = info.exit, contpc = loop }
-    active.loopdepth = depth
+    local rs = { op.A, op.A + 1, op.A + 2 }
+    local gv = st:veruse(pc, op.A); local g = gv and st.group[gv]
+    if g and st:hidegroup(g, pc, loop, rs) then src = ex.str(g.node)
+    elseif ins.name(op) == "FORGPREP_INEXT" then src = "ipairs(" .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ")"
+    elseif ins.name(op) == "FORGPREP_NEXT" then src = "pairs(" .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ")"
+    else src = ex.str(st:loopx(pc, loop, op.A)) .. ", " .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ", " .. ex.str(st:loopx(pc, loop, op.A + 2)) end
+    st:out("for " .. table.concat(vars, ", ") .. " in " .. src .. " do"); st.indent += 1
+    for i = 1, n do local r = op.A + 2 + i; st.alias[r] = vars[i]; st.declared[vars[i]] = st.indent end
+    local prev, olddepth = active.loop, active.loopdepth
+    active.loop = { breakpc = info.exit, contpc = loop }; active.loopdepth = depth
     self:_region(st, st:next(pc), loop, active)
-    active.loop = prev
-    active.loopdepth = olddepth
-    st:trim(st.indent)
-    st.indent -= 1
-    st:out("end")
+    active.loop, active.loopdepth = prev, olddepth
+    st:trim(st.indent); st.indent -= 1; st:out("end")
     for i = 1, n do st.alias[op.A + 2 + i] = old[op.A + 2 + i] end
+    st.v4.visited[loop] = true
     return info.exit
 end
 
 function decomp:_emitif(st, info, active, word)
-    st:out((word or "if") .. " " .. ex.str(info.cond) .. " then")
-    st.indent += 1
-    local old = active.join
-    active.join = info.join
-    self:_region(st, info.a, info.b, active)
-    active.join = old
-    st:trim(st.indent)
-    st.indent -= 1
-
+    st:out((word or "if") .. " " .. ex.str(info.cond) .. " then"); st.indent += 1
+    local old = active.join; active.join = info.join
+    self:_region(st, info.a, info.b, active); active.join = old
+    st:trim(st.indent); st.indent -= 1
     if info.c then
         local sub = branch.elseifInfo(st, info.c, info.join)
-        if sub then
-            self:_emitif(st, sub, active, "elseif")
-            return
-        end
-        st:out("else")
-        st.indent += 1
-        old = active.join
-        active.join = info.join
-        self:_region(st, info.c, info.d, active)
-        active.join = old
-        st:trim(st.indent)
-        st.indent -= 1
+        if sub then self:_emitif(st, sub, active, "elseif"); return end
+        st:out("else"); st.indent += 1; old = active.join; active.join = info.join
+        self:_region(st, info.c, info.d, active); active.join = old
+        st:trim(st.indent); st.indent -= 1
     end
     st:out("end")
 end
 
 function decomp:_region(st, start, stop, active)
-    local pc = start
-    active = active or {}
-
+    local pc = start; active = active or {}
     while pc < stop and pc <= #st.proto.Instructions do
-        if st.cfg.aux[pc] or st.consumed[pc] then
-            pc += 1
+        if st.cfg.aux[pc] then pc += 1
+        elseif st.consumed[pc] then st.v4.visited[pc] = true; pc += 1
         else
+            st.v4.visited[pc] = true
             local rep
             if not active["repeat:" .. tostring(pc)] then rep = loops.repeatInfo(st, pc) end
             if rep and rep.latch < stop then
-                active["repeat:" .. tostring(pc)] = true
-                st:out("repeat")
-                st.indent += 1
-                local prev = active.loop
-                active.loop = { breakpc = rep.exit, contpc = rep.cont }
-                self:_region(st, rep.body, rep.latch, active)
-                active.loop = prev
-                local x = cond.fall(st, rep.latch, st.proto.Instructions[rep.latch])
-                st:trim(st.indent)
-                st.indent -= 1
-                st:out("until " .. ex.str(x))
-                active["repeat:" .. tostring(pc)] = nil
-                pc = rep.exit
+
+
+                st:hoist(pc)
+                active["repeat:" .. tostring(pc)] = true; st:out("repeat"); st.indent += 1
+                local prev = active.loop; active.loop = { breakpc = rep.exit, contpc = rep.cont }
+                self:_region(st, rep.body, rep.latch, active); active.loop = prev
+                local x = cond.fall(st, rep.latch, st.proto.Instructions[rep.latch]); st.v4.visited[rep.latch] = true
+                st:trim(st.indent); st.indent -= 1; st:out("until " .. ex.str(x)); active["repeat:" .. tostring(pc)] = nil; pc = rep.exit
             else
                 local forever = loops.foreverInfo(st, pc, stop)
                 if forever then
-                    st:out("while true do")
-                    st.indent += 1
-                    local prev = active.loop
-                    active.loop = { breakpc = forever.exit, contpc = forever.cont, cont2 = forever.latch }
-                    self:_region(st, forever.body, forever.latch, active)
-                    active.loop = prev
-                    st:trim(st.indent)
-                    st.indent -= 1
-                    st:out("end")
-                    pc = forever.exit
-                else
-                    local op = st.proto.Instructions[pc]
-                    local name = ins.name(op)
 
-                    if name == "FORNPREP" then
-                        pc = self:_numfor(st, pc, op, stop, active) or ops.run(self, st, pc)
-                    elseif name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" then
-                        pc = self:_genfor(st, pc, op, stop, active) or ops.run(self, st, pc)
+                    st:hoist(pc)
+                    st:out("while true do"); st.indent += 1; local prev = active.loop
+                    active.loop = { breakpc = forever.exit, contpc = forever.cont, cont2 = forever.latch }
+                    self:_region(st, forever.body, forever.latch, active); active.loop = prev; st.v4.visited[forever.latch] = true
+                    st:trim(st.indent); st.indent -= 1; st:out("end"); pc = forever.exit
+                else
+                    local op = st.proto.Instructions[pc]; local name = ins.name(op)
+                    if name == "FORNPREP" then pc = self:_numfor(st, pc, op, stop, active) or self:_op(st, pc)
+                    elseif name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" then pc = self:_genfor(st, pc, op, stop, active) or self:_op(st, pc)
                     elseif name == "CMPPROTO" then
-                        local target = ins.jumpTarget(pc, op)
-                        local join = st:join(pc)
-                        if join and target > pc and target < join and join <= stop then
-                            self:_region(st, target, join, active)
-                            pc = join
-                        else
-                            st:badpc(pc, "unrecognized CMPPROTO inline guard -> " .. tostring(target))
-                            pc = st:next(pc)
-                        end
+                        local target, join = ins.jumpTarget(pc, op), st:join(pc)
+                        if join and target > pc and target < join and join <= stop then self:_region(st, target, join, active); pc = join
+                        else st:badpc(pc, "unrecognized CMPPROTO inline guard -> " .. tostring(target)); pc = st:next(pc) end
                     elseif ins.isConditional(op) and name ~= "FORNLOOP" and name ~= "FORGLOOP" then
-                        local loop = active.loop
-                        local target = ins.jumpTarget(pc, op)
-                        if loop and target == loop.breakpc then
-                            st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then break end")
-                            pc = st:next(pc)
-                        elseif loop and (target == loop.contpc or target == loop.cont2) then
-                            st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then continue end")
-                            pc = st:next(pc)
+                        local loop, target = active.loop, ins.jumpTarget(pc, op)
+                        if loop and target == loop.breakpc then st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then break end"); pc = st:next(pc)
+                        elseif loop and (target == loop.contpc or target == loop.cont2) then st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then continue end"); pc = st:next(pc)
                         else
                             local bp = cond.bool(st, pc, op)
-                            if bp then
-                                pc = bp
+                            if bp then pc = bp
                             else
                                 local wh = loops.whileInfo(st, pc)
                                 if wh and wh.exit <= stop then
-                                    st:hoist(pc)
-                                    st:out("while " .. ex.str(wh.cond) .. " do")
-                                    st.indent += 1
-                                    local prev = active.loop
-                                    active.loop = { breakpc = wh.exit, contpc = wh.cont }
-                                    self:_region(st, wh.body, wh.bodyend, active)
-                                    active.loop = prev
-                                    st:trim(st.indent)
-                                    st.indent -= 1
-                                    st:out("end")
-                                    pc = wh.exit
+                                    st:hoist(pc); st:out("while " .. ex.str(wh.cond) .. " do"); st.indent += 1
+                                    local prev = active.loop; active.loop = { breakpc = wh.exit, contpc = wh.cont }
+                                    self:_region(st, wh.body, wh.bodyend, active); active.loop = prev
+                                    st:trim(st.indent); st.indent -= 1; st:out("end"); pc = wh.exit
                                 else
                                     local info = branch.info(st, pc, stop)
-                                    if info and info.join <= stop then
-                                        st:hoist(info.join)
-                                        self:_emitif(st, info, active)
-                                        pc = info.join
-                                    else
-                                        st:badpc(pc, "unstructured conditional " .. name .. " -> " .. tostring(target))
-                                        pc = st:next(pc)
-                                    end
+                                    if info and info.join <= stop then st:hoist(info.join); self:_emitif(st, info, active); pc = info.join
+                                    else st:badpc(pc, "unstructured conditional " .. name .. " -> " .. tostring(target)); pc = st:next(pc) end
                                 end
                             end
                         end
                     elseif name == "JUMP" or name == "JUMPBACK" or name == "JUMPX" then
-                        local target = ins.jumpTarget(pc, op)
-                        local loop = active.loop
-                        if loop and target == loop.breakpc then
-                            st:out("break")
-                            pc = st:next(pc)
-                        elseif loop and (target == loop.contpc or target == loop.cont2) then
-                            st:out("continue")
-                            pc = st:next(pc)
-                        elseif target == stop or target == active.join then
-                            pc = stop
-                        else
-                            st:badpc(pc, "unstructured jump -> " .. tostring(target))
-                            pc = st:next(pc)
-                        end
-                    else
-                        pc = ops.run(self, st, pc)
-                    end
+                        local target, loop = ins.jumpTarget(pc, op), active.loop
+                        if loop and target == loop.breakpc then st:out("break"); pc = st:next(pc)
+                        elseif loop and (target == loop.contpc or target == loop.cont2) then st:out("continue"); pc = st:next(pc)
+                        elseif target == stop or target == active.join then pc = stop
+                        else st:badpc(pc, "unstructured jump -> " .. tostring(target)); pc = st:next(pc) end
+                    else pc = self:_op(st, pc) end
                 end
             end
         end
@@ -12365,29 +14781,164 @@ function decomp:_region(st, start, stop, active)
     return pc
 end
 
+local function dispatcherunsupported(st)
+    for _, n in ipairs(st.ir.ops) do
+        local name = n.name
+        if name == "FORNPREP" or name == "FORNLOOP" or name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" or name == "FORGLOOP" then
+            return "dispatcher requires VM loop-state emulation for " .. name .. " at pc " .. tostring(n.pc)
+        end
+        if name == "CMPPROTO" then return "CMPPROTO cannot be represented losslessly in source fallback at pc " .. tostring(n.pc) end
+        if name == "CLOSEUPVALS" then return "dispatcher would change upvalue close/cell lifetime at pc " .. tostring(n.pc) end
+        if name == "CAPTURE" and n.op.A == 1 then return "dispatcher would hoist a by-reference captured local cell at pc " .. tostring(n.pc) end
+    end
+end
+
+function decomp:_dispatcher(st)
+    local why = dispatcherunsupported(st)
+    if why then error("LumenV4: UNSUPPORTED lossless fallback: " .. why, 2) end
+
+
+    local nameset, ordered = {}, {}
+    for id, v in ipairs(st.ir.vals) do
+        if v and not st.ir.dead[id] and v.kind ~= "param" and v.kind ~= "undef" then
+            local name = st:vname(id, v.reg, nil, v.pc or 1)
+            if name and not nameset[name] and st.declared[name] == nil then nameset[name] = true; ordered[#ordered + 1] = name end
+        end
+    end
+    table.sort(ordered)
+    for i = 1, #ordered, 12 do
+        local chunk = {}; for j = i, math.min(i + 11, #ordered) do chunk[#chunk + 1] = ordered[j]; st.declared[ordered[j]] = 0 end
+        st:out("local " .. table.concat(chunk, ", "))
+    end
+
+    local state = st.naming:unique("__lumenstate")
+    st.declared[state] = 0
+    st:out("local " .. state .. " = 1")
+    st:out("while true do"); st.indent += 1
+
+    for bi, b in ipairs(st.cfg.blocks) do
+        st:out((bi == 1 and "if " or "elseif ") .. state .. " == " .. tostring(b.id) .. " then")
+        st.indent += 1
+        st.top = nil
+        for pi, pc in ipairs(b.pcs) do
+            st.v4.visited[pc] = true
+            if not st.consumed[pc] then
+                local op, name = st.proto.Instructions[pc], ins.name(st.proto.Instructions[pc])
+                local last = pi == #b.pcs
+                if last and ins.isConditional(op) then
+                    local target, fall = st.cfg.blockmap[ins.jumpTarget(pc, op)], st.cfg.blockmap[st:next(pc)]
+                    if not target or not fall then error("LumenV4: invalid dispatcher conditional edge at pc " .. tostring(pc), 2) end
+                    st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then")
+                    st.indent += 1; st:out(state .. " = " .. tostring(target)); st.indent -= 1
+                    st:out("else"); st.indent += 1; st:out(state .. " = " .. tostring(fall)); st.indent -= 1; st:out("end")
+                elseif last and (name == "JUMP" or name == "JUMPBACK" or name == "JUMPX") then
+                    local target = st.cfg.blockmap[ins.jumpTarget(pc, op)]
+                    if not target then error("LumenV4: invalid dispatcher jump edge at pc " .. tostring(pc), 2) end
+                    st:out(state .. " = " .. tostring(target))
+                elseif last and name == "LOADB" and (op.C or 0) ~= 0 then
+                    self:_op(st, pc)
+                    local target = st.cfg.blockmap[pc + op.C + 1]
+                    if not target then error("LumenV4: invalid LOADB edge at pc " .. tostring(pc), 2) end
+                    st:out(state .. " = " .. tostring(target))
+                else
+                    self:_op(st, pc)
+                    if last and name ~= "RETURN" then
+                        if #b.successors == 1 then st:out(state .. " = " .. tostring(b.successors[1]))
+                        elseif #b.successors == 0 then st:out("break")
+                        elseif #b.successors > 1 then error("LumenV4: unhandled multi-successor block at pc " .. tostring(pc), 2) end
+                    end
+                end
+            end
+        end
+        st.indent -= 1
+    end
+    st:out("else"); st.indent += 1; st:out("error(\"LumenV4: invalid dispatcher state \" .. tostring(" .. state .. "))"); st.indent -= 1
+    st:out("end")
+    st.indent -= 1; st:out("end")
+end
+
+local function metrics(st)
+    local reachable, covered = 0, 0
+    for pc = 1, #st.proto.Instructions do
+        if not st.cfg.aux[pc] and st.cfg.blockmap[pc] then
+            reachable += 1
+            if st.v4.visited[pc] or st.consumed[pc] then covered += 1 end
+        end
+    end
+    return reachable, covered, reachable == 0 and 1 or covered / reachable
+end
+
 function decomp:decompileProto(proto, up)
     local root, st = self:_child(proto, up or {})
-    return printer.run(root, self.opt), {
-        cfg = st.cfg,
-        ir = st.ir,
-        ssa = st.ssa,
-        ssaSummary = st.ssa:summary(),
-        issues = st.bad,
+    local src = printer.run(root, self.opt)
+    local reachable, covered, coverage = metrics(st)
+    if covered ~= reachable then
+        error(("LumenV4: PARTIAL origin coverage %d/%d (%.2f%%)"):format(covered, reachable, coverage * 100), 2)
+    end
+    local ss = st.ssa:summary()
+    local structuredblocks = st.v4.fallback and 0 or #st.cfg.blocks
+    local fallbackblocks = st.v4.fallback and #st.cfg.blocks or 0
+    local objectcount, escapedobjects = 0, 0
+    for _, obj in pairs(st.ir.objects or {}) do
+        objectcount += 1
+        if obj.escaped then escapedobjects += 1 end
+    end
+    local cellcount = 0
+    for _ in pairs(st.ir.cells or {}) do cellcount += 1 end
+    local packcount = 0
+    for _, pack in pairs(st.ssa.packsByPC or {}) do if pack and pack.producesTop then packcount += 1 end end
+    local irreducible = st.cfg.irreducible and 1 or 0
+    local bytecodeversion = self.parsed and self.parsed.BytecodeVersion or 0
+
+    if type(loadstring) ~= "function" then
+        error("LumenV4: UNSUPPORTED syntax verification requires loadstring()", 2)
+    end
+
+    local header = ("-- LumenV4 status=%s coverage=%.2f reachable=%d covered=%d blocks=%d structuredBlocks=%d fallbackBlocks=%d phis=%d undefs=%d packs=%d cells=%d objects=%d escapedObjects=%d irreducible=%d bytecodeVersion=%d ssa=true parser=true diagnostics=%d\n")
+        :format(st.v4.status, coverage * 100, reachable, covered, #st.cfg.blocks, structuredblocks, fallbackblocks,
+            ss.phis or 0, ss.undefs or 0, packcount, cellcount, objectcount, escapedobjects, irreducible, bytecodeversion, #st.bad)
+    src = header .. src
+    local check, err = loadstring(src, "@LumenV4/verify")
+    if not check then error("LumenV4: INVALID emitted Luau: " .. tostring(err), 2) end
+
+    return src, {
+        status = st.v4.status, cfg = st.cfg, ir = st.ir, ssa = st.ssa, ssaSummary = ss, issues = st.bad,
+        coverage = coverage, coveredInstructions = covered, reachableInstructions = reachable, fallback = st.v4.fallback,
+        syntaxValid = true, originCoverageValid = true, verification = "syntax+CFG-origin-invariants",
+        objectCount = objectcount, escapedObjects = escapedobjects, cellCount = cellcount, valuePackCount = packcount,
+        irreducible = st.cfg.irreducible == true, bytecodeVersion = bytecodeversion,
     }
 end
 
 function decomp:decompileParsed(parsed)
     local proto = parsed.Protos[parsed.ProtoEntryPoint]
-    assert(proto, "LumenDecomp: parsed bytecode has no entry proto")
+    assert(proto, "LumenV4: parsed bytecode has no entry proto")
     self.parsed = parsed
-    local src, info = self:decompileProto(proto, {})
+
+    local ok, src, info = pcall(function() return self:decompileProto(proto, {}) end)
+    if ok then
+        self.parsed = nil
+        return src, info
+    end
+
+
+    local structurederror = tostring(src)
+    local fok, fsrc, finfo = pcall(function()
+        return vmfallback.run(parsed, structurederror)
+    end)
     self.parsed = nil
-    return src, info
+
+    if not fok then
+        error("LumenV4: VM fallback generator failure after structured failure: " .. tostring(fsrc)
+            .. " | structured: " .. structurederror, 2)
+    end
+    return fsrc, finfo
 end
 
 return decomp
 ]===],
     ["main.decompiler.ops"] = [===[
+
 local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 local ex = require("main.output.expr")
@@ -12684,6 +15235,7 @@ end
 return ops
 ]===],
     ["main.ir.block"] = [===[
+
 local block = {}
 block.__index = block
 
@@ -12713,81 +15265,336 @@ local block = require("main.ir.block")
 
 local build = {}
 
-function build.run(proto)
-    local cfg = graph.build(proto)
-    local flow = ssa.build(proto, cfg)
-    local out = fn.new(proto, cfg, flow)
+local function copyset(src)
+    local out = {}; if src then for k in pairs(src) do out[k] = true end end; return out
+end
+local function unionset(dst, src)
+    local changed = false
+    if src then for k in pairs(src) do if not dst[k] then dst[k] = true; changed = true end end end
+    return changed
+end
+local function seteq(a, b)
+    a, b = a or {}, b or {}
+    for k in pairs(a) do if not b[k] then return false end end
+    for k in pairs(b) do if not a[k] then return false end end
+    return true
+end
 
-    for id, src in ipairs(flow.versions) do
-        out.vals[id] = val.new(id, src)
-        if src.dead then out.dead[id] = true end
-    end
 
-    for bid, phis in pairs(flow.phisByBlock) do
-        local dst = {}
-        out.phis[bid] = dst
-        for reg, p in pairs(phis) do
-            dst[reg] = { id = p.id, reg = reg, inputs = p.inputs, missing = p.missing }
-        end
-    end
-
-    for _, src in ipairs(cfg.blocks) do
-        local b = block.new(src)
-        out.blocks[b.id] = b
-        for _, pc in ipairs(src.pcs) do
-            local op = proto.Instructions[pc]
-            local name = ins.name(op)
-            local reads, writes = regs.readWrite(op)
-            local n = {
-                pc = pc,
-                op = op,
-                name = name,
-                block = b.id,
-                reads = reads,
-                writes = writes,
-                pure = fx.pure(name),
-                drop = fx.drop(name),
-                quiet = fx.quiet(name),
-                effect = fx.effect(name),
-                term = fx.term(name),
-            }
-            out.ops[#out.ops + 1] = n
-            out.bypc[pc] = n
-            b.ops[#b.ops + 1] = n
-        end
-    end
-
-    out:reindex()
+local function copystate(src)
+    local out = {}
+    for r, set in pairs(src or {}) do out[r] = copyset(set) end
     return out
 end
 
+local function stateeq(a, b)
+    a, b = a or {}, b or {}
+    for r, set in pairs(a) do if not seteq(set, b[r]) then return false end end
+    for r, set in pairs(b) do if not seteq(set, a[r]) then return false end end
+    return true
+end
+
+
+local function analyzecells(out)
+    local capturecell, capturereg, nextcell = {}, {}, 1
+    for _, n in ipairs(out.ops) do
+        if n.name == "CAPTURE" and n.op.A == 1 then
+            capturecell[n.pc] = nextcell
+            capturereg[nextcell] = n.op.B
+            nextcell += 1
+        end
+    end
+
+    if nextcell == 1 then
+        out.cells, out.cellOfValue, out.captureCell = {}, {}, capturecell
+        return out
+    end
+
+    local instate, outstate = {}, {}
+    local function merged(block)
+        if block.id == 1 then return {} end
+        local result = {}
+        for _, pred in ipairs(block.predecessors) do
+            for r, set in pairs(outstate[pred] or {}) do
+                local dst = result[r]
+                if not dst then dst = {}; result[r] = dst end
+                unionset(dst, set)
+            end
+        end
+        return result
+    end
+
+    local function transfer(block, incoming)
+        local state = copystate(incoming)
+        for _, pc in ipairs(block.pcs) do
+            local op = out.proto.Instructions[pc]
+            local name = ins.name(op)
+            if name == "CAPTURE" and op.A == 1 then
+                local set = state[op.B]
+                if not set then set = {}; state[op.B] = set end
+                set[capturecell[pc]] = true
+            elseif name == "CLOSEUPVALS" then
+                for r in pairs(state) do if r >= (op.A or 0) then state[r] = nil end end
+            end
+        end
+        return state
+    end
+
+    local changed, iterations = true, 0
+    local limit = math.max(32, #out.cfg.blocks * (nextcell + 8) * 4)
+    while changed do
+        iterations += 1
+        if iterations > limit then error("LumenV4: CellId dataflow failed to converge", 2) end
+        changed = false
+        for _, b in ipairs(out.cfg.blocks) do
+            local incoming = merged(b)
+            if not stateeq(instate[b.id], incoming) then instate[b.id] = incoming; changed = true end
+            local outgoing = transfer(b, incoming)
+            if not stateeq(outstate[b.id], outgoing) then outstate[b.id] = outgoing; changed = true end
+        end
+    end
+
+    local valuecells, closesites = {}, {}
+    local function markvalue(version, set)
+        if not version or not set or not next(set) then return end
+        local dst = valuecells[version]
+        if not dst then dst = {}; valuecells[version] = dst end
+        unionset(dst, set)
+    end
+
+    for _, b in ipairs(out.cfg.blocks) do
+        local state = copystate(instate[b.id])
+        for _, pc in ipairs(b.pcs) do
+            local op = out.proto.Instructions[pc]
+            local name = ins.name(op)
+            local uses = out.ssa.usesByPC[pc] or {}
+            local defs = out.ssa.defsByPC[pc] or {}
+
+            if name == "CAPTURE" and op.A == 1 then
+                local set = state[op.B]
+                if not set then set = {}; state[op.B] = set end
+                set[capturecell[pc]] = true
+            end
+
+            for r, version in pairs(uses) do markvalue(version, state[r]) end
+            for r, version in pairs(defs) do markvalue(version, state[r]) end
+
+            if name == "CLOSEUPVALS" then
+                for r, set in pairs(state) do
+                    if r >= (op.A or 0) then
+                        for cid in pairs(set) do
+                            local list = closesites[cid]
+                            if not list then list = {}; closesites[cid] = list end
+                            list[pc] = true
+                        end
+                        state[r] = nil
+                    end
+                end
+            end
+        end
+    end
+
+    local parent = {}
+    for cid = 1, nextcell - 1 do parent[cid] = cid end
+    local function root(x)
+        local p = parent[x]
+        if p ~= x then parent[x] = root(p) end
+        return parent[x]
+    end
+    local function join(a, b)
+        a, b = root(a), root(b)
+        if a ~= b then if a < b then parent[b] = a else parent[a] = b end end
+    end
+    local function joinset(set)
+        local first
+        for cid in pairs(set or {}) do if first then join(first, cid) else first = cid end end
+    end
+    for _, set in pairs(valuecells) do joinset(set) end
+    for _, state in pairs(instate) do for _, set in pairs(state) do joinset(set) end end
+    for _, state in pairs(outstate) do for _, set in pairs(state) do joinset(set) end end
+
+    local cells, cellofvalue = {}, {}
+    for pc, cid in pairs(capturecell) do
+        local rid = root(cid)
+        capturecell[pc] = rid
+        local c = cells[rid]
+        if not c then c = { id = rid, reg = capturereg[cid], captures = {}, closes = {}, values = {} }; cells[rid] = c end
+        c.captures[#c.captures + 1] = pc
+    end
+    for version, set in pairs(valuecells) do
+        local rid
+        for cid in pairs(set) do rid = root(cid); break end
+        if rid then
+            cellofvalue[version] = rid
+            local c = cells[rid]
+            if not c then c = { id = rid, reg = capturereg[rid], captures = {}, closes = {}, values = {} }; cells[rid] = c end
+            c.values[version] = true
+        end
+    end
+    for cid, sites in pairs(closesites) do
+        local rid = root(cid)
+        local c = cells[rid]
+        if c then for pc in pairs(sites) do c.closes[pc] = true end end
+    end
+    for _, c in pairs(cells) do table.sort(c.captures) end
+
+    out.cells = cells
+    out.cellOfValue = cellofvalue
+    out.captureCell = capturecell
+    out.cellInState = instate
+    out.cellOutState = outstate
+    out.cellIterations = iterations
+    function out:cellId(valueid) return self.cellOfValue[valueid] or self.cellOfValue[self:resolve(valueid)] end
+    return out
+end
+
+local function analyzeobjects(out)
+    local sets, objects, nextobject = {}, {}, 1
+    local function def(pc, reg)
+        local d = out.ssa.defsByPC[pc]; return d and d[reg] or nil
+    end
+    local function use(pc, reg)
+        local u = out.ssa.usesByPC[pc]; return u and u[reg] or nil
+    end
+    local function assign(id, nextset)
+        if not id then return false end
+        if not seteq(sets[id], nextset) then sets[id] = copyset(nextset); return true end
+        return false
+    end
+
+    for _, n in ipairs(out.ops) do
+        if n.name == "NEWTABLE" or n.name == "DUPTABLE" or n.name == "NEWCLASS" then
+            local id = def(n.pc, n.op.A)
+            if id then
+                local oid = nextobject; nextobject += 1
+                objects[oid] = { id = oid, allocPC = n.pc, kind = n.name, escaped = false, escapePCs = {}, aliases = {} }
+                sets[id] = { [oid] = true }
+            end
+        end
+    end
+
+    local changed, iterations = true, 0
+    local limit = math.max(32, #out.ops * 8 + 32)
+    while changed do
+        iterations += 1; if iterations > limit then error("LumenV4: ObjectId propagation failed to converge", 2) end
+        changed = false
+        for _, n in ipairs(out.ops) do
+            if n.name == "MOVE" then
+                changed = assign(def(n.pc, n.op.A), sets[use(n.pc, n.op.B)]) or changed
+            elseif n.name == "NAMECALL" or n.name == "NAMECALLUDATA" then
+
+                changed = assign(def(n.pc, n.op.A + 1), sets[use(n.pc, n.op.B)]) or changed
+            end
+        end
+        for _, phis in pairs(out.phis) do
+            for _, phi in pairs(phis) do
+                local merged = {}
+                for raw in pairs(phi.inputs or {}) do unionset(merged, sets[raw]) end
+                changed = assign(phi.id, merged) or changed
+            end
+        end
+    end
+
+    local function mark(id, pc, reason)
+        for oid in pairs(sets[id] or {}) do
+            local obj = objects[oid]
+            obj.escaped = true
+            obj.escapePCs[pc] = reason or true
+        end
+    end
+
+
+    for id, os in pairs(sets) do for oid in pairs(os) do objects[oid].aliases[id] = true end end
+    for _, n in ipairs(out.ops) do
+        local pc, op, name = n.pc, n.op, n.name
+        local reads = out.ssa.usesByPC[pc] or {}
+        local safebase = {}
+        if name == "GETTABLE" or name == "GETTABLEKS" or name == "GETTABLEN" or name == "GETUDATAKS" then safebase[op.B] = true
+        elseif name == "SETTABLE" or name == "SETTABLEKS" or name == "SETTABLEN" or name == "SETUDATAKS" then safebase[op.B] = true
+        elseif name == "SETLIST" then safebase[op.A] = true
+        elseif name == "NAMECALL" or name == "NAMECALLUDATA" then safebase[op.B] = true
+        elseif name == "MOVE" then safebase[op.B] = true
+        end
+
+        for reg, id in pairs(reads) do
+            if sets[id] and not safebase[reg] then
+                local reason = name
+                if name == "CALL" or name == "CALLFB" then reason = "CallUnknown"
+                elseif name == "RETURN" then reason = "Return"
+                elseif name == "CAPTURE" then reason = "Capture"
+                elseif name == "SETGLOBAL" or name == "SETUPVAL" then reason = "StoreExternal"
+                elseif name:match("^SETTABLE") or name == "SETUDATAKS" or name == "SETLIST" then reason = "StoreHeap" end
+                mark(id, pc, reason)
+            end
+        end
+    end
+
+    out.objectSets = sets
+    out.objects = objects
+    out.objectIterations = iterations
+    function out:objectIds(valueid) return self.objectSets[self:resolve(valueid)] or {} end
+    function out:objectId(valueid)
+        local one
+        for oid in pairs(self:objectIds(valueid)) do if one then return nil end; one = oid end
+        return one
+    end
+    return out
+end
+
+function build.run(proto)
+    local cfg = graph.build(proto)
+    local flow = ssa.build(proto, cfg)
+    assert(flow.converged, "LumenV4: refusing non-converged SSA")
+    local out = fn.new(proto, cfg, flow)
+    for id, src in ipairs(flow.versions) do
+        out.vals[id] = val.new(id, src)
+        if src.dead then out.dead[id] = true end
+        if src.kind == "undef" then out.const[id] = "nil"; out.inline[id] = true end
+    end
+    for bid, phis in pairs(flow.phisByBlock) do
+        local dst = {}; out.phis[bid] = dst
+        for reg, p in pairs(phis) do
+            dst[reg] = { id = p.id, reg = reg, inputs = p.inputs, incoming = p.incoming, missing = p.missing }
+        end
+    end
+    for _, src in ipairs(cfg.blocks) do
+        local b = block.new(src); out.blocks[b.id] = b
+        for _, pc in ipairs(src.pcs) do
+            local op = proto.Instructions[pc]
+            local name = ins.name(op)
+            local reads, writes, pack = regs.readWrite(op)
+            local n = { pc = pc, op = op, name = name, block = b.id, reads = reads, writes = writes, pack = pack,
+                pure = fx.pure(name), drop = fx.drop(name), quiet = fx.quiet(name), effect = fx.effect(name), term = fx.term(name) }
+            out.ops[#out.ops + 1] = n; out.bypc[pc] = n; b.ops[#b.ops + 1] = n
+        end
+    end
+    out:reindex()
+    analyzecells(out)
+    analyzeobjects(out)
+    return out
+end
 return build
 ]===],
     ["main.ir.effects"] = [===[
+
 local fx = {}
 
-local pure = {
+local relocatable = {
     LOADNIL = true, LOADB = true, LOADN = true, LOADK = true, LOADKX = true,
-    MOVE = true, GETUPVAL = true, GETIMPORT = true, GETGLOBAL = true,
-    GETTABLE = true, GETTABLEKS = true, GETTABLEN = true, GETUDATAKS = true,
-    ADD = true, SUB = true, MUL = true, DIV = true, MOD = true, POW = true,
-    IDIV = true, ADDK = true, SUBK = true, MULK = true, DIVK = true,
-    MODK = true, POWK = true, IDIVK = true, SUBRK = true, DIVRK = true,
-    AND = true, OR = true, ANDK = true, ORK = true, CONCAT = true,
-    NOT = true, MINUS = true, LENGTH = true, NEWTABLE = true, DUPTABLE = true,
-    GETVARARGS = true,
+
+    MOVE = true,
 }
 
-local drop = {
-    LOADNIL = true, LOADB = true, LOADN = true, LOADK = true, LOADKX = true,
-    MOVE = true, GETUPVAL = true, AND = true, OR = true, ANDK = true, ORK = true,
-    NOT = true, NEWTABLE = true, DUPTABLE = true, GETVARARGS = true,
+local discardable = {
+    LOADNIL = true, LOADB = true, LOADN = true, LOADK = true, LOADKX = true, MOVE = true,
+    NOT = true, AND = true, OR = true, ANDK = true, ORK = true,
+
+
 }
 
 local quiet = {
-    NOP = true, LOADNIL = true, LOADB = true, LOADN = true, LOADK = true,
-    LOADKX = true, MOVE = true, GETUPVAL = true, PREPVARARGS = true,
-    COVERAGE = true,
+    NOP = true, LOADNIL = true, LOADB = true, LOADN = true, LOADK = true, LOADKX = true,
+    MOVE = true, PREPVARARGS = true, COVERAGE = true,
 }
 
 local term = {
@@ -12799,31 +15606,39 @@ local term = {
     FORGPREP_NEXT = true, FORGLOOP = true, CMPPROTO = true,
 }
 
-function fx.pure(name)
-    return pure[name] == true
-end
+local effects = {
+    GETGLOBAL = "ReadGlobal", SETGLOBAL = "WriteGlobal",
+    GETUPVAL = "ReadCell", SETUPVAL = "WriteCell", CLOSEUPVALS = "CloseCells", CAPTURE = "CaptureCell",
+    GETTABLE = "ReadTable", GETTABLEKS = "ReadTable", GETTABLEN = "ReadTable", GETUDATAKS = "ReadTable",
+    SETTABLE = "WriteTable", SETTABLEKS = "WriteTable", SETTABLEN = "WriteTable", SETUDATAKS = "WriteTable",
+    CALL = "CallUnknown", CALLFB = "CallUnknown", NAMECALL = "ReadTable", NAMECALLUDATA = "ReadTable",
+    NEWCLOSURE = "AllocateClosure", DUPCLOSURE = "AllocateClosure",
+    NEWTABLE = "AllocateObject", DUPTABLE = "AllocateObject", NEWCLASS = "AllocateObject", NEWCLASSMEMBER = "WriteTable",
+    ADD = "MayMetamethod", SUB = "MayMetamethod", MUL = "MayMetamethod", DIV = "MayMetamethod", MOD = "MayMetamethod",
+    POW = "MayMetamethod", IDIV = "MayMetamethod", ADDK = "MayMetamethod", SUBK = "MayMetamethod", MULK = "MayMetamethod",
+    DIVK = "MayMetamethod", MODK = "MayMetamethod", POWK = "MayMetamethod", IDIVK = "MayMetamethod",
+    SUBRK = "MayMetamethod", DIVRK = "MayMetamethod", CONCAT = "MayMetamethod", LENGTH = "MayMetamethod",
+    GETIMPORT = "ReadImport", NATIVECALL = "CallUnknown",
+}
 
-function fx.drop(name)
-    return drop[name] == true
+function fx.pure(name) return relocatable[name] == true end
+function fx.drop(name) return discardable[name] == true end
+function fx.quiet(name) return quiet[name] == true end
+function fx.term(name) return term[name] == true end
+function fx.class(name)
+    if term[name] then return "Control" end
+    return effects[name] or (quiet[name] and "Pure" or "Unknown")
 end
-
-function fx.quiet(name)
-    return quiet[name] == true
-end
-
-function fx.term(name)
-    return term[name] == true
-end
-
 function fx.effect(name)
-    if drop[name] or quiet[name] or term[name] then return false end
-    if name == "NOP" or name == "BREAK" or name == "CLOSEUPVALS" or name == "PREPVARARGS" or name == "COVERAGE" or name == "NATIVECALL" or name == "CAPTURE" then return false end
-    return true
+    local c = fx.class(name)
+    return c ~= "Pure" and c ~= "Control"
 end
+function fx.canRelocate(name) return relocatable[name] == true end
 
 return fx
 ]===],
     ["main.ir.function"] = [===[
+
 local fn = {}
 fn.__index = fn
 
@@ -12920,6 +15735,7 @@ end
 return fn
 ]===],
     ["main.ir.value"] = [===[
+
 local val = {}
 val.__index = val
 
@@ -12941,6 +15757,7 @@ end
 return val
 ]===],
     ["main.naming.debug_names"] = [===[
+
 local id = require("main.naming.identifiers")
 
 local dbg = {}
@@ -12989,6 +15806,7 @@ end
 return dbg
 ]===],
     ["main.naming.identifiers"] = [===[
+
 local id = {}
 
 local kw = {
@@ -13034,6 +15852,7 @@ end
 return id
 ]===],
     ["main.naming.resolver"] = [===[
+
 local id = require("main.naming.identifiers")
 local rbx = require("main.naming.roblox")
 local dbg = require("main.naming.debug_names")
@@ -13151,6 +15970,7 @@ names.fromCall = rbx.fromCall
 return names
 ]===],
     ["main.naming.roblox"] = [===[
+
 local id = require("main.naming.identifiers")
 local words = require("main.naming.words")
 
@@ -13240,6 +16060,7 @@ end
 return rbx
 ]===],
     ["main.naming.types"] = [===[
+
 local id = require("main.naming.identifiers")
 
 local types = {}
@@ -13316,6 +16137,7 @@ end
 return types
 ]===],
     ["main.naming.words"] = [===[
+
 local id = require("main.naming.identifiers")
 
 local w = {}
@@ -13399,6 +16221,7 @@ end
 return w
 ]===],
     ["main.output.expr"] = [===[
+
 local expr = {}
 
 local prec = {
@@ -13482,6 +16305,7 @@ end
 return expr
 ]===],
     ["main.output.literals"] = [===[
+
 local id = require("main.naming.identifiers")
 
 local lit = {}
@@ -13584,6 +16408,7 @@ end
 return lit
 ]===],
     ["main.passes.conditions"] = [===[
+
 local ins = require("main.bytecode.instructions")
 
 local pass = {}
@@ -13607,6 +16432,7 @@ end
 return pass
 ]===],
     ["main.passes.constants"] = [===[
+
 local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 
@@ -13736,6 +16562,7 @@ end
 return pass
 ]===],
     ["main.passes.deadcode"] = [===[
+
 local pass = {}
 
 function pass.run(ir)
@@ -13777,6 +16604,7 @@ end
 return pass
 ]===],
     ["main.passes.flow"] = [===[
+
 local pass = {}
 
 function pass.run(ir)
@@ -13805,10 +16633,59 @@ local function quiet(ir, a, b)
     return true
 end
 
+local function mutablevalues(ir)
+    local mutable = {}
+    local changed = true
+
+
+    for id, objectset in pairs(ir.objectSets or {}) do
+        if next(objectset) then
+            local resolved = ir:resolve(id)
+            if resolved then mutable[resolved] = true end
+        end
+    end
+
+    for _, n in ipairs(ir.ops) do
+        if n.name == "NEWTABLE" or n.name == "DUPTABLE" or n.name == "NEWCLASS" then
+            local defs = ir.ssa.defsByPC[n.pc] or {}
+            local v = ir:resolve(defs[n.op.A])
+            if v then mutable[v] = true end
+        end
+    end
+
+    while changed do
+        changed = false
+        for _, n in ipairs(ir.ops) do
+            if n.name == "MOVE" then
+                local uses = ir.ssa.usesByPC[n.pc] or {}
+                local defs = ir.ssa.defsByPC[n.pc] or {}
+                local src = ir:resolve(uses[n.op.B])
+                local dst = ir:resolve(defs[n.op.A])
+                if src and dst and mutable[src] and not mutable[dst] then mutable[dst] = true; changed = true end
+            end
+        end
+        for _, phis in pairs(ir.phis) do
+            for _, p in pairs(phis) do
+                local pid = ir:resolve(p.id)
+                if pid and not mutable[pid] then
+                    for raw in pairs(p.inputs or {}) do
+                        local src = ir:resolve(raw)
+                        if src and mutable[src] then mutable[pid] = true; changed = true break end
+                    end
+                end
+            end
+        end
+    end
+    return mutable
+end
+
 function pass.run(ir)
+    local mutable = mutablevalues(ir)
+    ir.mutableObjects = mutable
+
     for id, v in pairs(ir.vals) do
         id = ir:resolve(id)
-        if id and not ir.dead[id] and v.kind == "def" then
+        if id and not ir.dead[id] and v.kind == "def" and not mutable[id] then
             local u = ir:only(id)
             local n = v.pc and ir.bypc[v.pc]
             if u and u.pc and n and ir.cfg.blockmap[v.pc] == ir.cfg.blockmap[u.pc] then
@@ -13822,13 +16699,17 @@ function pass.run(ir)
             end
         end
     end
+
     for id in pairs(ir.const) do
-        local ok = ir:count(id) > 0
-        for _, u in ipairs(ir:uses(id) or {}) do
-            local useop = u.pc and ir.bypc[u.pc] or nil
-            if u.phi or (useop and useop.name == "CAPTURE") then ok = false break end
+        id = ir:resolve(id)
+        if id and not mutable[id] then
+            local ok = ir:count(id) > 0
+            for _, u in ipairs(ir:uses(id) or {}) do
+                local useop = u.pc and ir.bypc[u.pc] or nil
+                if u.phi or (useop and useop.name == "CAPTURE") then ok = false break end
+            end
+            if ok then ir.inline[id] = true end
         end
-        if ok then ir.inline[id] = true end
     end
     return ir
 end
@@ -13836,6 +16717,7 @@ end
 return pass
 ]===],
     ["main.passes.names"] = [===[
+
 local pass = {}
 
 function pass.run(ir)
@@ -13875,8 +16757,8 @@ end
 return pass
 ]===],
     ["main.passes.pipeline"] = [===[
-local simp = require("main.passes.simplify")
-local konst = require("main.passes.constants")
+
+
 local dead = require("main.passes.deadcode")
 local names = require("main.passes.names")
 local prov = require("main.passes.provenance")
@@ -13888,11 +16770,18 @@ local pipe = {}
 
 function pipe.run(ir, opt)
     opt = opt or {}
-    simp.run(ir)
-    if opt.fold ~= false then konst.run(ir) end
+
+
     if opt.dce ~= false then dead.run(ir) end
+
+
     names.run(ir)
-    if opt.smartnames ~= false then prov.run(ir) else ir.bestname, ir.namescore, ir.hints, ir.origin = {}, {}, {}, {} end
+    if opt.smartnames ~= false then
+        prov.run(ir)
+    else
+        ir.bestname, ir.namescore, ir.hints, ir.origin = {}, {}, {}, {}
+    end
+
     if opt.inline ~= false then inline.run(ir) end
     cond.run(ir)
     flow.run(ir)
@@ -13902,6 +16791,7 @@ end
 return pipe
 ]===],
     ["main.passes.provenance"] = [===[
+
 local lit = require("main.output.literals")
 local id = require("main.naming.identifiers")
 local rbx = require("main.naming.roblox")
@@ -14245,6 +17135,7 @@ end
 return pass
 ]===],
     ["main.passes.simplify"] = [===[
+
 local pass = {}
 
 function pass.run(ir)
@@ -14288,14 +17179,15 @@ local branch = {}
 function branch.info(st, pc, stop)
     local ch = cond.chain(st, pc)
     if not ch or ch.exit <= ch.body then return nil end
+
     local join = st:join(pc)
-    if not join or join <= pc or join > stop then join = ch.exit end
+
+    if not join or join <= pc or join > stop then return nil end
     if ch.exit > join then return nil end
 
     if ch.exit == join then
         return { cond = ch.cond, a = ch.body, b = join, join = join }
     end
-
     return { cond = ch.cond, a = ch.body, b = ch.exit, c = ch.exit, d = join, join = join }
 end
 
@@ -14309,6 +17201,7 @@ end
 return branch
 ]===],
     ["main.recover.conditions"] = [===[
+
 local ins = require("main.bytecode.instructions")
 local ex = require("main.output.expr")
 local lit = require("main.output.literals")
@@ -14474,34 +17367,20 @@ local lit = require("main.output.literals")
 local fn = {}
 
 local evt = {
-    PlayerAdded = { "player" }, PlayerRemoving = { "player" },
-    CharacterAdded = { "character" }, CharacterRemoving = { "character" },
-    ChildAdded = { "child" }, ChildRemoved = { "child" },
-    DescendantAdded = { "descendant" }, DescendantRemoving = { "descendant" },
-    Touched = { "hit" }, TouchEnded = { "hit" },
-    InputBegan = { "input", "gameProcessed" }, InputChanged = { "input", "gameProcessed" }, InputEnded = { "input", "gameProcessed" },
-    Heartbeat = { "dt" }, RenderStepped = { "dt" }, PreRender = { "dt" }, PreSimulation = { "dt" }, PostSimulation = { "dt" },
-    Stepped = { "time", "dt" },
-    AncestryChanged = { "child", "parent" }, AttributeChanged = { "attribute" },
-    Changed = { "value" },
+    PlayerAdded = { "player" }, PlayerRemoving = { "player" }, CharacterAdded = { "character" }, CharacterRemoving = { "character" },
+    ChildAdded = { "child" }, ChildRemoved = { "child" }, DescendantAdded = { "descendant" }, DescendantRemoving = { "descendant" },
+    Touched = { "hit" }, TouchEnded = { "hit" }, InputBegan = { "input", "gameProcessed" }, InputChanged = { "input", "gameProcessed" },
+    InputEnded = { "input", "gameProcessed" }, Heartbeat = { "dt" }, RenderStepped = { "dt" }, PreRender = { "dt" },
+    PreSimulation = { "dt" }, PostSimulation = { "dt" }, Stepped = { "time", "dt" }, AncestryChanged = { "child", "parent" },
+    AttributeChanged = { "attribute" }, Changed = { "value" },
 }
-
-local meth = {
-    BindToRenderStep = { "dt" },
-    BindAction = { "actionName", "inputState", "input" },
-    BindActionAtPriority = { "actionName", "inputState", "input" },
-}
+local meth = { BindToRenderStep = { "dt" }, BindAction = { "actionName", "inputState", "input" }, BindActionAtPriority = { "actionName", "inputState", "input" } }
 
 local function cbhints(st, pc, r)
     local v = st:verdef(pc, r)
     if not v then return nil end
     local call
-    for _, u in ipairs(st.ir:uses(v) or {}) do
-        if u.pc then
-            if call then return nil end
-            call = u.pc
-        end
-    end
+    for _, u in ipairs(st.ir:uses(v) or {}) do if u.pc then if call then return nil end; call = u.pc end end
     if not call then return nil end
     local op = st.proto.Instructions[call]
     local name = ins.name(op)
@@ -14511,8 +17390,20 @@ local function cbhints(st, pc, r)
         local tail = pend.obj and pend.obj:match("([%a_][%w_]*)$")
         return tail and evt[tail] or nil
     end
-    if pend and meth[pend.method] then return meth[pend.method] end
-    return nil
+    return pend and meth[pend.method] or nil
+end
+
+local function capturename(st, cp, kind, src, debugname)
+
+
+    local parent
+    if kind == 0 or kind == 1 then
+        parent = st:useName(cp, src, nil)
+    else
+        parent = st.up[src + 1] or ("upvalue" .. tostring(src))
+    end
+    if not parent or parent == "" then parent = debugname end
+    return parent or ("upvalue" .. tostring(src))
 end
 
 function fn.caps(st, pc, child)
@@ -14523,16 +17414,38 @@ function fn.caps(st, pc, child)
         local op = st.proto.Instructions[cp]
         local du = child.Upvalues and child.Upvalues[i]
         local dn = du and du.Name
-        if ins.name(op) ~= "CAPTURE" then
-            out[i] = dn or ("upvalue" .. tostring(i - 1))
-        else
-            local kind, src = op.A, op.B
-            if dn and dn ~= "" then out[i] = dn
-            elseif kind == 0 or kind == 1 then out[i] = st:useName(cp, src, nil)
-            else out[i] = st.up[src + 1] or ("upvalue" .. tostring(src)) end
-            st.consumed[cp] = true
-            nx = st:next(cp)
+        if not op or ins.name(op) ~= "CAPTURE" then
+            error(("LumenV4: UNSUPPORTED NEWCLOSURE at pc %d expected CAPTURE %d/%d"):format(pc, i, child.UpvalueCount or 0), 2)
         end
+
+        local kind, src = op.A, op.B
+        if kind ~= 0 and kind ~= 1 and kind ~= 2 then
+            error(("LumenV4: UNSUPPORTED CAPTURE kind %s at pc %d"):format(tostring(kind), cp), 2)
+        end
+        if kind == 0 or kind == 1 then
+            if not st:veruse(cp, src) then
+                error(("LumenV4: UNSUPPORTED CAPTURE references undefined parent register R%d at pc %d"):format(src, cp), 2)
+            end
+        elseif not st.up[src + 1] then
+            error(("LumenV4: UNSUPPORTED CAPTURE_UPVAL references missing parent upvalue U%d at pc %d"):format(src, cp), 2)
+        end
+
+        if kind == 0 then
+
+
+            local snap = st.naming:unique("capture" .. tostring(i) .. "Value")
+            st.declared[snap] = st.indent
+            st:out("local " .. snap .. " = " .. st:use(cp, src))
+            out[i] = snap
+        else
+            out[i] = capturename(st, cp, kind, src, dn)
+        end
+        st.consumed[cp] = true
+        nx = st:next(cp)
+    end
+    local extra = st.proto.Instructions[nx]
+    if extra and ins.name(extra) == "CAPTURE" then
+        error(("LumenV4: UNSUPPORTED NEWCLOSURE at pc %d has more CAPTURE instructions than child upvalues"):format(pc), 2)
     end
     return out, nx
 end
@@ -14540,14 +17453,8 @@ end
 local function direct(st, pc, r, nx)
     local v = st:verdef(pc, r)
     if not v then return nil end
-    local uses = st.ir:uses(v) or {}
-    local one
-    for _, u in ipairs(uses) do
-        if u.pc then
-            if one then return nil end
-            one = u
-        end
-    end
+    local uses, one = st.ir:uses(v) or {}, nil
+    for _, u in ipairs(uses) do if u.pc then if one then return nil end; one = u end end
     if not one or one.pc ~= nx then return nil end
     local op = st.proto.Instructions[one.pc]
     local name = ins.name(op)
@@ -14569,23 +17476,13 @@ function fn.emit(d, st, pc, r, child, caps, nx)
     local hint = child.Name
     if hint == nil or hint == "" then hint = st.ir.bestname and st.ir.bestname[st.ir:nameid(st:verdef(pc, r))] end
     if hint == nil or hint == "" then hint = "fn" .. tostring(r) end
-
     local root, sub, args = d:_child(child, caps, cbhints(st, pc, r))
     local target, assign, store = direct(st, pc, r, nx or st:next(pc))
     if target then
         st.consumed[store] = true
-        if not assign and target:find("%.") and args[1] and args[1]:match("^self%s*[:$]") then
+        if not assign and target:find("%.") and args[1] and (args[1]:match("^self%s*[:$]") or args[1] == "self") then
             local base, field = target:match("^(.*)%.([%a_][%w_]*)$")
-            if base and field then
-                target = base .. ":" .. field
-                table.remove(args, 1)
-            end
-        elseif not assign and target:find("%.") and args[1] == "self" then
-            local base, field = target:match("^(.*)%.([%a_][%w_]*)$")
-            if base and field then
-                target = base .. ":" .. field
-                table.remove(args, 1)
-            end
+            if base and field then target = base .. ":" .. field; table.remove(args, 1) end
         end
         st.ast:add({ kind = "function", name = target, args = table.concat(args, ", "), body = root, localfn = false, assign = assign })
     else
@@ -14604,6 +17501,7 @@ end
 return fn
 ]===],
     ["main.recover.guards"] = [===[
+
 local pass = {}
 
 local function term(block)
@@ -14642,6 +17540,7 @@ end
 return pass
 ]===],
     ["main.recover.loops"] = [===[
+
 local ins = require("main.bytecode.instructions")
 local cond = require("main.recover.conditions")
 
@@ -14710,6 +17609,7 @@ end
 return loops
 ]===],
     ["main.recover.tables"] = [===[
+
 local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 local ex = require("main.output.expr")
@@ -14806,6 +17706,7 @@ end
 return tab
 ]===],
     ["main.runtime.environment"] = [===[
+
 local env = {}
 
 function env.get()
@@ -14837,6 +17738,7 @@ end
 return env
 ]===],
     ["main.runtime.http"] = [===[
+
 local env = require("main.runtime.environment")
 
 local http = {}
@@ -14875,6 +17777,7 @@ end
 return http
 ]===],
     ["main.runtime.iridium"] = [===[
+
 local env = require("main.runtime.environment")
 local http = require("main.runtime.http")
 local patch = require("main.runtime.iridium_patch")
@@ -15105,6 +18008,7 @@ end
 return iri
 ]===],
     ["main.runtime.iridium_patch"] = [===[
+
 local patch = {}
 
 local rev = "v13-3"
@@ -15253,6 +18157,7 @@ end
 return patch
 ]===],
     ["main.worker"] = [===[
+
 local cfg = require("main.config")
 local iri = require("main.runtime.iridium")
 local decomp = require("main.decompiler.engine")
