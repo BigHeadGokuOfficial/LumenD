@@ -32,14 +32,8 @@ function build.run(proto)
         out.blocks[b.id] = b
         for _, pc in ipairs(src.pcs) do
             local op = proto.Instructions[pc]
-            local name = cfg.names and cfg.names[pc] or ins.name(op)
-            local pair = cfg.rw and cfg.rw[pc]
-            local reads, writes
-            if pair then
-                reads, writes = pair.reads, pair.writes
-            else
-                reads, writes = regs.readWrite(op)
-            end
+            local name = ins.name(op)
+            local reads, writes = regs.readWrite(op)
             local n = {
                 pc = pc,
                 op = op,

@@ -15,7 +15,7 @@ local api = {
 }
 
 local function parsebc(raw, opt)
-    return iri.deserialize(raw, opt.iridium)
+    return iri.get():Deserialize(raw, opt.iridium)
 end
 
 function api:parseBytecode(raw, opt)
@@ -32,10 +32,6 @@ function api:decompileBytecode(raw, opt)
     local parsed = parsebc(raw, opt)
     local d = decomp.new(opt)
     local source, details = d:decompileParsed(parsed)
-
-    if opt.metadata == false then
-        return source
-    end
 
     return source, {
         version = ver.version,

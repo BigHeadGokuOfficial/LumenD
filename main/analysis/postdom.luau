@@ -1,122 +1,77 @@
 local post = {}
 
-local function rpo(blocks)
-    local n = #blocks
-    local root = n + 1
-    local exits = {}
-
-    for _, b in ipairs(blocks) do
-        if #b.successors == 0 then exits[#exits + 1] = b.id end
+local function same(a, b)
+    for k in pairs(a) do
+        if not b[k] then return false end
     end
-
-    local seen = { [root] = true }
-    local postorder = {}
-    local stack = { { id = root, i = 1 } }
-
-    local function nexts(id)
-        if id == root then return exits end
-        return blocks[id].predecessors
+    for k in pairs(b) do
+        if not a[k] then return false end
     end
-
-    while #stack > 0 do
-        local top = stack[#stack]
-        local list = nexts(top.id)
-        local sid = list[top.i]
-
-        if sid then
-            top.i += 1
-            if not seen[sid] then
-                seen[sid] = true
-                stack[#stack + 1] = { id = sid, i = 1 }
-            end
-        else
-            postorder[#postorder + 1] = top.id
-            stack[#stack] = nil
-        end
-    end
-
-    local out = {}
-    for i = #postorder, 1, -1 do out[#out + 1] = postorder[i] end
-    return out, seen, root, exits
-end
-
-local function meet(a, b, idom, rank)
-    while a ~= b do
-        while rank[a] > rank[b] do a = idom[a] end
-        while rank[b] > rank[a] do b = idom[b] end
-    end
-    return a
+    return true
 end
 
 function post.run(blocks)
-    if #blocks == 0 then return {}, {} end
+    local all = {}
+    for _, b in ipairs(blocks) do all[b.id] = true end
 
-    local order, reach, root = rpo(blocks)
-    local rank = {}
-    for i, id in ipairs(order) do rank[id] = i end
+    local pd = {}
+    for _, b in ipairs(blocks) do
+        local set = {}
+        if #b.successors == 0 then
+            set[b.id] = true
+        else
+            for id in pairs(all) do set[id] = true end
+        end
+        pd[b.id] = set
+    end
 
-    local idom = { [root] = root }
-    local changed = true
-
-    while changed do
-        changed = false
-
-        for i = 2, #order do
-            local id = order[i]
-            local succ = blocks[id].successors
-            local first
-
-            if #succ == 0 then
-                first = root
-            else
-                for _, sid in ipairs(succ) do
-                    if idom[sid] then
-                        first = sid
-                        break
-                    end
-                end
-            end
-
-            if first then
-                local new = first
-
-                if #succ > 0 then
-                    for _, sid in ipairs(succ) do
-                        if sid ~= first and idom[sid] then
-                            new = meet(sid, new, idom, rank)
+    local dirty = true
+    while dirty do
+        dirty = false
+        for i = #blocks, 1, -1 do
+            local b = blocks[i]
+            if #b.successors > 0 then
+                local set
+                for _, sid in ipairs(b.successors) do
+                    local src = pd[sid]
+                    if not set then
+                        set = {}
+                        for id in pairs(src) do set[id] = true end
+                    else
+                        for id in pairs(set) do
+                            if not src[id] then set[id] = nil end
                         end
                     end
                 end
-
-                if idom[id] ~= new then
-                    idom[id] = new
-                    changed = true
+                set = set or {}
+                set[b.id] = true
+                if not same(pd[b.id], set) then
+                    pd[b.id] = set
+                    dirty = true
                 end
             end
         end
     end
 
-    local pd = {}
     local ip = {}
-
     for _, b in ipairs(blocks) do
-        local set = { [b.id] = true }
-
-        if reach[b.id] then
-            local cur = b.id
-            local parent = idom[cur]
-            if parent and parent ~= root and parent ~= cur then ip[b.id] = parent end
-
-            local guard = 0
-            while parent and parent ~= root and parent ~= cur and guard <= #blocks do
-                set[parent] = true
-                cur = parent
-                parent = idom[cur]
-                guard += 1
+        local cand = {}
+        for id in pairs(pd[b.id]) do
+            if id ~= b.id then cand[#cand + 1] = id end
+        end
+        for _, id in ipairs(cand) do
+            local near = true
+            for _, other in ipairs(cand) do
+                if other ~= id and pd[other] and pd[other][id] then
+                    near = false
+                    break
+                end
+            end
+            if near then
+                ip[b.id] = id
+                break
             end
         end
-
-        pd[b.id] = set
     end
 
     return pd, ip

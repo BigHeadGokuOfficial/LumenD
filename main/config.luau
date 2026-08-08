@@ -12,7 +12,6 @@ local base = {
     inlineast = true,
     callbacks = true,
     booleans = true,
-    metadata = true,
     iridium = nil,
 }
 

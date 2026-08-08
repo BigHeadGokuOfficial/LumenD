@@ -116,7 +116,7 @@ function regs.readWrite(op)
     return reads, writes
 end
 
-function regs.stats(proto, aux, cache)
+function regs.stats(proto, aux)
     local stats = {}
     aux = aux or ins.auxSlots(proto)
 
@@ -137,13 +137,7 @@ function regs.stats(proto, aux, cache)
     for pc = 1, #proto.Instructions do
         if not aux[pc] then
             local op = proto.Instructions[pc]
-            local pair = cache and cache[pc]
-            local reads, writes
-            if pair then
-                reads, writes = pair.reads, pair.writes
-            else
-                reads, writes = regs.readWrite(op)
-            end
+            local reads, writes = regs.readWrite(op)
 
             for reg in pairs(reads) do
                 local entry = get(reg)

@@ -20,29 +20,12 @@ function fn.new(proto, cfg, flow)
 end
 
 function fn:resolve(id)
-    if not id then return nil end
-    local start = id
-    local root = id
-    local n = 0
-
-    while self.alias[root] and self.alias[root] ~= root do
-        root = self.alias[root]
-        n += 1
-        if n > 256 then break end
+    local seen = {}
+    while id and self.alias[id] and not seen[id] do
+        seen[id] = true
+        id = self.alias[id]
     end
-
-    if root ~= start then
-        local cur = start
-        n = 0
-        while self.alias[cur] and self.alias[cur] ~= root and n <= 256 do
-            local nextid = self.alias[cur]
-            self.alias[cur] = root
-            cur = nextid
-            n += 1
-        end
-    end
-
-    return root
+    return id
 end
 
 function fn:use(pc, reg)
