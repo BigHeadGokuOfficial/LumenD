@@ -7,6 +7,7 @@ local dis = require("main.diagnostics.disassembler")
 local view = require("main.diagnostics.inspect")
 local env = require("main.runtime.environment")
 local save = require("main.serialization.save")
+local dump = require("main.dump")
 
 local api = {
     Version = ver.version,
@@ -14,7 +15,7 @@ local api = {
 }
 
 local function parsebc(raw, opt)
-    return iri.get():Deserialize(raw, opt.iridium)
+    return iri.deserialize(raw, opt.iridium)
 end
 
 function api:parseBytecode(raw, opt)
@@ -31,6 +32,10 @@ function api:decompileBytecode(raw, opt)
     local parsed = parsebc(raw, opt)
     local d = decomp.new(opt)
     local source, details = d:decompileParsed(parsed)
+
+    if opt.metadata == false then
+        return source
+    end
 
     return source, {
         version = ver.version,
@@ -85,6 +90,14 @@ end
 
 function api:save(obj, file, opt)
     return save.run(self, obj, file, opt)
+end
+
+function api:dump(opt)
+    return dump.run(self, opt)
+end
+
+function api:auto(opt)
+    return dump.auto(self, opt)
 end
 
 function api:serializerInfo()

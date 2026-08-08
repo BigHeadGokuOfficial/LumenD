@@ -4,61 +4,101 @@ local mod = {
     ["main.analysis.dominators"] = [===[
 local dom = {}
 
-local function equal(a, b)
-    for key in pairs(a) do if not b[key] then return false end end
-    for key in pairs(b) do if not a[key] then return false end end
-    return true
+local function rpo(blocks)
+    local seen = {}
+    local post = {}
+    local stack = { { id = 1, i = 1 } }
+    seen[1] = true
+
+    while #stack > 0 do
+        local top = stack[#stack]
+        local b = blocks[top.id]
+        local sid = b and b.successors[top.i]
+
+        if sid then
+            top.i += 1
+            if not seen[sid] then
+                seen[sid] = true
+                stack[#stack + 1] = { id = sid, i = 1 }
+            end
+        else
+            post[#post + 1] = top.id
+            stack[#stack] = nil
+        end
+    end
+
+    local out = {}
+    for i = #post, 1, -1 do out[#out + 1] = post[i] end
+    return out, seen
+end
+
+local function meet(a, b, idom, rank)
+    while a ~= b do
+        while rank[a] > rank[b] do a = idom[a] end
+        while rank[b] > rank[a] do b = idom[b] end
+    end
+    return a
 end
 
 function dom.compute(blocks)
-    local all = {}
-    for _, block in ipairs(blocks) do all[block.id] = true end
+    if #blocks == 0 then return {} end
 
-    local out = {}
-    for _, block in ipairs(blocks) do
-        local set = {}
+    local order, reach = rpo(blocks)
+    local rank = {}
+    for i, id in ipairs(order) do rank[id] = i end
 
-        if block.id == 1 then
-            set[1] = true
-        else
-            for id in pairs(all) do set[id] = true end
-        end
+    local idom = { [1] = 1 }
+    local changed = true
 
-        out[block.id] = set
-    end
+    while changed do
+        changed = false
 
-    local chg = true
-    while chg do
-        chg = false
+        for i = 2, #order do
+            local id = order[i]
+            local b = blocks[id]
+            local first
 
-        for _, block in ipairs(blocks) do
-            if block.id ~= 1 then
-                local set = nil
+            for _, pid in ipairs(b.predecessors) do
+                if idom[pid] then
+                    first = pid
+                    break
+                end
+            end
 
-                for _, pred in ipairs(block.predecessors) do
-                    local predSet = out[pred]
-
-                    if set == nil then
-                        set = {}
-                        for id in pairs(predSet) do set[id] = true end
-                    else
-                        for id in pairs(set) do
-                            if not predSet[id] then set[id] = nil end
-                        end
+            if first then
+                local new = first
+                for _, pid in ipairs(b.predecessors) do
+                    if pid ~= first and idom[pid] then
+                        new = meet(pid, new, idom, rank)
                     end
                 end
 
-                set = set or {}
-                set[block.id] = true
-
-                if not equal(out[block.id], set) then
-                    out[block.id] = set
-                    chg = true
+                if idom[id] ~= new then
+                    idom[id] = new
+                    changed = true
                 end
             end
         end
     end
 
+    local out = {}
+    for _, b in ipairs(blocks) do
+        local set = { [b.id] = true }
+
+        if reach[b.id] then
+            local cur = b.id
+            local guard = 0
+            while cur ~= 1 and idom[cur] and guard <= #blocks do
+                cur = idom[cur]
+                set[cur] = true
+                guard += 1
+            end
+        end
+
+        out[b.id] = set
+    end
+
+    out.idom = idom
     return out
 end
 
@@ -78,6 +118,8 @@ function graph.build(proto)
     local aux = ins.auxSlots(proto)
     local leaders = { [1] = true }
     local nexts = {}
+    local names = {}
+    local rw = {}
 
     local function valid(pc)
         return pc >= 1 and pc <= #ops and not aux[pc]
@@ -87,6 +129,9 @@ function graph.build(proto)
         if not aux[pc] then
             local op = ops[pc]
             local name = ins.name(op)
+            names[pc] = name
+            local reads, writes = regs.readWrite(op)
+            rw[pc] = { reads = reads, writes = writes }
             local nextPC = ins.next(proto, pc, aux)
             local successors = {}
 
@@ -173,7 +218,9 @@ function graph.build(proto)
         postdom = postdom,
         ipdom = ipdom,
         loops = loops.find(blocks, dominators),
-        registerStats = regs.stats(proto, aux),
+        registerStats = regs.stats(proto, aux, rw),
+        names = names,
+        rw = rw,
     }
 end
 
@@ -236,78 +283,123 @@ return loops
     ["main.analysis.postdom"] = [===[
 local post = {}
 
-local function same(a, b)
-    for k in pairs(a) do
-        if not b[k] then return false end
+local function rpo(blocks)
+    local n = #blocks
+    local root = n + 1
+    local exits = {}
+
+    for _, b in ipairs(blocks) do
+        if #b.successors == 0 then exits[#exits + 1] = b.id end
     end
-    for k in pairs(b) do
-        if not a[k] then return false end
+
+    local seen = { [root] = true }
+    local postorder = {}
+    local stack = { { id = root, i = 1 } }
+
+    local function nexts(id)
+        if id == root then return exits end
+        return blocks[id].predecessors
     end
-    return true
+
+    while #stack > 0 do
+        local top = stack[#stack]
+        local list = nexts(top.id)
+        local sid = list[top.i]
+
+        if sid then
+            top.i += 1
+            if not seen[sid] then
+                seen[sid] = true
+                stack[#stack + 1] = { id = sid, i = 1 }
+            end
+        else
+            postorder[#postorder + 1] = top.id
+            stack[#stack] = nil
+        end
+    end
+
+    local out = {}
+    for i = #postorder, 1, -1 do out[#out + 1] = postorder[i] end
+    return out, seen, root, exits
+end
+
+local function meet(a, b, idom, rank)
+    while a ~= b do
+        while rank[a] > rank[b] do a = idom[a] end
+        while rank[b] > rank[a] do b = idom[b] end
+    end
+    return a
 end
 
 function post.run(blocks)
-    local all = {}
-    for _, b in ipairs(blocks) do all[b.id] = true end
+    if #blocks == 0 then return {}, {} end
 
-    local pd = {}
-    for _, b in ipairs(blocks) do
-        local set = {}
-        if #b.successors == 0 then
-            set[b.id] = true
-        else
-            for id in pairs(all) do set[id] = true end
-        end
-        pd[b.id] = set
-    end
+    local order, reach, root = rpo(blocks)
+    local rank = {}
+    for i, id in ipairs(order) do rank[id] = i end
 
-    local dirty = true
-    while dirty do
-        dirty = false
-        for i = #blocks, 1, -1 do
-            local b = blocks[i]
-            if #b.successors > 0 then
-                local set
-                for _, sid in ipairs(b.successors) do
-                    local src = pd[sid]
-                    if not set then
-                        set = {}
-                        for id in pairs(src) do set[id] = true end
-                    else
-                        for id in pairs(set) do
-                            if not src[id] then set[id] = nil end
+    local idom = { [root] = root }
+    local changed = true
+
+    while changed do
+        changed = false
+
+        for i = 2, #order do
+            local id = order[i]
+            local succ = blocks[id].successors
+            local first
+
+            if #succ == 0 then
+                first = root
+            else
+                for _, sid in ipairs(succ) do
+                    if idom[sid] then
+                        first = sid
+                        break
+                    end
+                end
+            end
+
+            if first then
+                local new = first
+
+                if #succ > 0 then
+                    for _, sid in ipairs(succ) do
+                        if sid ~= first and idom[sid] then
+                            new = meet(sid, new, idom, rank)
                         end
                     end
                 end
-                set = set or {}
-                set[b.id] = true
-                if not same(pd[b.id], set) then
-                    pd[b.id] = set
-                    dirty = true
+
+                if idom[id] ~= new then
+                    idom[id] = new
+                    changed = true
                 end
             end
         end
     end
 
+    local pd = {}
     local ip = {}
+
     for _, b in ipairs(blocks) do
-        local cand = {}
-        for id in pairs(pd[b.id]) do
-            if id ~= b.id then cand[#cand + 1] = id end
-        end
-        for _, id in ipairs(cand) do
-            local near = true
-            for _, other in ipairs(cand) do
-                if other ~= id and pd[other] and pd[other][id] then
-                    near = false
-                    break
-                end
-            end
-            if near then
-                ip[b.id] = id
-                break
+        local set = { [b.id] = true }
+
+        if reach[b.id] then
+            local cur = b.id
+            local parent = idom[cur]
+            if parent and parent ~= root and parent ~= cur then ip[b.id] = parent end
+
+            local guard = 0
+            while parent and parent ~= root and parent ~= cur and guard <= #blocks do
+                set[parent] = true
+                cur = parent
+                parent = idom[cur]
+                guard += 1
             end
         end
+
+        pd[b.id] = set
     end
 
     return pd, ip
@@ -434,7 +526,7 @@ function regs.readWrite(op)
     return reads, writes
 end
 
-function regs.stats(proto, aux)
+function regs.stats(proto, aux, cache)
     local stats = {}
     aux = aux or ins.auxSlots(proto)
 
@@ -455,7 +547,13 @@ function regs.stats(proto, aux)
     for pc = 1, #proto.Instructions do
         if not aux[pc] then
             local op = proto.Instructions[pc]
-            local reads, writes = regs.readWrite(op)
+            local pair = cache and cache[pc]
+            local reads, writes
+            if pair then
+                reads, writes = pair.reads, pair.writes
+            else
+                reads, writes = regs.readWrite(op)
+            end
 
             for reg in pairs(reads) do
                 local entry = get(reg)
@@ -557,7 +655,8 @@ function ssa.build(proto, cfg)
     for _, block in ipairs(cfg.blocks) do
         for _, pc in ipairs(block.pcs) do
             local op = proto.Instructions[pc]
-            local _, writes = regs.readWrite(op)
+            local pair = cfg.rw and cfg.rw[pc]
+            local writes = pair and pair.writes or select(2, regs.readWrite(op))
 
             if next(writes) then
                 local defs = {}
@@ -660,43 +759,55 @@ function ssa.build(proto, cfg)
         return merged
     end
 
-    local changed = true
+    local queue = {}
+    local queued = {}
+    local head = 1
     local iterations = 0
-    local maxiter = math.max(16, #cfg.blocks * 8)
+    local maxiter = math.max(64, #cfg.blocks * 64)
 
-    while changed and iterations < maxiter do
-        iterations = iterations + 1
-        changed = false
-
-        for _, block in ipairs(cfg.blocks) do
-            local incoming = merge(block)
-            local oldin = result.inVersions[block.id] or {}
-
-            if not same(oldin, incoming) then
-                result.inVersions[block.id] = incoming
-                changed = true
-            end
-
-            local current = copy(incoming)
-
-            for _, pc in ipairs(block.pcs) do
-                local defs = result.defsByPC[pc]
-                if defs then
-                    for reg, version in pairs(defs) do
-                        current[reg] = version
-                    end
-                end
-            end
-
-            local oldout = result.outVersions[block.id] or {}
-            if not same(oldout, current) then
-                result.outVersions[block.id] = current
-                changed = true
-            end
+    local function push(id)
+        if not queued[id] then
+            queued[id] = true
+            queue[#queue + 1] = id
         end
     end
 
-    result.converged = not changed
+    for _, block in ipairs(cfg.blocks) do push(block.id) end
+
+    while head <= #queue and iterations < maxiter do
+        local id = queue[head]
+        head += 1
+        queued[id] = nil
+        iterations += 1
+
+        local block = cfg.blocks[id]
+        local incoming = merge(block)
+        local oldin = result.inVersions[id] or {}
+        local inchg = not same(oldin, incoming)
+
+        if inchg or result.inVersions[id] == nil then
+            result.inVersions[id] = incoming
+        end
+
+        local current = copy(incoming)
+
+        for _, pc in ipairs(block.pcs) do
+            local defs = result.defsByPC[pc]
+            if defs then
+                for reg, version in pairs(defs) do
+                    current[reg] = version
+                end
+            end
+        end
+
+        local oldout = result.outVersions[id] or {}
+        if not same(oldout, current) or result.outVersions[id] == nil then
+            result.outVersions[id] = current
+            for _, sid in ipairs(block.successors) do push(sid) end
+        end
+    end
+
+    result.converged = head > #queue
     result.iterations = iterations
 
     for blockId, phis in pairs(result.phisByBlock) do
@@ -715,7 +826,8 @@ function ssa.build(proto, cfg)
 
         for _, pc in ipairs(block.pcs) do
             local op = proto.Instructions[pc]
-            local reads, _ = regs.readWrite(op)
+            local pair = cfg.rw and cfg.rw[pc]
+            local reads = pair and pair.reads or select(1, regs.readWrite(op))
             local uses = {}
 
             for reg in pairs(reads) do
@@ -832,7 +944,7 @@ local api = {
 }
 
 local function parsebc(raw, opt)
-    return iri.get():Deserialize(raw, opt.iridium)
+    return iri.deserialize(raw, opt.iridium)
 end
 
 function api:parseBytecode(raw, opt)
@@ -849,6 +961,10 @@ function api:decompileBytecode(raw, opt)
     local parsed = parsebc(raw, opt)
     local d = decomp.new(opt)
     local source, details = d:decompileParsed(parsed)
+
+    if opt.metadata == false then
+        return source
+    end
 
     return source, {
         version = ver.version,
@@ -909,8 +1025,8 @@ function api:dump(opt)
     return dump.run(self, opt)
 end
 
-function api:auto()
-    return dump.auto(self)
+function api:auto(opt)
+    return dump.auto(self, opt)
 end
 
 function api:serializerInfo()
@@ -2064,6 +2180,7 @@ local base = {
     inlineast = true,
     callbacks = true,
     booleans = true,
+    metadata = true,
     iridium = nil,
 }
 
@@ -2494,7 +2611,7 @@ function decomp:_state(proto, up, ph)
     local ir = irbuild.run(proto)
     ir.paramhints = ph or {}
     ir = irpass.run(ir, self.opt)
-    local naming = names.new(ir.cfg.registerStats, self.opt, proto)
+    local naming = names.new(ir.cfg.registerStats, self.opt, proto, ir.debugranges, ir.typeranges)
     return context.new(proto, ir, naming, up, lower.new(), self.opt)
 end
 
@@ -2747,7 +2864,13 @@ end
 
 function decomp:decompileProto(proto, up)
     local root, st = self:_child(proto, up or {})
-    return printer.run(root), {
+    local src = printer.run(root)
+
+    if self.opt.metadata == false then
+        return src
+    end
+
+    return src, {
         cfg = st.cfg,
         ir = st.ir,
         ssa = st.ssa,
@@ -3173,44 +3296,51 @@ local function clean(s)
     return s
 end
 
-local function mkdir(path)
+local function mkdir(path, made)
+    if made[path] then return true end
     if type(makefolder) ~= "function" then return false end
     if type(isfolder) == "function" then
         local ok, yes = pcall(isfolder, path)
-        if ok and yes then return true end
+        if ok and yes then
+            made[path] = true
+            return true
+        end
     end
-    return pcall(makefolder, path)
+    local ok = pcall(makefolder, path)
+    if ok then made[path] = true end
+    return ok
 end
 
-local function mkall(path)
+local function mkall(path, made)
     local cur = ""
     for part in tostring(path):gmatch("[^/]+") do
         cur = cur == "" and part or cur .. "/" .. part
-        mkdir(cur)
+        mkdir(cur, made)
     end
 end
 
 local function rootdir()
-    local id = tostring(game.PlaceId or 0)
-    local stamp = tostring(os.time())
-    return "LumenDecomp/" .. id .. "/dump_" .. stamp
+    return "LumenDecomp/" .. tostring(game.PlaceId or 0) .. "/dump_" .. tostring(os.time())
 end
 
 local function scriptobj(obj)
-    return obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script")
+    local c = obj.ClassName
+    return c == "LocalScript" or c == "ModuleScript" or c == "Script"
 end
 
 local function parts(obj)
-    local out = {}
+    local rev = {}
     local cur = obj.Parent
     while cur and cur ~= game do
-        table.insert(out, 1, clean(cur.Name))
+        rev[#rev + 1] = clean(cur.Name)
         cur = cur.Parent
     end
+    local out = {}
+    for i = #rev, 1, -1 do out[#out + 1] = rev[i] end
     return out
 end
 
-local function outpath(root, obj, flat, used)
+local function outpath(root, obj, flat, used, made)
     local seg = parts(obj)
     local dir = root .. "/Scripts"
 
@@ -3218,7 +3348,7 @@ local function outpath(root, obj, flat, used)
         for _, name in ipairs(seg) do dir = dir .. "/" .. name end
     end
 
-    mkall(dir)
+    mkall(dir, made)
 
     local base = clean(obj.Name) .. "." .. clean(obj.ClassName)
     if flat then
@@ -3236,10 +3366,22 @@ local function outpath(root, obj, flat, used)
     return path
 end
 
-local function scripts()
+local core = {
+    CoreGui = true,
+    CorePackages = true,
+    RobloxReplicatedStorage = true,
+    CoreScriptSyncService = true,
+}
+
+local function scripts(ignorecore)
     local out = {}
-    for _, obj in ipairs(game:GetDescendants()) do
-        if scriptobj(obj) then out[#out + 1] = obj end
+    for _, root in ipairs(game:GetChildren()) do
+        if not (ignorecore and core[root.Name]) then
+            if scriptobj(root) then out[#out + 1] = root end
+            for _, obj in ipairs(root:GetDescendants()) do
+                if scriptobj(obj) then out[#out + 1] = obj end
+            end
+        end
     end
     return out
 end
@@ -3252,31 +3394,64 @@ local function write(path, data)
     return ok, err
 end
 
-local function tree(lumen, root, opt, stat)
-    local list = scripts()
-    local used = {}
-    stat.found = #list
+local function decompileall(lumen, list, opt, stat)
+    local cache = {}
+    local started = os.clock()
+    local total = #list
+
+    stat.found = total
+
+    local decopt = { metadata = false }
+    if type(opt.Options) == "table" then
+        for k, v in pairs(opt.Options) do decopt[k] = v end
+        decopt.metadata = false
+    end
 
     for i, obj in ipairs(list) do
-        st.set("Decompiling", obj, i, #list)
-        local res = lumen:tryDecompile(obj, opt.Options)
+        local res = lumen:tryDecompile(obj, decopt)
 
         if res.success and type(res.source) == "string" and res.source ~= "" then
-            local path = outpath(root, obj, not opt.Tree, used)
-            local ok, err = write(path, res.source)
-            if ok then
-                stat.good += 1
-            else
-                stat.failed += 1
-                stat.errors[#stat.errors + 1] = st.path(obj) .. " :: " .. tostring(err)
-            end
+            cache[obj] = res.source
+            stat.good += 1
         else
+            local err = tostring(res.error)
+            cache[obj] = { success = false, error = err }
             stat.failed += 1
-            stat.errors[#stat.errors + 1] = st.path(obj) .. " :: " .. tostring(res.error)
+            stat.errors[#stat.errors + 1] = st.path(obj) .. " :: " .. err
         end
 
-        if i % 16 == 0 then task.wait() end
+        local elapsed = os.clock() - started
+        local rate = elapsed > 0 and i / elapsed or nil
+        st.progress("Decompiling", obj, i, total, rate)
     end
+
+    stat.decompileTime = os.clock() - started
+    stat.rate = stat.decompileTime > 0 and total / stat.decompileTime or 0
+    return cache
+end
+
+local function writetree(root, list, cache, treeon, stat, made)
+    local used = {}
+    local total = #list
+    local started = os.clock()
+
+    for i, obj in ipairs(list) do
+        local src = cache[obj]
+        if type(src) == "string" then
+            local path = outpath(root, obj, not treeon, used, made)
+            local ok, err = write(path, src)
+            if not ok then
+                stat.writeFailed += 1
+                stat.errors[#stat.errors + 1] = st.path(obj) .. " :: " .. tostring(err)
+            end
+        end
+
+        local elapsed = os.clock() - started
+        local rate = elapsed > 0 and i / elapsed or nil
+        st.progress("Writing source tree", obj, i, total, rate)
+    end
+
+    stat.writeTime = os.clock() - started
 end
 
 local function summary(root, stat)
@@ -3286,7 +3461,11 @@ local function summary(root, stat)
         "Scripts found: " .. tostring(stat.found),
         "Decompiled: " .. tostring(stat.good),
         "Failed/skipped: " .. tostring(stat.failed),
+        "Write failures: " .. tostring(stat.writeFailed),
         "Binary: " .. tostring(stat.binary),
+        "Decompile seconds: " .. string.format("%.3f", stat.decompileTime or 0),
+        "Decompile rate: " .. string.format("%.2f scripts/s", stat.rate or 0),
+        "Write seconds: " .. string.format("%.3f", stat.writeTime or 0),
         "",
     }
 
@@ -3301,26 +3480,44 @@ end
 function dump.run(lumen, opt)
     opt = opt or {}
     local root = opt.Root or rootdir()
-    local stat = { found = 0, good = 0, failed = 0, binary = false, errors = {} }
+    local stat = {
+        found = 0,
+        good = 0,
+        failed = 0,
+        writeFailed = 0,
+        binary = false,
+        errors = {},
+        decompileTime = 0,
+        writeTime = 0,
+        rate = 0,
+    }
+    local made = {}
 
-    mkall(root)
+    mkall(root, made)
     st.set("Starting", tostring(game.Name) .. " | " .. root)
 
+    local list
+    local cache
+
     if opt.Decompile and (opt.Tree or not opt.Binary) then
-        tree(lumen, root, opt, stat)
+        list = scripts(opt.IgnoreCoreScripts == true)
+        cache = decompileall(lumen, list, opt, stat)
+        writetree(root, list, cache, opt.Tree, stat, made)
     end
 
     if opt.Binary then
-        st.set("Saving binary", tostring(game.Name))
+        st.set("Saving binary", cache and "reusing decompiled source cache" or tostring(game.Name))
         local file = root .. "/FullGame.rbxl"
         local ok, err = pcall(function()
             lumen:save(game, file, {
                 Binary = true,
                 Decompile = opt.Decompile == true,
+                SourceCache = cache,
                 NilInstances = opt.NilInstances == true,
                 RemovePlayerCharacters = opt.RemovePlayerCharacters == true,
                 SavePlayers = opt.SavePlayers == true,
-                MaxThreads = opt.MaxThreads or 4,
+                MaxThreads = opt.MaxThreads or 8,
+                DecompileIgnore = opt.IgnoreCoreScripts and { "CoreGui", "CorePackages", "RobloxReplicatedStorage", "CoreScriptSyncService" } or opt.DecompileIgnore,
                 ShowStatus = false,
             })
         end)
@@ -3331,20 +3528,44 @@ function dump.run(lumen, opt)
     end
 
     summary(root, stat)
-    st.done("Done — " .. tostring(stat.good) .. " decompiled, " .. tostring(stat.failed) .. " failed")
+    st.done("Done — " .. tostring(stat.good) .. " decompiled, " .. tostring(stat.failed) .. " failed | " .. string.format("%.1f/s", stat.rate or 0))
     return root, stat
 end
 
-function dump.auto(lumen)
+function dump.auto(lumen, boot)
     local e = env.get()
-    local binary = rawget(e, "Binary") == true
-    local decomp = rawget(e, "Decompile") == true
-    local treeon = rawget(e, "Tree") == true
 
-    st.set("Loaded", "v" .. tostring(lumen.Version))
+    local function flag(name)
+        if type(boot) == "table" and boot[name] ~= nil then return boot[name] == true end
+
+        local v = rawget(e, name)
+        if v ~= nil then return v == true end
+
+        if type(getfenv) == "function" then
+            for level = 0, 8 do
+                local ok, scope = pcall(getfenv, level)
+                if ok and type(scope) == "table" then
+                    v = rawget(scope, name)
+                    if v ~= nil then return v == true end
+                end
+            end
+        end
+
+        v = rawget(_G, name)
+        return v == true
+    end
+
+    local binary = flag("Binary")
+    local decomp = flag("Decompile")
+    local treeon = flag("Tree")
+    local ignorecore = flag("IgnoreCoreScripts")
+    local flags = "Binary=" .. tostring(binary) .. " | Decompile=" .. tostring(decomp) .. " | Tree=" .. tostring(treeon) .. " | IgnoreCoreScripts=" .. tostring(ignorecore)
+
+    st.set("Loaded", "v" .. tostring(lumen.Version) .. " | " .. flags)
+    print("[LumenDecomp] " .. flags)
 
     if not binary and not decomp and not treeon then
-        task.delay(2, function() st.done("Loaded — idle") end)
+        task.delay(2, function() st.done("Loaded — idle | " .. flags) end)
         return false
     end
 
@@ -3354,12 +3575,14 @@ function dump.auto(lumen)
     end
 
     e.__LumenDump = true
+    st.set("Starting dump", flags)
     task.spawn(function()
         local ok, err = pcall(function()
             dump.run(lumen, {
                 Binary = binary,
                 Decompile = decomp,
                 Tree = treeon,
+                IgnoreCoreScripts = ignorecore,
             })
         end)
         e.__LumenDump = nil
@@ -3426,8 +3649,14 @@ function build.run(proto)
         out.blocks[b.id] = b
         for _, pc in ipairs(src.pcs) do
             local op = proto.Instructions[pc]
-            local name = ins.name(op)
-            local reads, writes = regs.readWrite(op)
+            local name = cfg.names and cfg.names[pc] or ins.name(op)
+            local pair = cfg.rw and cfg.rw[pc]
+            local reads, writes
+            if pair then
+                reads, writes = pair.reads, pair.writes
+            else
+                reads, writes = regs.readWrite(op)
+            end
             local n = {
                 pc = pc,
                 op = op,
@@ -3536,12 +3765,29 @@ function fn.new(proto, cfg, flow)
 end
 
 function fn:resolve(id)
-    local seen = {}
-    while id and self.alias[id] and not seen[id] do
-        seen[id] = true
-        id = self.alias[id]
+    if not id then return nil end
+    local start = id
+    local root = id
+    local n = 0
+
+    while self.alias[root] and self.alias[root] ~= root do
+        root = self.alias[root]
+        n += 1
+        if n > 256 then break end
     end
-    return id
+
+    if root ~= start then
+        local cur = start
+        n = 0
+        while self.alias[cur] and self.alias[cur] ~= root and n <= 256 do
+            local nextid = self.alias[cur]
+            self.alias[cur] = root
+            cur = nextid
+            n += 1
+        end
+    end
+
+    return root
 end
 
 function fn:use(pc, reg)
@@ -3732,7 +3978,7 @@ local ty = require("main.naming.types")
 local names = {}
 names.__index = names
 
-function names.new(stats, opt, proto)
+function names.new(stats, opt, proto, debugranges, typeranges)
     return setmetatable({
         used = {},
         regs = {},
@@ -3740,8 +3986,8 @@ function names.new(stats, opt, proto)
         stats = stats or {},
         opt = opt or {},
         proto = proto,
-        debug = dbg.ranges(proto),
-        typed = ty.ranges(proto),
+        debug = debugranges or dbg.ranges(proto),
+        typed = typeranges or ty.ranges(proto),
     }, names)
 end
 
@@ -4649,6 +4895,8 @@ function pass.run(ir)
     local pend = {}
     local dr = dbg.ranges(ir.proto)
     local tr = ty.ranges(ir.proto)
+    ir.debugranges = dr
+    ir.typeranges = tr
 
     local function fam(v)
         return v and ir:nameid(v) or nil
@@ -4698,14 +4946,23 @@ function pass.run(ir)
     end
 
     local prep = {}
+    local defs = {}
+    local uses = {}
+
+    local function d(r)
+        return ir:resolve(defs[r])
+    end
+
+    local function u(r)
+        return ir:resolve(uses[r])
+    end
+
     for _, n in ipairs(ir.ops) do
         local op = n.op
         local name = n.name
         local pc = n.pc
-        local defs = ir.ssa.defsByPC[pc] or {}
-        local uses = ir.ssa.usesByPC[pc] or {}
-        local function d(r) return ir:resolve(defs[r]) end
-        local function u(r) return ir:resolve(uses[r]) end
+        defs = ir.ssa.defsByPC[pc] or {}
+        uses = ir.ssa.usesByPC[pc] or {}
 
         if name == "GETGLOBAL" then
             local g = rawk(ir.proto, op.AuxValue and op.AuxValue.Value or 0)
@@ -4890,17 +5147,10 @@ function pass.run(ir)
         elseif name == "FORNLOOP" then
             add(d(op.A + 3), "i", 62, "numfor")
         end
-    end
 
-    for _, n in ipairs(ir.ops) do
-        local op, pc, name = n.op, n.pc, n.name
-        local uses = ir.ssa.usesByPC[pc] or {}
-        local function u(r) return ir:resolve(uses[r]) end
         if name == "JUMPIF" or name == "JUMPIFNOT" then
             add(u(op.A), "enabled", 38, "condition")
-        elseif name == "GETTABLE" then
-            add(u(op.C), "key", 42, "index")
-        elseif name == "SETTABLE" then
+        elseif name == "GETTABLE" or name == "SETTABLE" then
             add(u(op.C), "key", 42, "index")
         elseif name == "CONCAT" then
             for r = op.B, op.C do add(u(r), "text", 30, "concat") end
@@ -5597,6 +5847,8 @@ local cache = {}
 local NIL = {}
 local LOADING = {}
 local root = nil
+local key = nil
+local keyset = false
 
 local function resolve(name)
     if name == "@root" then
@@ -5677,6 +5929,36 @@ function iri.get()
     return root
 end
 
+function iri.deserialize(raw, opt)
+    local r = iri.get()
+    local cfg = {}
+
+    if type(opt) == "table" then
+        for k, v in pairs(opt) do cfg[k] = v end
+    end
+
+    local explicit = cfg.EncodingKey ~= nil
+    if not explicit and keyset and key ~= nil then
+        cfg.EncodingKey = key
+    end
+
+    local ok, out = pcall(r.Deserialize, r, raw, cfg)
+
+    if not ok and not explicit and keyset and key ~= nil then
+        cfg.EncodingKey = nil
+        ok, out = pcall(r.Deserialize, r, raw, cfg)
+    end
+
+    if not ok then error(out, 2) end
+
+    if not explicit then
+        key = cfg.EncodingKey
+        keyset = true
+    end
+
+    return out
+end
+
 function iri.info()
     local pi = patch.info()
     return {
@@ -5688,6 +5970,8 @@ function iri.info()
         target = pi.target,
         classes = pi.classes,
         loaded = root ~= nil,
+        encodingKey = key,
+        encodingKeyKnown = keyset,
     }
 end
 
@@ -5866,6 +6150,8 @@ local st = {}
 local gui
 local text
 local dead = false
+local lastui = 0
+local lastcon = 0
 
 local function parent()
     if type(gethui) == "function" then
@@ -5934,27 +6220,48 @@ function st.path(obj)
     return ok and out or tostring(obj)
 end
 
-function st.set(stage, obj, done, total)
-    if dead then return end
+local function msg(stage, obj, done, total, rate)
     local path = type(obj) == "string" and obj or st.path(obj)
     local count = ""
     if done and total then
         count = " [" .. tostring(done) .. "/" .. tostring(total) .. "]"
     end
-    local msg = "LumenDecomp — " .. tostring(stage) .. count
-    if path ~= "" then msg = msg .. "\n" .. path end
-
-    if make() and text then
-        text.Text = msg
+    if rate then
+        count = count .. " " .. string.format("%.1f/s", rate)
     end
+    local out = "LumenDecomp — " .. tostring(stage) .. count
+    if path ~= "" then out = out .. "\n" .. path end
+    return out
+end
 
-    if type(rconsoleprint) == "function" then
-        pcall(rconsoleprint, msg .. "\n")
+local function show(out, console)
+    if dead then return end
+    if make() and text then text.Text = out end
+    if console and type(rconsoleprint) == "function" then
+        pcall(rconsoleprint, out .. "\n")
     end
 end
 
-function st.done(msg)
-    st.set(msg or "Done")
+function st.set(stage, obj, done, total)
+    local out = msg(stage, obj, done, total)
+    show(out, true)
+    lastui = os.clock()
+    lastcon = lastui
+end
+
+function st.progress(stage, obj, done, total, rate)
+    if dead then return end
+    local now = os.clock()
+    if done ~= total and now - lastui < 0.075 then return end
+    local out = msg(stage, obj, done, total, rate)
+    local con = done == total or now - lastcon >= 0.5
+    show(out, con)
+    lastui = now
+    if con then lastcon = now end
+end
+
+function st.done(msgtext)
+    st.set(msgtext or "Done")
     if gui then
         task.delay(5, function()
             if gui then pcall(function() gui:Destroy() end) end
@@ -8155,32 +8462,39 @@ local save = {}
 
 local ready = false
 local fail = nil
+local cache = nil
+
+local function cached(scr)
+    if not cache then return nil end
+    local v = cache[scr]
+    if type(v) == "string" then return true, v end
+    if type(v) == "table" then
+        if v.success and type(v.source) == "string" then return true, v.source end
+        return false, v.error or "cached decompile failure"
+    end
+    return nil
+end
 
 local function start(lumen)
-    if ready then
-        return true
-    end
-
-    if fail then
-        return false, fail
-    end
+    if ready then return true end
+    if fail then return false, fail end
 
     iri.get()
 
     dex.SetDecompiler(function(scr)
-        st.set("Decompiling", scr)
-        local ok, src = pcall(function()
-            local out = lumen:decompile(scr, {
-                aggressive = false,
-            })
-            return out
-        end)
-
-        if ok then
-            return src
+        local hit, src = cached(scr)
+        if hit ~= nil then
+            if hit then return src end
+            return nil, tostring(src)
         end
 
-        return nil, tostring(src)
+        st.set("Decompiling", scr)
+        local ok, out = pcall(function()
+            return lumen:decompile(scr, { aggressive = false })
+        end)
+
+        if ok then return out end
+        return nil, tostring(out)
     end)
 
     local ok, result, err = pcall(dex.Init)
@@ -8205,16 +8519,22 @@ function save.run(lumen, obj, file, opt)
     end
 
     opt = opt or {}
+    if opt.Decompile == nil then opt.Decompile = true end
+    if opt.Binary == nil then opt.Binary = true end
 
-    if opt.Decompile == nil then
-        opt.Decompile = true
+    local old = cache
+    cache = opt.SourceCache
+
+    local pass = {}
+    for k, v in pairs(opt) do
+        if k ~= "SourceCache" then pass[k] = v end
     end
 
-    if opt.Binary == nil then
-        opt.Binary = true
-    end
+    local callok, a, b = pcall(dex.Save, obj, file, pass)
+    cache = old
 
-    return dex.Save(obj, file, opt)
+    if not callok then error(a, 2) end
+    return a, b
 end
 
 function save.info()
@@ -8230,7 +8550,7 @@ end
 return save
 ]===],
     ["main.version"] = [===[
-return { name = "LumenDecomp", version = "3.1.0" }
+return { name = "LumenDecomp", version = "3.2.0" }
 ]===],
 }
 
@@ -8259,5 +8579,19 @@ local function req(name)
 end
 
 local api = req("main.api")
-api:auto()
+local boot = {
+    Binary = rawget(_G, "Binary"),
+    Decompile = rawget(_G, "Decompile"),
+    Tree = rawget(_G, "Tree"),
+    IgnoreCoreScripts = rawget(_G, "IgnoreCoreScripts"),
+}
+if type(getgenv) == "function" then
+    local ok, e = pcall(getgenv)
+    if ok and type(e) == "table" then
+        for _, k in ipairs({ "Binary", "Decompile", "Tree", "IgnoreCoreScripts" }) do
+            if boot[k] == nil then boot[k] = rawget(e, k) end
+        end
+    end
+end
+api:auto(boot)
 return api

@@ -60,6 +60,8 @@ function pass.run(ir)
     local pend = {}
     local dr = dbg.ranges(ir.proto)
     local tr = ty.ranges(ir.proto)
+    ir.debugranges = dr
+    ir.typeranges = tr
 
     local function fam(v)
         return v and ir:nameid(v) or nil
@@ -109,14 +111,23 @@ function pass.run(ir)
     end
 
     local prep = {}
+    local defs = {}
+    local uses = {}
+
+    local function d(r)
+        return ir:resolve(defs[r])
+    end
+
+    local function u(r)
+        return ir:resolve(uses[r])
+    end
+
     for _, n in ipairs(ir.ops) do
         local op = n.op
         local name = n.name
         local pc = n.pc
-        local defs = ir.ssa.defsByPC[pc] or {}
-        local uses = ir.ssa.usesByPC[pc] or {}
-        local function d(r) return ir:resolve(defs[r]) end
-        local function u(r) return ir:resolve(uses[r]) end
+        defs = ir.ssa.defsByPC[pc] or {}
+        uses = ir.ssa.usesByPC[pc] or {}
 
         if name == "GETGLOBAL" then
             local g = rawk(ir.proto, op.AuxValue and op.AuxValue.Value or 0)
@@ -301,17 +312,10 @@ function pass.run(ir)
         elseif name == "FORNLOOP" then
             add(d(op.A + 3), "i", 62, "numfor")
         end
-    end
 
-    for _, n in ipairs(ir.ops) do
-        local op, pc, name = n.op, n.pc, n.name
-        local uses = ir.ssa.usesByPC[pc] or {}
-        local function u(r) return ir:resolve(uses[r]) end
         if name == "JUMPIF" or name == "JUMPIFNOT" then
             add(u(op.A), "enabled", 38, "condition")
-        elseif name == "GETTABLE" then
-            add(u(op.C), "key", 42, "index")
-        elseif name == "SETTABLE" then
+        elseif name == "GETTABLE" or name == "SETTABLE" then
             add(u(op.C), "key", 42, "index")
         elseif name == "CONCAT" then
             for r = op.B, op.C do add(u(r), "text", 30, "concat") end

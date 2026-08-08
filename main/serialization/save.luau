@@ -1,35 +1,44 @@
 local dex = require("main.serialization.dex_serializer")
 local iri = require("main.runtime.iridium")
+local st = require("main.runtime.status")
 
 local save = {}
 
 local ready = false
 local fail = nil
+local cache = nil
+
+local function cached(scr)
+    if not cache then return nil end
+    local v = cache[scr]
+    if type(v) == "string" then return true, v end
+    if type(v) == "table" then
+        if v.success and type(v.source) == "string" then return true, v.source end
+        return false, v.error or "cached decompile failure"
+    end
+    return nil
+end
 
 local function start(lumen)
-    if ready then
-        return true
-    end
-
-    if fail then
-        return false, fail
-    end
+    if ready then return true end
+    if fail then return false, fail end
 
     iri.get()
 
     dex.SetDecompiler(function(scr)
-        local ok, src = pcall(function()
-            local out = lumen:decompile(scr, {
-                aggressive = false,
-            })
-            return out
-        end)
-
-        if ok then
-            return src
+        local hit, src = cached(scr)
+        if hit ~= nil then
+            if hit then return src end
+            return nil, tostring(src)
         end
 
-        return nil, tostring(src)
+        st.set("Decompiling", scr)
+        local ok, out = pcall(function()
+            return lumen:decompile(scr, { aggressive = false })
+        end)
+
+        if ok then return out end
+        return nil, tostring(out)
     end)
 
     local ok, result, err = pcall(dex.Init)
@@ -54,16 +63,22 @@ function save.run(lumen, obj, file, opt)
     end
 
     opt = opt or {}
+    if opt.Decompile == nil then opt.Decompile = true end
+    if opt.Binary == nil then opt.Binary = true end
 
-    if opt.Decompile == nil then
-        opt.Decompile = true
+    local old = cache
+    cache = opt.SourceCache
+
+    local pass = {}
+    for k, v in pairs(opt) do
+        if k ~= "SourceCache" then pass[k] = v end
     end
 
-    if opt.Binary == nil then
-        opt.Binary = true
-    end
+    local callok, a, b = pcall(dex.Save, obj, file, pass)
+    cache = old
 
-    return dex.Save(obj, file, opt)
+    if not callok then error(a, 2) end
+    return a, b
 end
 
 function save.info()

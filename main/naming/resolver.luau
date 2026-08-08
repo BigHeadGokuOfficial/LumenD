@@ -6,7 +6,7 @@ local ty = require("main.naming.types")
 local names = {}
 names.__index = names
 
-function names.new(stats, opt, proto)
+function names.new(stats, opt, proto, debugranges, typeranges)
     return setmetatable({
         used = {},
         regs = {},
@@ -14,8 +14,8 @@ function names.new(stats, opt, proto)
         stats = stats or {},
         opt = opt or {},
         proto = proto,
-        debug = dbg.ranges(proto),
-        typed = ty.ranges(proto),
+        debug = debugranges or dbg.ranges(proto),
+        typed = typeranges or ty.ranges(proto),
     }, names)
 end
 

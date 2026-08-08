@@ -13,6 +13,8 @@ local cache = {}
 local NIL = {}
 local LOADING = {}
 local root = nil
+local key = nil
+local keyset = false
 
 local function resolve(name)
     if name == "@root" then
@@ -93,6 +95,36 @@ function iri.get()
     return root
 end
 
+function iri.deserialize(raw, opt)
+    local r = iri.get()
+    local cfg = {}
+
+    if type(opt) == "table" then
+        for k, v in pairs(opt) do cfg[k] = v end
+    end
+
+    local explicit = cfg.EncodingKey ~= nil
+    if not explicit and keyset and key ~= nil then
+        cfg.EncodingKey = key
+    end
+
+    local ok, out = pcall(r.Deserialize, r, raw, cfg)
+
+    if not ok and not explicit and keyset and key ~= nil then
+        cfg.EncodingKey = nil
+        ok, out = pcall(r.Deserialize, r, raw, cfg)
+    end
+
+    if not ok then error(out, 2) end
+
+    if not explicit then
+        key = cfg.EncodingKey
+        keyset = true
+    end
+
+    return out
+end
+
 function iri.info()
     local pi = patch.info()
     return {
@@ -104,6 +136,8 @@ function iri.info()
         target = pi.target,
         classes = pi.classes,
         loaded = root ~= nil,
+        encodingKey = key,
+        encodingKeyKnown = keyset,
     }
 end
 

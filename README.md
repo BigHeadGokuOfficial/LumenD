@@ -1,15 +1,14 @@
-# LumenDecomp V3.1
+# LumenDecomp V3.2 Speed
 
 ```lua
-Binary = true
-Decompile = true
-Tree = true
+local g = getgenv()
 
-local lumen = loadstring(game:HttpGet("https://raw.githubusercontent.com/BigHeadGokuOfficial/LumenD/main/LumenDecomp/lumen.luau"))()
+g.Binary = true
+g.Decompile = true
+g.Tree = true
+g.IgnoreCoreScripts = true
+
+local lumen = loadstring(game:HttpGet("https://raw.githubusercontent.com/BigHeadGokuOfficial/LumenD/main/lumen.luau"))()
 ```
 
-# Credits:
-
-Moon / DexSerializer
-
-ActualMasterOogway / Iridium.
+Credits: Moon / DexSerializer, ActualMasterOogway / Iridium.

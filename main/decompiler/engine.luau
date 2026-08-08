@@ -33,7 +33,7 @@ function decomp:_state(proto, up, ph)
     local ir = irbuild.run(proto)
     ir.paramhints = ph or {}
     ir = irpass.run(ir, self.opt)
-    local naming = names.new(ir.cfg.registerStats, self.opt, proto)
+    local naming = names.new(ir.cfg.registerStats, self.opt, proto, ir.debugranges, ir.typeranges)
     return context.new(proto, ir, naming, up, lower.new(), self.opt)
 end
 
@@ -286,7 +286,13 @@ end
 
 function decomp:decompileProto(proto, up)
     local root, st = self:_child(proto, up or {})
-    return printer.run(root), {
+    local src = printer.run(root)
+
+    if self.opt.metadata == false then
+        return src
+    end
+
+    return src, {
         cfg = st.cfg,
         ir = st.ir,
         ssa = st.ssa,

@@ -69,7 +69,8 @@ function ssa.build(proto, cfg)
     for _, block in ipairs(cfg.blocks) do
         for _, pc in ipairs(block.pcs) do
             local op = proto.Instructions[pc]
-            local _, writes = regs.readWrite(op)
+            local pair = cfg.rw and cfg.rw[pc]
+            local writes = pair and pair.writes or select(2, regs.readWrite(op))
 
             if next(writes) then
                 local defs = {}
@@ -172,43 +173,55 @@ function ssa.build(proto, cfg)
         return merged
     end
 
-    local changed = true
+    local queue = {}
+    local queued = {}
+    local head = 1
     local iterations = 0
-    local maxiter = math.max(16, #cfg.blocks * 8)
+    local maxiter = math.max(64, #cfg.blocks * 64)
 
-    while changed and iterations < maxiter do
-        iterations = iterations + 1
-        changed = false
-
-        for _, block in ipairs(cfg.blocks) do
-            local incoming = merge(block)
-            local oldin = result.inVersions[block.id] or {}
-
-            if not same(oldin, incoming) then
-                result.inVersions[block.id] = incoming
-                changed = true
-            end
-
-            local current = copy(incoming)
-
-            for _, pc in ipairs(block.pcs) do
-                local defs = result.defsByPC[pc]
-                if defs then
-                    for reg, version in pairs(defs) do
-                        current[reg] = version
-                    end
-                end
-            end
-
-            local oldout = result.outVersions[block.id] or {}
-            if not same(oldout, current) then
-                result.outVersions[block.id] = current
-                changed = true
-            end
+    local function push(id)
+        if not queued[id] then
+            queued[id] = true
+            queue[#queue + 1] = id
         end
     end
 
-    result.converged = not changed
+    for _, block in ipairs(cfg.blocks) do push(block.id) end
+
+    while head <= #queue and iterations < maxiter do
+        local id = queue[head]
+        head += 1
+        queued[id] = nil
+        iterations += 1
+
+        local block = cfg.blocks[id]
+        local incoming = merge(block)
+        local oldin = result.inVersions[id] or {}
+        local inchg = not same(oldin, incoming)
+
+        if inchg or result.inVersions[id] == nil then
+            result.inVersions[id] = incoming
+        end
+
+        local current = copy(incoming)
+
+        for _, pc in ipairs(block.pcs) do
+            local defs = result.defsByPC[pc]
+            if defs then
+                for reg, version in pairs(defs) do
+                    current[reg] = version
+                end
+            end
+        end
+
+        local oldout = result.outVersions[id] or {}
+        if not same(oldout, current) or result.outVersions[id] == nil then
+            result.outVersions[id] = current
+            for _, sid in ipairs(block.successors) do push(sid) end
+        end
+    end
+
+    result.converged = head > #queue
     result.iterations = iterations
 
     for blockId, phis in pairs(result.phisByBlock) do
@@ -227,7 +240,8 @@ function ssa.build(proto, cfg)
 
         for _, pc in ipairs(block.pcs) do
             local op = proto.Instructions[pc]
-            local reads, _ = regs.readWrite(op)
+            local pair = cfg.rw and cfg.rw[pc]
+            local reads = pair and pair.reads or select(1, regs.readWrite(op))
             local uses = {}
 
             for reg in pairs(reads) do

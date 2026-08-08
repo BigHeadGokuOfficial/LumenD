@@ -11,6 +11,8 @@ function graph.build(proto)
     local aux = ins.auxSlots(proto)
     local leaders = { [1] = true }
     local nexts = {}
+    local names = {}
+    local rw = {}
 
     local function valid(pc)
         return pc >= 1 and pc <= #ops and not aux[pc]
@@ -20,6 +22,9 @@ function graph.build(proto)
         if not aux[pc] then
             local op = ops[pc]
             local name = ins.name(op)
+            names[pc] = name
+            local reads, writes = regs.readWrite(op)
+            rw[pc] = { reads = reads, writes = writes }
             local nextPC = ins.next(proto, pc, aux)
             local successors = {}
 
@@ -106,7 +111,9 @@ function graph.build(proto)
         postdom = postdom,
         ipdom = ipdom,
         loops = loops.find(blocks, dominators),
-        registerStats = regs.stats(proto, aux),
+        registerStats = regs.stats(proto, aux, rw),
+        names = names,
+        rw = rw,
     }
 end
 
