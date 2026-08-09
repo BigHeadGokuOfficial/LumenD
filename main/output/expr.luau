@@ -1,4 +1,3 @@
-
 local expr = {}
 
 local prec = {
@@ -20,53 +19,103 @@ local prec = {
     ["^"] = 8,
 }
 
-local function node(s, p, stable, kind, a, b, op)
-    return { s = s, p = p or 99, stable = stable == true, kind = kind, a = a, b = b, op = op }
-end
-
-local function text(v)
-    return type(v) == "table" and v.s or tostring(v)
-end
-
-local function wrap(v, p, right, op)
+local function render(v)
     if type(v) ~= "table" then return tostring(v) end
-    if v.p < p then return "(" .. v.s .. ")" end
-    if v.p == p then
-        if p == 3 then return "(" .. v.s .. ")" end
-        if op == "^" and not right then return "(" .. v.s .. ")" end
-        if op == ".." and not right then return "(" .. v.s .. ")" end
-        if right and op ~= "^" and op ~= ".." then return "(" .. v.s .. ")" end
+    local kind = v.kind
+    if kind == "atom" or kind == "raw" or kind == "literal" or kind == "local" or kind == "global" then
+        return tostring(v.value or "")
+    elseif kind == "bin" then
+        local p = v.p
+        local function wrap(x, right)
+            if type(x) ~= "table" then return tostring(x) end
+            local text = render(x)
+            if x.p < p then return "(" .. text .. ")" end
+            if x.p == p then
+                if p == 3 then return "(" .. text .. ")" end
+                if v.op == "^" and not right then return "(" .. text .. ")" end
+                if v.op == ".." and not right then return "(" .. text .. ")" end
+                if right and v.op ~= "^" and v.op ~= ".." then return "(" .. text .. ")" end
+            end
+            return text
+        end
+        return wrap(v.a, false) .. " " .. v.op .. " " .. wrap(v.b, true)
+    elseif kind == "un" then
+        local a = render(v.a)
+        if type(v.a) == "table" and v.a.p < v.p then a = "(" .. a .. ")" end
+        return v.op == "not" and ("not " .. a) or (v.op .. a)
+    elseif kind == "prop" then
+        local a = render(v.a)
+        if type(v.a) == "table" and v.a.p < 9 then a = "(" .. a .. ")" end
+        return a .. tostring(v.field or "")
+    elseif kind == "call" then
+        local fn = render(v.fn)
+        if type(v.fn) == "table" and v.fn.p < 9 then fn = "(" .. fn .. ")" end
+        if v.method then fn = fn .. ":" .. tostring(v.method) end
+        local args = {}
+        for i, arg in ipairs(v.args or {}) do args[i] = render(arg) end
+        return fn .. "(" .. table.concat(args, ", ") .. ")"
+    elseif kind == "table" then
+        local out = {}
+        for _, field in ipairs(v.fields or {}) do
+            if field.kind == "list" then
+                out[#out + 1] = render(field.value)
+            elseif field.kind == "field" then
+                out[#out + 1] = tostring(field.key) .. " = " .. render(field.value)
+            else
+                out[#out + 1] = "[" .. tostring(field.key) .. "] = " .. render(field.value)
+            end
+        end
+        return #out == 0 and "{}" or ("{ " .. table.concat(out, ", ") .. " }")
     end
-    return v.s
+    error("LumenV4: EXPR_VERIFY unknown semantic expression kind " .. tostring(kind), 2)
+end
+
+local function node(kind, p, stable, data)
+    local out = { kind = kind, p = p or 99, stable = stable == true }
+    for k, v in pairs(data or {}) do out[k] = v end
+    out.s = render(out)
+    return out
 end
 
 function expr.atom(s, stable)
-    return node(s, 99, stable, "atom")
+    return node("atom", 99, stable, { value = s })
+end
+
+function expr.raw(s, stable)
+    return node("raw", 99, stable, { value = s })
+end
+
+function expr.literal(s)
+    return node("literal", 99, true, { value = s })
+end
+
+function expr.localref(symbol, name)
+    return node("local", 99, false, { symbol = symbol, value = name })
+end
+
+function expr.global(name)
+    return node("global", 99, false, { value = name })
 end
 
 function expr.bin(a, op, b)
     local p = prec[op] or 5
-    return node(wrap(a, p, false, op) .. " " .. op .. " " .. wrap(b, p, true, op), p, a.stable and b.stable, "bin", a, b, op)
+    return node("bin", p, type(a) == "table" and a.stable and type(b) == "table" and b.stable, { a = a, b = b, op = op })
 end
 
 function expr.un(op, a)
-    local p = 7
-    local s = type(a) == "table" and (a.p < p and "(" .. a.s .. ")" or a.s) or tostring(a)
-    if op == "not" then
-        return node("not " .. s, p, a.stable, "un", a, nil, op)
-    end
-    return node(op .. s, p, a.stable, "un", a, nil, op)
+    return node("un", 7, type(a) == "table" and a.stable, { a = a, op = op })
 end
 
 function expr.prop(a, field)
-    local base = type(a) == "table" and (a.p < 9 and "(" .. a.s .. ")" or a.s) or tostring(a)
-    return node(base .. field, 10, false, "prop", a, field)
+    return node("prop", 10, false, { a = a, field = field })
 end
 
 function expr.call(fn, args, method)
-    local base = type(fn) == "table" and (fn.p < 9 and "(" .. fn.s .. ")" or fn.s) or tostring(fn)
-    if method then base = base .. ":" .. method end
-    return node(base .. "(" .. table.concat(args, ", ") .. ")", 10, false, "call", fn, args, method)
+    return node("call", 10, false, { fn = fn, args = args or {}, method = method })
+end
+
+function expr.table(fields)
+    return node("table", 99, false, { fields = fields or {} })
 end
 
 function expr.join(list, op)
@@ -76,7 +125,40 @@ function expr.join(list, op)
 end
 
 function expr.str(v)
-    return text(v)
+    return render(v)
 end
 
+local function verify(v, seen)
+    if type(v) ~= "table" then return true end
+    seen = seen or {}
+    if seen[v] then return true end
+    seen[v] = true
+    local kind = v.kind
+    if kind == "local" then
+        assert(v.symbol ~= nil, "LumenV4: EXPR_VERIFY local expression has no SymbolId")
+        assert(type(v.value) == "string" and v.value ~= "", "LumenV4: EXPR_VERIFY local expression has no display name")
+    elseif kind == "global" or kind == "literal" or kind == "atom" or kind == "raw" then
+        assert(v.value ~= nil, "LumenV4: EXPR_VERIFY atom has no value")
+    elseif kind == "bin" then
+        assert(v.op and v.a ~= nil and v.b ~= nil, "LumenV4: EXPR_VERIFY malformed binary expression")
+        verify(v.a, seen); verify(v.b, seen)
+    elseif kind == "un" then
+        assert(v.op and v.a ~= nil, "LumenV4: EXPR_VERIFY malformed unary expression")
+        verify(v.a, seen)
+    elseif kind == "prop" then
+        assert(v.a ~= nil and v.field ~= nil, "LumenV4: EXPR_VERIFY malformed property expression")
+        verify(v.a, seen)
+    elseif kind == "call" then
+        assert(v.fn ~= nil and type(v.args) == "table", "LumenV4: EXPR_VERIFY malformed call expression")
+        verify(v.fn, seen); for _, a in ipairs(v.args) do verify(a, seen) end
+    elseif kind == "table" then
+        for _, field in ipairs(v.fields or {}) do assert(field.value ~= nil, "LumenV4: EXPR_VERIFY table field has no value"); verify(field.value, seen) end
+    else
+        error("LumenV4: EXPR_VERIFY unknown expression kind " .. tostring(kind), 2)
+    end
+    assert(render(v) == v.s, "LumenV4: EXPR_VERIFY cached rendering diverged from semantic tree")
+    return true
+end
+
+expr.verify = verify
 return expr

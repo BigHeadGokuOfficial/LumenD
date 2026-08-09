@@ -76,6 +76,7 @@ function cond.chain(st, pc)
     local exit = ins.jumpTarget(pc, first)
     local cur = pc
     local list = {}
+    local pcs = {}
     local count = 0
 
     while true do
@@ -84,23 +85,25 @@ function cond.chain(st, pc)
         if not ins.isConditional(op) or name == "FORNLOOP" or name == "FORGLOOP" then break end
         if ins.jumpTarget(cur, op) ~= exit then break end
         list[#list + 1] = cond.fall(st, cur, op)
+        pcs[#pcs + 1] = cur
         count += 1
         local nx = st:next(cur)
         local nop = st.proto.Instructions[nx]
         if not nop or not ins.isConditional(nop) then
-            return { cond = ex.join(list, "and"), body = nx, exit = exit, last = cur }
+            return { cond = ex.join(list, "and"), body = nx, exit = exit, last = cur, pcs = pcs }
         end
         if ins.jumpTarget(nx, nop) ~= exit then break end
         cur = nx
     end
 
     if count > 1 then
-        return { cond = ex.join(list, "and"), body = st:next(cur), exit = exit, last = cur }
+        return { cond = ex.join(list, "and"), body = st:next(cur), exit = exit, last = cur, pcs = pcs }
     end
 
     local body = exit
     local p = pc
     local ors = {}
+    local orpcs = {}
     while p < body do
         local op = st.proto.Instructions[p]
         if not op or not ins.isConditional(op) then break end
@@ -108,16 +111,18 @@ function cond.chain(st, pc)
         local jt = ins.jumpTarget(p, op)
         if jt == body and nx < body then
             ors[#ors + 1] = cond.jump(st, p, op)
+            orpcs[#orpcs + 1] = p
             p = nx
         elseif nx == body and jt > body then
             ors[#ors + 1] = cond.fall(st, p, op)
-            return { cond = ex.join(ors, "or"), body = body, exit = jt, last = p }
+            orpcs[#orpcs + 1] = p
+            return { cond = ex.join(ors, "or"), body = body, exit = jt, last = p, pcs = orpcs }
         else
             break
         end
     end
 
-    return { cond = cond.fall(st, pc, first), body = st:next(pc), exit = exit, last = pc }
+    return { cond = cond.fall(st, pc, first), body = st:next(pc), exit = exit, last = pc, pcs = { pc } }
 end
 
 function cond.bool(st, pc, op)

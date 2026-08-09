@@ -33,9 +33,13 @@ end
 function api:decompileBytecode(raw, opt)
     opt = cfg(opt)
 
+    local dt = os.clock()
     local parsed = parsebc(raw, opt)
+    local decode = os.clock() - dt
     local d = decomp.new(opt)
     local source, details = d:decompileParsed(parsed)
+    details.timings = details.timings or {}
+    details.timings.decode = decode
 
     return source, {
         version = ver.version,

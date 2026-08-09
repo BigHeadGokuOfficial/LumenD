@@ -8,31 +8,76 @@ local config = require("main.config")
 
 local dump = {}
 
-local function accept(stat, source)
+local function accept(stat, source, info)
     stat.good += 1
-    local status = source:match('^local __lumenmeta = "LumenV4 status=([A-Z_]+)')
-    if status == "LOSSLESS_FALLBACK" or status == "VM_FALLBACK" then
-        stat.fallback += 1
-    elseif status == "STRUCTURED" then
+    info = type(info) == "table" and info or nil
+
+    local status = info and info.status or source:match("^%-%- LumenV4 status=([A-Z_]+)")
+    local reachable = info and tonumber(info.reachableInstructions) or tonumber(source:match("reachable=(%d+)")) or 0
+    local covered = info and tonumber(info.coveredInstructions) or tonumber(source:match("covered=(%d+)")) or 0
+
+    if status == "STRUCTURED" then
         stat.structured += 1
+        stat.structuredReachable += reachable
+    elseif status == "LOSSLESS_FALLBACK" then
+        stat.lossless += 1
+        stat.fallback += 1
+        stat.losslessReachable += reachable
+    elseif status == "VM_FALLBACK" then
+        stat.vm += 1
+        stat.fallback += 1
+        stat.vmReachable += reachable
     else
         stat.unknown += 1
     end
-    local reachable, covered = source:match("reachable=(%d+) covered=(%d+)")
-    stat.reachable += tonumber(reachable) or 0
-    stat.covered += tonumber(covered) or 0
-    local sb, fb = source:match("structuredBlocks=(%d+) fallbackBlocks=(%d+)")
-    stat.sblocks += tonumber(sb) or 0
-    stat.fblocks += tonumber(fb) or 0
-    stat.phis += tonumber(source:match("phis=(%d+)")) or 0
-    stat.packs += tonumber(source:match("packs=(%d+)")) or 0
-    stat.cells += tonumber(source:match("cells=(%d+)")) or 0
-    stat.objects += tonumber(source:match("objects=(%d+)")) or 0
-    stat.escaped += tonumber(source:match("escapedObjects=(%d+)")) or 0
-    stat.irreducible += tonumber(source:match("irreducible=(%d+)")) or 0
-    local bv = tonumber(source:match("bytecodeVersion=(%d+)"))
+
+    stat.reachable += reachable
+    stat.covered += covered
+
+    local blocks = info and info.cfg and info.cfg.blocks and #info.cfg.blocks or nil
+    local sb = tonumber(source:match("structuredBlocks=(%d+)")) or 0
+    local fb = tonumber(source:match("fallbackBlocks=(%d+)")) or 0
+    if info and blocks then
+        if status == "STRUCTURED" then sb, fb = blocks, 0
+        elseif status == "LOSSLESS_FALLBACK" then sb, fb = 0, blocks end
+    elseif info and status == "VM_FALLBACK" then
+        sb, fb = tonumber(info.structuredBlocks) or 0, tonumber(info.fallbackBlocks) or reachable
+    end
+    stat.sblocks += sb
+    stat.fblocks += fb
+
+    local ss = info and info.ssaSummary or nil
+    stat.phis += ss and tonumber(ss.phis) or tonumber(source:match("phis=(%d+)")) or 0
+    stat.packs += info and tonumber(info.valuePackCount) or tonumber(source:match("packs=(%d+)")) or 0
+    stat.cells += info and tonumber(info.cellCount) or tonumber(source:match("cells=(%d+)")) or 0
+    stat.objects += info and tonumber(info.objectCount) or tonumber(source:match("objects=(%d+)")) or 0
+    stat.escaped += info and tonumber(info.escapedObjects) or tonumber(source:match("escapedObjects=(%d+)")) or 0
+    stat.irreducible += info and (info.irreducible and 1 or 0) or tonumber(source:match("irreducible=(%d+)")) or 0
+
+    if info and info.captureVerified == false then stat.captureFailures += 1 end
+    local tm = info and info.timings
+    if type(tm) == "table" then
+        local cfgtime = type(tm.cfg) == "table" and tm.cfg or {}
+        local ssatime = type(tm.ssaDetail) == "table" and tm.ssaDetail or {}
+        local passes = type(tm.passes) == "table" and tm.passes or {}
+        local stage = stat.stage
+        stage.decode += tonumber(tm.decode) or 0
+        stage.cfg += tonumber(cfgtime.cfg) or tonumber(tm.graph) or 0
+        stage.dominators += tonumber(cfgtime.dominators) or 0
+        stage.postdominators += tonumber(cfgtime.postdominators) or 0
+        stage.ssa += tonumber(ssatime.ssa) or tonumber(tm.ssa) or 0
+        stage.cells += tonumber(tm.cells) or 0
+        stage.objects += tonumber(tm.objects) or 0
+        stage.packs += tonumber(ssatime.packs) or 0
+        stage.structuring += tonumber(tm.structuring) or 0
+        stage.outssa += tonumber(passes.outssa) or 0
+        stage.naming += (tonumber(passes.naming) or 0) + (tonumber(tm.symbolNaming) or 0)
+        stage.printing += tonumber(tm.printing) or 0
+        stage.verification += (tonumber(tm.verification) or 0) + (tonumber(tm.expressionVerify) or 0)
+    end
+    local bv = info and tonumber(info.bytecodeVersion) or tonumber(source:match("bytecodeVersion=(%d+)"))
     if bv then stat.versions[bv] = (stat.versions[bv] or 0) + 1 end
-    if source:find("parser=true", 1, true) then stat.syntax += 1 end
+    if info and info.syntaxValid == true or source:find("parser=true", 1, true) then stat.syntax += 1 end
 end
 
 local function rootdir()
@@ -52,6 +97,14 @@ local function decompfail(stat, cache, obj, err)
     elseif err:find("LumenV4: INVALID", 1, true) then stat.invalid += 1
     elseif err:find("LumenV4: UNSUPPORTED", 1, true) then stat.unsupported += 1
     else stat.other += 1 end
+    if err:find("CAPTURE_VERIFY", 1, true) then stat.captureFailures += 1 end
+    if err:find("SSA destruction", 1, true) or err:find("OUT_OF_SSA", 1, true) or err:find("SSA_DESTRUCT", 1, true) then stat.ssaFailures += 1 end
+    if err:find("unstructured", 1, true) or err:find("STRUCTURED_BUDGET", 1, true) or err:find("STRUCTURED_COMPLEXITY", 1, true) or err:find("CFG_STRUCTURE", 1, true) then stat.cfgFailures += 1 end
+    if err:find("ObjectId", 1, true) or err:find("table identity", 1, true) or err:find("OBJECT_VERIFY", 1, true) then stat.tableFailures += 1 end
+    if err:find("SCOPE_VERIFY", 1, true) then stat.scopeFailures += 1 end
+    if err:find("EXPR_VERIFY", 1, true) then stat.expressionFailures += 1 end
+    if err:find("ValuePack", 1, true) then stat.packFailures += 1 end
+    if err:find("recursion depth", 1, true) or err:find("compiler", 1, true) and err:find("VM fallback", 1, true) then stat.compilerFailures += 1 end
     cache[obj] = { success = false, error = err }
     local line = st.path(obj) .. " :: " .. err
     stat.errors[#stat.errors + 1] = line
@@ -145,7 +198,7 @@ local function serial(lumen, jobs, opt, stat, cache, label)
         local res = lumen:tryDecompileBytecode(job.raw, cfg)
         if res.success and type(res.source) == "string" and res.source ~= "" then
             cache[job.obj] = res.source
-            accept(stat, res.source)
+            accept(stat, res.source, res.metadata and res.metadata.details)
         else
             decompfail(stat, cache, job.obj, res.error)
         end
@@ -162,7 +215,7 @@ local function serial(lumen, jobs, opt, stat, cache, label)
 end
 
 local actorcode = [[
-local id, src, vendor, smart, funcs, guards, fold, conds, blocks = ...
+local id, src, vendor, smart, funcs, guards, fold, conds, blocks, fidelity, structuredBudget, structuredMax, structuredProtoMax, structuredBlocks = ...
 local ch = get_comm_channel(id)
 local genv = type(getgenv) == "function" and getgenv() or _G
 local okv, v = pcall(function()
@@ -198,6 +251,11 @@ local dec = {
     fold = fold,
     conditions = conds,
     doblocks = blocks,
+    fidelity = fidelity,
+    structuredbudget = structuredBudget,
+    structuredmaxinstructions = structuredMax,
+    structuredmaxprotoinstructions = structuredProtoMax,
+    structuredmaxblocks = structuredBlocks,
 }
 local con
 con = ch.Event:Connect(function(kind, jid, raw)
@@ -206,11 +264,11 @@ con = ch.Event:Connect(function(kind, jid, raw)
         return
     end
     if kind ~= "job" then return end
-    local good, out = pcall(function() return api:decompileBytecode(raw, dec) end)
+    local good, out, meta = pcall(function() return api:decompileBytecode(raw, dec) end)
     if good and type(out) == "string" and out ~= "" then
-        ch:Fire("done", jid, true, out)
+        ch:Fire("done", jid, true, out, meta and meta.details)
     else
-        ch:Fire("done", jid, false, tostring(out))
+        ch:Fire("done", jid, false, tostring(out), nil)
     end
 end)
 ch:Fire("boot", true, "")
@@ -265,16 +323,16 @@ local function actors(lumen, jobs, opt, stat, cache)
         if #live >= want then break end
         local id, ch = create_comm_channel()
         local w = { id = id, ch = ch, actor = actor, ready = false, dead = false, busy = false, sent = 0 }
-        w.con = ch.Event:Connect(function(kind, a, b, c)
+        w.con = ch.Event:Connect(function(kind, a, b, c, d)
             if kind == "boot" then
                 if a then w.ready = true else w.dead = true; w.err = tostring(b) end
             elseif kind == "done" then
                 qtail += 1
-                q[qtail] = { w = w, jid = a, ok = b, out = c }
+                q[qtail] = { w = w, jid = a, ok = b, out = c, info = d }
             end
         end)
         ws[#ws + 1] = w
-        local rok, rerr = pcall(run_on_actor, actor, actorcode, id, src, vendor, dc.smartnames ~= false, dc.functions ~= false, dc.guards ~= false, dc.fold ~= false, dc.conditions ~= false, dc.doblocks or 0)
+        local rok, rerr = pcall(run_on_actor, actor, actorcode, id, src, vendor, dc.smartnames ~= false, dc.functions ~= false, dc.guards ~= false, dc.fold ~= false, dc.conditions ~= false, dc.doblocks or 0, dc.fidelity ~= false, dc.structuredbudget, dc.structuredmaxinstructions, dc.structuredmaxprotoinstructions, dc.structuredmaxblocks)
         if not rok then
             w.dead = true
             w.err = tostring(rerr)
@@ -338,7 +396,7 @@ local function actors(lumen, jobs, opt, stat, cache)
                 local job = jobs[jid]
                 if r.ok and type(r.out) == "string" and r.out ~= "" then
                     cache[job.obj] = r.out
-                    accept(stat, r.out)
+                    accept(stat, r.out, r.info)
                 else
                     retry[#retry + 1] = job
                 end
@@ -391,7 +449,7 @@ local function actors(lumen, jobs, opt, stat, cache)
                 local res = lumen:tryDecompileBytecode(job.raw, cfg)
                 if res.success and type(res.source) == "string" and res.source ~= "" then
                     cache[job.obj] = res.source
-                    accept(stat, res.source)
+                    accept(stat, res.source, res.metadata and res.metadata.details)
                 else
                     decompfail(stat, cache, job.obj, res.error)
                 end
@@ -469,11 +527,27 @@ local function summary(root, stat)
         "Bytecode available: " .. tostring(stat.available),
         "Accepted source (syntax + origin coverage): " .. tostring(stat.good),
         "Structured accepted: " .. tostring(stat.structured),
+        "Lossless fallback accepted: " .. tostring(stat.lossless),
+        "VM fallback accepted: " .. tostring(stat.vm),
         "Lossless/VM fallback accepted: " .. tostring(stat.fallback),
+        "Reachable instructions structured: " .. tostring(stat.structuredReachable),
+        "Reachable instructions lossless fallback: " .. tostring(stat.losslessReachable),
+        "Reachable instructions VM fallback: " .. tostring(stat.vmReachable),
+        "Structured instruction %: " .. (stat.reachable > 0 and string.format("%.2f%%", stat.structuredReachable * 100 / stat.reachable) or "0.00%"),
+        "Lossless instruction %: " .. (stat.reachable > 0 and string.format("%.2f%%", stat.losslessReachable * 100 / stat.reachable) or "0.00%"),
+        "VM instruction %: " .. (stat.reachable > 0 and string.format("%.2f%%", stat.vmReachable * 100 / stat.reachable) or "0.00%"),
         "Partial: " .. tostring(stat.partial),
         "Invalid output: " .. tostring(stat.invalid),
         "Unsupported: " .. tostring(stat.unsupported),
         "Other failures: " .. tostring(stat.other),
+        "Capture verifier failures: " .. tostring(stat.captureFailures),
+        "SSA destruction failures: " .. tostring(stat.ssaFailures),
+        "CFG structuring/complexity failures: " .. tostring(stat.cfgFailures),
+        "Table identity failures: " .. tostring(stat.tableFailures),
+        "ValuePack failures: " .. tostring(stat.packFailures),
+        "Scope verifier failures: " .. tostring(stat.scopeFailures),
+        "Expression verifier failures: " .. tostring(stat.expressionFailures),
+        "Compiler-size fallback failures: " .. tostring(stat.compilerFailures),
         "Syntax-valid source: " .. tostring(stat.syntax) .. "/" .. tostring(stat.good),
         "Reachable instruction coverage: " .. (stat.reachable > 0 and string.format("%.2f%%", stat.covered * 100 / stat.reachable) or "100.00%"),
         "Structured blocks: " .. tostring(stat.sblocks),
@@ -500,6 +574,20 @@ local function summary(root, stat)
         "ConstantFolding: " .. tostring(stat.decompiler and stat.decompiler.fold ~= false),
         "ConditionalStructurer: " .. tostring(stat.decompiler and stat.decompiler.conditions ~= false),
         "DoBlockInsertionThreshold: " .. tostring(stat.decompiler and stat.decompiler.doblocks or 0),
+        "FidelityMode: " .. tostring(stat.decompiler and stat.decompiler.fidelity ~= false),
+        "Stage decode seconds: " .. string.format("%.3f", stat.stage.decode or 0),
+        "Stage cfg seconds: " .. string.format("%.3f", stat.stage.cfg or 0),
+        "Stage dominators seconds: " .. string.format("%.3f", stat.stage.dominators or 0),
+        "Stage postdominators seconds: " .. string.format("%.3f", stat.stage.postdominators or 0),
+        "Stage SSA seconds: " .. string.format("%.3f", stat.stage.ssa or 0),
+        "Stage CellId seconds: " .. string.format("%.3f", stat.stage.cells or 0),
+        "Stage ObjectId seconds: " .. string.format("%.3f", stat.stage.objects or 0),
+        "Stage ValuePack seconds: " .. string.format("%.3f", stat.stage.packs or 0),
+        "Stage structuring seconds: " .. string.format("%.3f", stat.stage.structuring or 0),
+        "Stage out-of-SSA seconds: " .. string.format("%.3f", stat.stage.outssa or 0),
+        "Stage naming seconds: " .. string.format("%.3f", stat.stage.naming or 0),
+        "Stage printing seconds: " .. string.format("%.3f", stat.stage.printing or 0),
+        "Stage verification seconds: " .. string.format("%.3f", stat.stage.verification or 0),
         "Acquire seconds: " .. string.format("%.3f", stat.acquireTime or 0),
         "Acquire batch: " .. tostring(stat.acquireBatch or 0),
         "Acquire budget ms: " .. string.format("%.2f", stat.acquireBudgetMs or 0),
@@ -533,8 +621,21 @@ function dump.run(lumen, opt)
         available = 0,
         good = 0,
         structured = 0,
+        lossless = 0,
+        vm = 0,
         fallback = 0,
         unknown = 0,
+        structuredReachable = 0,
+        losslessReachable = 0,
+        vmReachable = 0,
+        captureFailures = 0,
+        ssaFailures = 0,
+        cfgFailures = 0,
+        tableFailures = 0,
+        packFailures = 0,
+        scopeFailures = 0,
+        expressionFailures = 0,
+        compilerFailures = 0,
         partial = 0,
         invalid = 0,
         unsupported = 0,
@@ -574,6 +675,7 @@ function dump.run(lumen, opt)
         rate = 0,
         parallel = 1,
         decompiler = config(decopt(opt)),
+        stage = { decode = 0, cfg = 0, dominators = 0, postdominators = 0, ssa = 0, cells = 0, objects = 0, packs = 0, structuring = 0, outssa = 0, naming = 0, printing = 0, verification = 0 },
     }
     local made = {}
     tree.mkall(root, made)
@@ -681,7 +783,7 @@ function dump.auto(lumen, boot)
     local writebudget = tonumber(val("WriteBudgetMs")) or 8
     local dopt = val("DecompilerOptions")
     if type(dopt) ~= "table" then dopt = {} end
-    local names = { "SmartVariableRenamer", "FunctionDeclarations", "GuardClauses", "ConstantFolding", "ConditionalStructurer", "DoBlockInsertionThreshold" }
+    local names = { "SmartVariableRenamer", "FunctionDeclarations", "GuardClauses", "ConstantFolding", "ConditionalStructurer", "DoBlockInsertionThreshold", "FidelityMode", "StructuredBudgetSeconds", "StructuredMaxInstructions", "StructuredMaxProtoInstructions", "StructuredMaxBlocks" }
     for _, name in ipairs(names) do
         local v = val(name)
         if v ~= nil then dopt[name] = v end

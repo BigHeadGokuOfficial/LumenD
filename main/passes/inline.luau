@@ -66,7 +66,8 @@ function pass.run(ir, check)
     for id, v in pairs(ir.vals) do
         if check then check() end
         id = ir:resolve(id)
-        if id and not ir.dead[id] and v.kind == "def" and not mutable[id] then
+        local protected = id and ir.outssa and ir.outssa.materialize and ir.outssa.materialize[id]
+        if id and not ir.dead[id] and v.kind == "def" and not mutable[id] and not protected then
             local u = ir:only(id)
             local n = v.pc and ir.bypc[v.pc]
             if u and u.pc and n and ir.cfg.blockmap[v.pc] == ir.cfg.blockmap[u.pc] then
@@ -83,7 +84,8 @@ function pass.run(ir, check)
 
     for id in pairs(ir.const) do
         id = ir:resolve(id)
-        if id and not mutable[id] then
+        local protected = id and ir.outssa and ir.outssa.materialize and ir.outssa.materialize[id]
+        if id and not mutable[id] and not protected then
             local ok = ir:count(id) > 0
             for _, u in ipairs(ir:uses(id) or {}) do
                 local useop = u.pc and ir.bypc[u.pc] or nil

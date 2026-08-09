@@ -149,7 +149,7 @@ function ssa.build(proto, cfg, check, limits)
         inVersions = {}, outVersions = {}, useCount = {}, defUse = {}, undefByReg = {}, packsByPC = {},
         liveIn = livein, liveOut = liveout, liveAfter = liveafter,
         packInBlock = packinblock, packOutBlock = packoutblock, packBefore = packbefore,
-        packInput = packinput, ambiguousPack = ambiguouspack,
+        packInput = packinput, ambiguousPack = ambiguouspack, timings = timings,
     }
     local nextver = 1
     local function newver(kind, reg, pc, block)
@@ -326,7 +326,8 @@ function ssa.build(proto, cfg, check, limits)
         end
         return true
     end
-    result.verified = verifyssa()
+    timings.ssa = os.clock() - ssastart
+    local vt = os.clock(); result.verified = verifyssa(); result.valuePackVerified = result.verified == true; timings.verify = os.clock() - vt
 
     function result:versionForUse(pc, reg) local u = self.usesByPC[pc]; return u and u[reg] or nil end
     function result:versionForDef(pc, reg) local d = self.defsByPC[pc]; return d and d[reg] or nil end

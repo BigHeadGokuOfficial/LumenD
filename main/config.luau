@@ -19,9 +19,9 @@ local base = {
     iridium = nil,
     fidelity = true,
     structuredbudget = 1.25,
-    structuredmaxinstructions = 8000,
-    structuredmaxprotoinstructions = 4000,
-    structuredmaxblocks = 256,
+    structuredmaxinstructions = 32000,
+    structuredmaxprotoinstructions = 16000,
+    structuredmaxblocks = 1024,
 }
 
 local map = {
@@ -44,9 +44,9 @@ return function(opt)
     if opt then for k, v in pairs(opt) do out[map[k] or k] = v end end
     out.doblocks = math.max(0, math.floor(tonumber(out.doblocks) or 0))
     out.structuredbudget = math.max(0, tonumber(out.structuredbudget) or 1.25)
-    out.structuredmaxinstructions = math.max(0, math.floor(tonumber(out.structuredmaxinstructions) or 8000))
-    out.structuredmaxprotoinstructions = math.max(0, math.floor(tonumber(out.structuredmaxprotoinstructions) or 4000))
-    out.structuredmaxblocks = math.max(0, math.floor(tonumber(out.structuredmaxblocks) or 256))
+    out.structuredmaxinstructions = math.max(0, math.floor(tonumber(out.structuredmaxinstructions) or 32000))
+    out.structuredmaxprotoinstructions = math.max(0, math.floor(tonumber(out.structuredmaxprotoinstructions) or 16000))
+    out.structuredmaxblocks = math.max(0, math.floor(tonumber(out.structuredmaxblocks) or 1024))
     if out.fidelity ~= false then
 
         out.fold = false

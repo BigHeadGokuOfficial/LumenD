@@ -186,6 +186,67 @@ local function closurechild(parsed, proto, op, byobject)
     end
 end
 
+local function sharddispatch(out, startindex, depth, leafsize)
+    leafsize = math.max(8, tonumber(leafsize) or 48)
+    local prefix = string.rep("    ", depth)
+    local raw = {}
+    for i = startindex, #out do raw[#raw + 1] = out[i] end
+    for i = #out, startindex, -1 do out[i] = nil end
+
+    local branches = {}
+    local current
+    for _, text in ipairs(raw) do
+        local pc = text:match("^" .. prefix .. "if __pc == (%-?%d+) then$")
+            or text:match("^" .. prefix .. "elseif __pc == (%-?%d+) then$")
+        if pc then
+            current = { pc = tonumber(pc), body = {} }
+            branches[#branches + 1] = current
+        elseif current then
+            current.body[#current.body + 1] = text
+        end
+    end
+
+    if #branches == 0 then
+        line(out, depth, "error(\"LumenV4 VM fallback: empty dispatcher\")")
+        return
+    end
+
+    local function body(branch, newdepth)
+        for _, text in ipairs(branch.body) do
+            local spaces = text:match("^(%s*)") or ""
+            local olddepth = math.floor(#spaces / 4)
+            local rel = math.max(0, olddepth - (depth + 1))
+            line(out, newdepth + rel, text:sub(#spaces + 1))
+        end
+    end
+
+    local function leaf(lo, hi, d)
+        for i = lo, hi do
+            local b = branches[i]
+            line(out, d, (i == lo and "if " or "elseif ") .. "__pc == " .. tostring(b.pc) .. " then")
+            body(b, d + 1)
+        end
+        line(out, d, "else")
+        line(out, d + 1, "error(\"LumenV4 VM fallback: invalid pc \" .. tostring(__pc))")
+        line(out, d, "end")
+    end
+
+    local function tree(lo, hi, d)
+        if hi - lo + 1 <= leafsize then
+            leaf(lo, hi, d)
+            return
+        end
+        local mid = math.floor((lo + hi) / 2)
+        line(out, d, "if __pc <= " .. tostring(branches[mid].pc) .. " then")
+        tree(lo, mid, d + 1)
+        line(out, d, "else")
+        tree(mid + 1, hi, d + 1)
+        line(out, d, "end")
+    end
+
+    tree(1, #branches, depth)
+end
+
 local function emitprotofactory(out, parsed, proto, id, byobject, pulse)
     local pcs, slots = realpcs(proto)
     local maxstack = math.max(1, tonumber(proto.MaxStackSize) or 255)
@@ -247,6 +308,7 @@ local function emitprotofactory(out, parsed, proto, id, byobject, pulse)
         end
     end
 
+    local dispatchstart = #out + 1
     local branchindex = 0
     for _, pc in ipairs(pcs) do
         if pulse then pulse() end
@@ -479,9 +541,7 @@ local function emitprotofactory(out, parsed, proto, id, byobject, pulse)
         end
     end
 
-    line(out, 3, "else")
-    line(out, 4, "error(\"LumenV4 VM fallback: invalid pc \" .. tostring(__pc))")
-    line(out, 3, "end")
+    sharddispatch(out, dispatchstart, 3, 48)
     line(out, 2, "end")
     line(out, 1, "end")
     line(out, 1, "return __fn")
@@ -697,6 +757,11 @@ function vm.run(parsed, reason)
         syntaxValid = true,
         originCoverageValid = true,
         coverage = 1,
+        reachableInstructions = decoded,
+        coveredInstructions = decoded,
+        structuredBlocks = 0,
+        fallbackBlocks = decoded,
+        captureVerified = true,
         verification = "decoded-bytecode-total-dispatch",
         structuredError = tostring(reason or ""),
     }
@@ -739,22 +804,32 @@ end
 
 function decomp:_state(proto, up, ph)
     self:_check()
-    local limits = {
-        maxinstructions = self.opt.structuredmaxprotoinstructions or self.opt.structuredmaxinstructions,
-        maxblocks = self.opt.structuredmaxblocks,
-    }
+    local limits
+    if self.losslessOnly then
+        local mi = tonumber(self.opt.structuredmaxprotoinstructions) or 16000
+        local mb = tonumber(self.opt.structuredmaxblocks) or 1024
+        limits = { maxinstructions = mi > 0 and math.max(mi, 65536) or 0, maxblocks = mb > 0 and math.max(mb, 4096) or 0 }
+    else
+        limits = {
+            maxinstructions = self.opt.structuredmaxprotoinstructions or self.opt.structuredmaxinstructions,
+            maxblocks = self.opt.structuredmaxblocks,
+        }
+    end
     local ir = irbuild.run(proto, function() self:_check() end, limits)
     ir.paramhints = ph or {}
     self:_check()
     ir = irpass.run(ir, self.opt, function() self:_check() end)
     self:_check()
+    local nt = os.clock()
     local naming = names.new(ir.cfg.registerStats, self.opt, proto)
+    ir.timings = ir.timings or {}; ir.timings.symbolNaming = os.clock() - nt
     local st = context.new(proto, ir, naming, up, lower.new(), self.opt)
-    st.v4 = { fallback = false, visited = {}, status = "STRUCTURED", cellNames = {} }
+    st.v4 = { fallback = false, visited = {}, status = "STRUCTURED", cellNames = {}, captureVerified = true, childCaptures = 0, timings = ir.timings }
 
 
     if ir.cells and next(ir.cells) then
         local oldvname = st.vname
+        st.basevname = oldvname
         local ids = {}
         for cid in pairs(ir.cells) do ids[#ids + 1] = cid end
         table.sort(ids)
@@ -774,7 +849,17 @@ function decomp:_state(proto, up, ph)
             end
         end
         st.vname = function(self, value, reg, hint, pc)
-            local cid = value and ((self.ir.cellOfValue and self.ir.cellOfValue[value]) or resolvedcell[self.ir:resolve(value)])
+            local raw = value and self.ir:resolve(value)
+            local cid
+            if pc and raw then
+                local def = self.ssa.defsByPC[pc] and self.ssa.defsByPC[pc][reg]
+                if def and self.ir:resolve(def) == raw then cid = self.ir.cellDef and self.ir.cellDef[pc] and self.ir.cellDef[pc][reg] end
+                if not cid then
+                    local use = self.ssa.usesByPC[pc] and self.ssa.usesByPC[pc][reg]
+                    if use and self.ir:resolve(use) == raw then cid = self.ir.cellUse and self.ir.cellUse[pc] and self.ir.cellUse[pc][reg] end
+                end
+            end
+            if not cid then cid = value and ((self.ir.cellOfValue and self.ir.cellOfValue[value]) or resolvedcell[raw]) end
             local cellname = cid and self.v4.cellNames[cid]
             if cellname then return cellname end
             return oldvname(self, value, reg, hint, pc)
@@ -782,26 +867,8 @@ function decomp:_state(proto, up, ph)
     end
 
 
-    for bid, phis in pairs(ir.phis or {}) do
-        local block = assert(ir.cfg.blocks[bid], "LumenV4: phi references invalid CFG block")
-        for reg, phi in pairs(phis) do
-            local pid = ir:resolve(phi.id)
-            if pid and not ir.dead[pid] then
-                local target = st:vname(pid, reg, nil, block.startPC)
-                for pred, raw in pairs(phi.incoming or {}) do
-                    local rid = ir:resolve(raw)
-                    local value = rid and ir.vals[rid] or nil
-                    if value and value.kind ~= "undef" then
-                        local pb = assert(ir.cfg.blocks[pred], "LumenV4: phi references invalid predecessor")
-                        local source = st:vname(rid, reg, nil, pb.endPC)
-                        if source ~= target then
-                            error(("LumenV4: UNSUPPORTED SSA destruction mismatch for phi v%d r%d: b%d uses %s, target is %s")
-                                :format(pid, reg, pred, tostring(source), tostring(target)), 2)
-                        end
-                    end
-                end
-            end
-        end
+    if not ir.outssa or ir.outssa.verified ~= true then
+        error("LumenV4: SSA_DESTRUCT out-of-SSA verification did not complete", 2)
     end
     st.v4.ssaDestructionVerified = true
     return st
@@ -891,18 +958,7 @@ function decomp:_op(st, pc)
     end
 
     local name = ins.name(op)
-    local nx
-
-    if name == "NEWTABLE" then
-        st:set(pc, op.A, ex.atom("{}", false))
-        nx = st:next(pc)
-    elseif name == "DUPTABLE" then
-        local constant = st.proto.Constants and st.proto.Constants[(op.D or 0) + 1]
-        st:set(pc, op.A, ex.atom(lit.constant(constant), false))
-        nx = st:next(pc)
-    else
-        nx = ops.run(self, st, pc)
-    end
+    local nx = ops.run(self, st, pc)
 
     if pack.producesTop then
         local produced = st.top
@@ -925,6 +981,12 @@ function decomp:_op(st, pc)
         end
         st.top = nil
     end
+    local bid = st.cfg.blockmap[pc]
+    local sid = nx and st.cfg.blockmap[nx]
+    local block = bid and st.cfg.blocks[bid]
+    if not (st.v4 and st.v4.dispatcher) and bid and sid and bid ~= sid and block and #block.successors == 1 and block.successors[1] == sid then
+        st:edge(bid, sid)
+    end
     return nx
 end
 
@@ -933,23 +995,40 @@ function decomp:_child(proto, up, ph)
     local st = self:_state(proto, up, ph)
     local args = arguments(st, proto)
     preparepacks(st)
-    self:_region(st, 1, #proto.Instructions + 1, {})
+    local scopeclock
 
-    if hashard(st) then
+    if not self.losslessOnly then
+        scopeclock = os.clock(); st:prepareoutssa(); st.v4.timings.scope = (st.v4.timings.scope or 0) + (os.clock() - scopeclock)
+        local structureclock = os.clock(); self:_region(st, 1, #proto.Instructions + 1, {}); st.v4.timings.structuring = (st.v4.timings.structuring or 0) + (os.clock() - structureclock)
+        local outok, outwhy = st:verifyoutssa()
+        if not outok then st.bad[#st.bad + 1] = "SSA_DESTRUCT structured edge not represented: " .. tostring(outwhy) end
+    end
 
-        st = self:_state(proto, up, ph)
-        args = arguments(st, proto)
-        preparepacks(st)
+    if self.losslessOnly or hashard(st) then
+        if not self.losslessOnly then
+            local base = tonumber(self.opt.structuredbudget) or 1.25
+            local extra = math.min(5, #(proto.Instructions or {}) / 1500)
+            self.deadline = os.clock() + math.max(1.5, base + extra)
+            st = self:_state(proto, up, ph)
+            args = arguments(st, proto)
+            preparepacks(st)
+        end
         st.v4.fallback = true
         st.v4.status = "LOSSLESS_FALLBACK"
-        self:_dispatcher(st)
+        st:preparedispatch()
+        scopeclock = os.clock(); st:prepareoutssa(); st.v4.timings.scope = (st.v4.timings.scope or 0) + (os.clock() - scopeclock)
+        local dispatchclock = os.clock(); self:_dispatcher(st); st.v4.timings.lossless = (st.v4.timings.lossless or 0) + (os.clock() - dispatchclock)
+        local fallbackok, fallbackwhy = st:verifyoutssa()
+        if not fallbackok then st.bad[#st.bad + 1] = "SSA_DESTRUCT fallback edge not represented: " .. tostring(fallbackwhy) end
         if hashard(st) then
             error("LumenV4: UNSUPPORTED semantic lowering issue: " .. table.concat(st.bad, " | "), 2)
         end
     end
 
     self:_check()
-    local root = astpass.run(st.ast:done(), self.opt)
+    local verifyclock = os.clock(); st:verifyexpr(); st.v4.timings.expressionVerify = os.clock() - verifyclock
+    local scopeverifyclock = os.clock(); st:verifyscope(); st.v4.timings.scopeVerify = os.clock() - scopeverifyclock
+    local astclock = os.clock(); local root = astpass.run(st.ast:done(), self.opt); st.v4.timings.ast = os.clock() - astclock
     self:_check()
     return root, st, args
 end
@@ -981,8 +1060,9 @@ function decomp:_numfor(st, pc, op, stop, active)
     if step ~= "1" then head ..= ", " .. step end
     st:out(head .. " do"); st.indent += 1
     st.alias[varreg] = var; st.declared[var] = st.indent
+    if lv then st:declaresymbol(st.ir:nameid(lv), var, st.indent) end
     local prev, olddepth = active.loop, active.loopdepth
-    active.loop = { breakpc = info.exit, contpc = loop }; active.loopdepth = depth
+    active.loop = { breakpc = info.exit, contpc = loop, headerpc = pc, kind = "numeric" }; active.loopdepth = depth
     self:_region(st, bodystart, loop, active)
     active.loop, active.loopdepth = prev, olddepth
     st:trim(st.indent); st.indent -= 1; st:out("end"); st.alias[varreg] = old
@@ -996,11 +1076,12 @@ function decomp:_genfor(st, pc, op, stop, active)
     local loop, lop = info.loop, info.op
     local aux = lop.AuxValue and lop.AuxValue.Value or 0
     local n = math.max(1, bit32.band(aux, 0xff))
-    local depth, vars, old = (active.loopdepth or 0) + 1, {}, {}
+    local depth, vars, old, varids = (active.loopdepth or 0) + 1, {}, {}, {}
     for i = 1, n do
         local r = op.A + 2 + i; old[r] = st.alias[r]
         local hint = i == 1 and (n == 1 and "item" or "key") or (i == 2 and "value" or ("value" .. tostring(i)))
         local v = st:verdef(loop, r)
+        varids[i] = v
         vars[i] = not loopused(st, r, st:next(pc), loop) and "_" or st:vname(v, r, hint, loop)
     end
     local src
@@ -1011,9 +1092,12 @@ function decomp:_genfor(st, pc, op, stop, active)
     elseif ins.name(op) == "FORGPREP_NEXT" then src = "pairs(" .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ")"
     else src = ex.str(st:loopx(pc, loop, op.A)) .. ", " .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ", " .. ex.str(st:loopx(pc, loop, op.A + 2)) end
     st:out("for " .. table.concat(vars, ", ") .. " in " .. src .. " do"); st.indent += 1
-    for i = 1, n do local r = op.A + 2 + i; st.alias[r] = vars[i]; st.declared[vars[i]] = st.indent end
+    for i = 1, n do
+        local r = op.A + 2 + i; st.alias[r] = vars[i]; st.declared[vars[i]] = st.indent
+        if varids[i] and vars[i] ~= "_" then st:declaresymbol(st.ir:nameid(varids[i]), vars[i], st.indent) end
+    end
     local prev, olddepth = active.loop, active.loopdepth
-    active.loop = { breakpc = info.exit, contpc = loop }; active.loopdepth = depth
+    active.loop = { breakpc = info.exit, contpc = loop, headerpc = pc, kind = "generic" }; active.loopdepth = depth
     self:_region(st, st:next(pc), loop, active)
     active.loop, active.loopdepth = prev, olddepth
     st:trim(st.indent); st.indent -= 1; st:out("end")
@@ -1023,16 +1107,39 @@ function decomp:_genfor(st, pc, op, stop, active)
 end
 
 function decomp:_emitif(st, info, active, word)
+    local condpcs = info.condpcs or { info.head }
+    local single = #condpcs == 1 and condpcs[1] ~= nil
+    local falsepc = single and condpcs[1] or nil
+    local falseentry = info.c or info.join
+    local falsepred = falsepc and st.cfg.blockmap[falsepc] or nil
+    local falsesucc = falseentry and st.cfg.blockmap[falseentry] or nil
+    local falsecopy = falsepred and falsesucc and st:hasedge(falsepred, falsesucc) or false
+
     st:out((word or "if") .. " " .. ex.str(info.cond) .. " then"); st.indent += 1
+    if single then st:edgepc(info.last or info.head, info.a) end
     local old = active.join; active.join = info.join
     self:_region(st, info.a, info.b, active); active.join = old
     st:trim(st.indent); st.indent -= 1
+
     if info.c then
         local sub = branch.elseifInfo(st, info.c, info.join)
-        if sub then self:_emitif(st, sub, active, "elseif"); return end
-        st:out("else"); st.indent += 1; old = active.join; active.join = info.join
-        self:_region(st, info.c, info.d, active); active.join = old
+        if sub and not falsecopy then
+            self:_emitif(st, sub, active, "elseif")
+            return
+        end
+        st:out("else"); st.indent += 1
+        if single then st:edgepc(falsepc, info.c) end
+        if sub then
+            self:_emitif(st, sub, active, "if")
+        else
+            old = active.join; active.join = info.join
+            self:_region(st, info.c, info.d, active); active.join = old
+        end
         st:trim(st.indent); st.indent -= 1
+    elseif falsecopy then
+        st:out("else"); st.indent += 1
+        st:edgepc(falsepc, info.join)
+        st.indent -= 1
     end
     st:out("end")
 end
@@ -1054,7 +1161,7 @@ function decomp:_region(st, start, stop, active)
 
                 st:hoist(pc)
                 active["repeat:" .. tostring(pc)] = true; st:out("repeat"); st.indent += 1
-                local prev = active.loop; active.loop = { breakpc = rep.exit, contpc = rep.cont }
+                local prev = active.loop; active.loop = { breakpc = rep.exit, contpc = rep.cont, headerpc = pc, kind = "repeat" }
                 self:_region(st, rep.body, rep.latch, active); active.loop = prev
                 local x = cond.fall(st, rep.latch, st.proto.Instructions[rep.latch]); st.v4.visited[rep.latch] = true
                 st:trim(st.indent); st.indent -= 1; st:out("until " .. ex.str(x)); active["repeat:" .. tostring(pc)] = nil; pc = rep.exit
@@ -1064,7 +1171,7 @@ function decomp:_region(st, start, stop, active)
 
                     st:hoist(pc)
                     st:out("while true do"); st.indent += 1; local prev = active.loop
-                    active.loop = { breakpc = forever.exit, contpc = forever.cont, cont2 = forever.latch }
+                    active.loop = { breakpc = forever.exit, contpc = forever.cont, cont2 = forever.latch, headerpc = pc, kind = "forever" }
                     self:_region(st, forever.body, forever.latch, active); active.loop = prev; st.v4.visited[forever.latch] = true
                     st:trim(st.indent); st.indent -= 1; st:out("end"); pc = forever.exit
                 else
@@ -1077,8 +1184,21 @@ function decomp:_region(st, start, stop, active)
                         else st:badpc(pc, "unrecognized CMPPROTO inline guard -> " .. tostring(target)); pc = st:next(pc) end
                     elseif ins.isConditional(op) and name ~= "FORNLOOP" and name ~= "FORGLOOP" then
                         local loop, target = active.loop, ins.jumpTarget(pc, op)
-                        if loop and target == loop.breakpc then st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then break end"); pc = st:next(pc)
-                        elseif loop and (target == loop.contpc or target == loop.cont2) then st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then continue end"); pc = st:next(pc)
+                        local edgekind = loops.edgeKind(st, pc, target, active)
+                        if loop and (target == loop.breakpc or edgekind == "break") then
+                            local from, to = st.cfg.blockmap[pc], st.cfg.blockmap[target]
+                            if from and to and st:hasedge(from, to) then
+                                st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then"); st.indent += 1
+                                st:edge(from, to); st:out("break"); st.indent -= 1; st:out("end")
+                            else st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then break end") end
+                            pc = st:next(pc)
+                        elseif loop and (target == loop.contpc or target == loop.cont2 or edgekind == "continue") then
+                            local from, to = st.cfg.blockmap[pc], st.cfg.blockmap[target]
+                            if from and to and st:hasedge(from, to) then
+                                st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then"); st.indent += 1
+                                st:edge(from, to); st:out("continue"); st.indent -= 1; st:out("end")
+                            else st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then continue end") end
+                            pc = st:next(pc)
                         else
                             local bp = cond.bool(st, pc, op)
                             if bp then pc = bp
@@ -1086,7 +1206,7 @@ function decomp:_region(st, start, stop, active)
                                 local wh = loops.whileInfo(st, pc)
                                 if wh and wh.exit <= stop then
                                     st:hoist(pc); st:out("while " .. ex.str(wh.cond) .. " do"); st.indent += 1
-                                    local prev = active.loop; active.loop = { breakpc = wh.exit, contpc = wh.cont }
+                                    local prev = active.loop; active.loop = { breakpc = wh.exit, contpc = wh.cont, headerpc = pc, kind = "while" }
                                     self:_region(st, wh.body, wh.bodyend, active); active.loop = prev
                                     st:trim(st.indent); st.indent -= 1; st:out("end"); pc = wh.exit
                                 else
@@ -1098,9 +1218,10 @@ function decomp:_region(st, start, stop, active)
                         end
                     elseif name == "JUMP" or name == "JUMPBACK" or name == "JUMPX" then
                         local target, loop = ins.jumpTarget(pc, op), active.loop
-                        if loop and target == loop.breakpc then st:out("break"); pc = st:next(pc)
-                        elseif loop and (target == loop.contpc or target == loop.cont2) then st:out("continue"); pc = st:next(pc)
-                        elseif target == stop or target == active.join then pc = stop
+                        local edgekind = loops.edgeKind(st, pc, target, active)
+                        if loop and (target == loop.breakpc or edgekind == "break") then st:edgepc(pc, target); st:out("break"); pc = st:next(pc)
+                        elseif loop and (target == loop.contpc or target == loop.cont2 or edgekind == "continue") then st:edgepc(pc, target); st:out("continue"); pc = st:next(pc)
+                        elseif target == stop or target == active.join then st:edgepc(pc, target); pc = stop
                         else st:badpc(pc, "unstructured jump -> " .. tostring(target)); pc = st:next(pc) end
                     else pc = self:_op(st, pc) end
                 end
@@ -1113,19 +1234,37 @@ end
 local function dispatcherunsupported(st)
     for _, n in ipairs(st.ir.ops) do
         local name = n.name
-        if name == "FORNPREP" or name == "FORNLOOP" or name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" or name == "FORGLOOP" then
-            return "dispatcher requires VM loop-state emulation for " .. name .. " at pc " .. tostring(n.pc)
+        if name == "CMPPROTO" then
+            return "CMPPROTO cannot be represented losslessly in source fallback at pc " .. tostring(n.pc)
         end
-        if name == "CMPPROTO" then return "CMPPROTO cannot be represented losslessly in source fallback at pc " .. tostring(n.pc) end
-        if name == "CLOSEUPVALS" then return "dispatcher would change upvalue close/cell lifetime at pc " .. tostring(n.pc) end
-        if name == "CAPTURE" and n.op.A == 1 then return "dispatcher would hoist a by-reference captured local cell at pc " .. tostring(n.pc) end
     end
 end
 
 function decomp:_dispatcher(st)
+    st.v4.dispatcher = true
     local why = dispatcherunsupported(st)
     if why then error("LumenV4: UNSUPPORTED lossless fallback: " .. why, 2) end
 
+    local fornum = st.naming:unique("__fornum")
+    local iterprep = st.naming:unique("__iterprep")
+    st:out("local function " .. fornum .. "(v)")
+    st.indent += 1
+    st:out("if type(v) == \"number\" then return v end")
+    st:out("local n = tonumber(v)")
+    st:out("if n == nil then error(\"invalid 'for' limit/step/index (number expected)\", 2) end")
+    st:out("return n")
+    st.indent -= 1; st:out("end")
+    st:out("local function " .. iterprep .. "(v)")
+    st.indent += 1
+    st:out("local mt")
+    st:out("if type(getrawmetatable) == \"function\" then local ok, raw = pcall(getrawmetatable, v); if ok then mt = raw end end")
+    st:out("if mt == nil then mt = getmetatable(v) end")
+    st:out("local it = type(mt) == \"table\" and mt.__iter or nil")
+    st:out("if it ~= nil then return it(v) end")
+    st:out("if type(mt) == \"table\" and mt.__call ~= nil then return v, nil, nil end")
+    st:out("if type(v) == \"table\" then return next, v, nil end")
+    st:out("return v, nil, nil")
+    st.indent -= 1; st:out("end")
 
     local nameset, ordered = {}, {}
     for id, v in ipairs(st.ir.vals) do
@@ -1154,25 +1293,77 @@ function decomp:_dispatcher(st)
             if not st.consumed[pc] then
                 local op, name = st.proto.Instructions[pc], ins.name(st.proto.Instructions[pc])
                 local last = pi == #b.pcs
-                if last and ins.isConditional(op) then
+                if last and name == "FORNPREP" then
+                    local a = op.A
+                    local oldlimit, oldstep, oldidx = st:use(pc, a), st:use(pc, a + 1), st:use(pc, a + 2)
+                    local limit = st:set(pc, a, ex.atom(fornum .. "(" .. oldlimit .. ")", false)) or st:defName(pc, a)
+                    local step = st:set(pc, a + 1, ex.atom(fornum .. "(" .. oldstep .. ")", false)) or st:defName(pc, a + 1)
+                    local idx = st:set(pc, a + 2, ex.atom(fornum .. "(" .. oldidx .. ")", false)) or st:defName(pc, a + 2)
+                    local target, fall = st.cfg.blockmap[ins.jumpTarget(pc, op)], st.cfg.blockmap[st:next(pc)]
+                    if not target or not fall then error("LumenV4: invalid FORNPREP edge at pc " .. tostring(pc), 2) end
+                    st:out("if (" .. step .. " > 0 and " .. idx .. " <= " .. limit .. ") or (not (" .. step .. " > 0) and " .. limit .. " <= " .. idx .. ") then")
+                    st.indent += 1; st:edge(b.id, fall); st:out(state .. " = " .. tostring(fall)); st.indent -= 1
+                    st:out("else"); st.indent += 1; st:edge(b.id, target); st:out(state .. " = " .. tostring(target)); st.indent -= 1; st:out("end")
+                elseif last and name == "FORNLOOP" then
+                    local a = op.A
+                    local limit, step, oldidx = st:use(pc, a), st:use(pc, a + 1), st:use(pc, a + 2)
+                    local idx = st:set(pc, a + 2, ex.atom(oldidx .. " + " .. step, false)) or st:defName(pc, a + 2)
+                    local target, fall = st.cfg.blockmap[ins.jumpTarget(pc, op)], st.cfg.blockmap[st:next(pc)]
+                    if not target or not fall then error("LumenV4: invalid FORNLOOP edge at pc " .. tostring(pc), 2) end
+                    st:out("if (" .. step .. " > 0 and " .. idx .. " <= " .. limit .. ") or (not (" .. step .. " > 0) and " .. limit .. " <= " .. idx .. ") then")
+                    st.indent += 1; st:edge(b.id, target); st:out(state .. " = " .. tostring(target)); st.indent -= 1
+                    st:out("else"); st.indent += 1; st:edge(b.id, fall); st:out(state .. " = " .. tostring(fall)); st.indent -= 1; st:out("end")
+                elseif last and (name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT") then
+                    local a = op.A
+                    local g0, s0, i0 = st:use(pc, a), st:use(pc, a + 1), st:use(pc, a + 2)
+                    local gtmp = st.naming:unique("iterator")
+                    local stmp = st.naming:unique("state")
+                    local itmp = st.naming:unique("index")
+                    if name == "FORGPREP" then
+                        st:out("local " .. gtmp .. ", " .. stmp .. ", " .. itmp .. " = " .. g0 .. ", " .. s0 .. ", " .. i0)
+                        st:out("if type(" .. gtmp .. ") ~= \"function\" then " .. gtmp .. ", " .. stmp .. ", " .. itmp .. " = " .. iterprep .. "(" .. gtmp .. ") end")
+                    else
+                        st:out("local " .. gtmp .. ", " .. stmp .. ", " .. itmp .. " = " .. g0 .. ", " .. s0 .. ", " .. i0)
+                    end
+                    st:set(pc, a, ex.atom(gtmp, false))
+                    st:set(pc, a + 1, ex.atom(stmp, false))
+                    st:set(pc, a + 2, ex.atom(itmp, false))
+                    local target = st.cfg.blockmap[ins.jumpTarget(pc, op)]
+                    if not target then error("LumenV4: invalid FORGPREP edge at pc " .. tostring(pc), 2) end
+                    st:edge(b.id, target); st:out(state .. " = " .. tostring(target))
+                elseif last and name == "FORGLOOP" then
+                    local a = op.A
+                    local count = math.max(1, bit32.band((op.AuxValue and op.AuxValue.Value or 0), 0xff))
+                    local ret = st.naming:unique("iterResult")
+                    st:out("local " .. ret .. " = table.pack((" .. st:use(pc, a) .. ")(" .. st:use(pc, a + 1) .. ", " .. st:use(pc, a + 2) .. "))")
+                    local indexname = st:set(pc, a + 2, ex.atom(ret .. "[1]", false)) or st:defName(pc, a + 2)
+                    for i = 1, count do st:set(pc, a + 2 + i, ex.atom(ret .. "[" .. tostring(i) .. "]", false)) end
+                    local target, fall = st.cfg.blockmap[ins.jumpTarget(pc, op)], st.cfg.blockmap[st:next(pc)]
+                    if not target or not fall then error("LumenV4: invalid FORGLOOP edge at pc " .. tostring(pc), 2) end
+                    st:out("if " .. indexname .. " ~= nil then")
+                    st.indent += 1; st:edge(b.id, target); st:out(state .. " = " .. tostring(target)); st.indent -= 1
+                    st:out("else"); st.indent += 1; st:edge(b.id, fall); st:out(state .. " = " .. tostring(fall)); st.indent -= 1; st:out("end")
+                elseif last and ins.isConditional(op) then
                     local target, fall = st.cfg.blockmap[ins.jumpTarget(pc, op)], st.cfg.blockmap[st:next(pc)]
                     if not target or not fall then error("LumenV4: invalid dispatcher conditional edge at pc " .. tostring(pc), 2) end
                     st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then")
-                    st.indent += 1; st:out(state .. " = " .. tostring(target)); st.indent -= 1
-                    st:out("else"); st.indent += 1; st:out(state .. " = " .. tostring(fall)); st.indent -= 1; st:out("end")
+                    st.indent += 1; st:edge(b.id, target); st:out(state .. " = " .. tostring(target)); st.indent -= 1
+                    st:out("else"); st.indent += 1; st:edge(b.id, fall); st:out(state .. " = " .. tostring(fall)); st.indent -= 1; st:out("end")
                 elseif last and (name == "JUMP" or name == "JUMPBACK" or name == "JUMPX") then
                     local target = st.cfg.blockmap[ins.jumpTarget(pc, op)]
                     if not target then error("LumenV4: invalid dispatcher jump edge at pc " .. tostring(pc), 2) end
+                    st:edge(b.id, target)
                     st:out(state .. " = " .. tostring(target))
                 elseif last and name == "LOADB" and (op.C or 0) ~= 0 then
                     self:_op(st, pc)
                     local target = st.cfg.blockmap[pc + op.C + 1]
                     if not target then error("LumenV4: invalid LOADB edge at pc " .. tostring(pc), 2) end
+                    st:edge(b.id, target)
                     st:out(state .. " = " .. tostring(target))
                 else
                     self:_op(st, pc)
                     if last and name ~= "RETURN" then
-                        if #b.successors == 1 then st:out(state .. " = " .. tostring(b.successors[1]))
+                        if #b.successors == 1 then st:edge(b.id, b.successors[1]); st:out(state .. " = " .. tostring(b.successors[1]))
                         elseif #b.successors == 0 then st:out("break")
                         elseif #b.successors > 1 then error("LumenV4: unhandled multi-successor block at pc " .. tostring(pc), 2) end
                     end
@@ -1184,6 +1375,7 @@ function decomp:_dispatcher(st)
     st:out("else"); st.indent += 1; st:out("error(\"LumenV4: invalid dispatcher state \" .. tostring(" .. state .. "))"); st.indent -= 1
     st:out("end")
     st.indent -= 1; st:out("end")
+    st.v4.dispatcher = nil
 end
 
 local function metrics(st)
@@ -1197,9 +1389,35 @@ local function metrics(st)
     return reachable, covered, reachable == 0 and 1 or covered / reachable
 end
 
+local function capturebackstop(src)
+    for text in tostring(src or ""):gmatch("[^\r\n]+") do
+        local lhs, rhs = text:match("^%s*local%s+([%a_][%w_]*)%s*=%s*([%a_][%w_]*)%s*;?%s*$")
+        if lhs and lhs == rhs and (lhs:match("^upvalue%d+$") or lhs:match("^capture%d*Value%d*$") or lhs:match("^cell%d+$")) then
+            return false, lhs
+        end
+    end
+    return true
+end
+
 function decomp:decompileProto(proto, up)
     local root, st = self:_child(proto, up or {})
-    local src = printer.run(root, self.opt)
+    if not st.v4 or st.v4.captureVerified ~= true then
+        error("LumenV4: CAPTURE_VERIFY structured capture verification did not complete", 2)
+    end
+    if not st.v4.ssaDestructionVerified or not st.v4.outssaVerified or not st.ir.outssa or st.ir.outssa.verified ~= true then
+        error("LumenV4: SSA_DESTRUCT structured out-of-SSA verification did not complete", 2)
+    end
+    if not st.ir.objectVerified then error("LumenV4: OBJECT_VERIFY object identity verification did not complete", 2) end
+    if not st.ssa.valuePackVerified then error("LumenV4: VALUEPACK_VERIFY ValuePack verification did not complete", 2) end
+    if not st.v4.exprVerified then error("LumenV4: EXPR_VERIFY semantic expression verification did not complete", 2) end
+    if not st.v4.scopeVerified then error("LumenV4: SCOPE_VERIFY scope verification did not complete", 2) end
+    if not st.cfg.verified or not st.cfg.structure or not st.cfg.structure.verified then error("LumenV4: CFG_STRUCTURE verification did not complete", 2) end
+    local printclock = os.clock(); local src = printer.run(root, self.opt); st.v4.timings.printing = os.clock() - printclock
+    local verifyclock = os.clock()
+    local capok, capname = capturebackstop(src)
+    if not capok then
+        error("LumenV4: CAPTURE_VERIFY accidental self-initialization for " .. tostring(capname), 2)
+    end
     local reachable, covered, coverage = metrics(st)
     if covered ~= reachable then
         error(("LumenV4: PARTIAL origin coverage %d/%d (%.2f%%)"):format(covered, reachable, coverage * 100), 2)
@@ -1223,19 +1441,22 @@ function decomp:decompileProto(proto, up)
         error("LumenV4: UNSUPPORTED syntax verification requires loadstring()", 2)
     end
 
-    local header = ("-- LumenV4 status=%s coverage=%.2f reachable=%d covered=%d blocks=%d structuredBlocks=%d fallbackBlocks=%d phis=%d undefs=%d packs=%d cells=%d objects=%d escapedObjects=%d irreducible=%d bytecodeVersion=%d ssa=true parser=true diagnostics=%d\n")
+    local header = ("-- LumenV4 status=%s coverage=%.2f reachable=%d covered=%d blocks=%d structuredBlocks=%d fallbackBlocks=%d phis=%d undefs=%d packs=%d cells=%d objects=%d escapedObjects=%d irreducible=%d bytecodeVersion=%d ssa=true outssa=true copies=%d parser=true capture=true objects=true valuepacks=true scope=true expr=true cfgstructure=true diagnostics=%d\n")
         :format(st.v4.status, coverage * 100, reachable, covered, #st.cfg.blocks, structuredblocks, fallbackblocks,
-            ss.phis or 0, ss.undefs or 0, packcount, cellcount, objectcount, escapedobjects, irreducible, bytecodeversion, #st.bad)
+            ss.phis or 0, ss.undefs or 0, packcount, cellcount, objectcount, escapedobjects, irreducible, bytecodeversion, st.ir.outssa.copyCount or 0, #st.bad)
     src = header .. src
     local check, err = loadstring(src, "@LumenV4/verify")
     if not check then error("LumenV4: INVALID emitted Luau: " .. tostring(err), 2) end
+    st.v4.timings.verification = os.clock() - verifyclock
 
     return src, {
         status = st.v4.status, cfg = st.cfg, ir = st.ir, ssa = st.ssa, ssaSummary = ss, issues = st.bad,
         coverage = coverage, coveredInstructions = covered, reachableInstructions = reachable, fallback = st.v4.fallback,
-        syntaxValid = true, originCoverageValid = true, verification = "syntax+CFG-origin-invariants",
+        syntaxValid = true, originCoverageValid = true, verification = "syntax+CFG-origin+SSA+out-of-SSA+capture+object+scope+expression-invariants", captureVerified = true, outssaVerified = true,
+        objectVerified = true, valuePackVerified = true, scopeVerified = true, expressionVerified = true, cfgStructureVerified = true,
+        outssaCopyCount = st.ir.outssa.copyCount or 0, outssaCoalesced = st.ir.outssa.coalesced or 0,
         objectCount = objectcount, escapedObjects = escapedobjects, cellCount = cellcount, valuePackCount = packcount,
-        irreducible = st.cfg.irreducible == true, bytecodeVersion = bytecodeversion,
+        irreducible = st.cfg.irreducible == true, bytecodeVersion = bytecodeversion, timings = st.v4.timings,
     }
 end
 
@@ -1251,13 +1472,15 @@ function decomp:decompileParsed(parsed)
         totalinstructions += n
         if n > maxprotoinstructions then maxprotoinstructions = n end
     end
-    local maxtotal = tonumber(self.opt.structuredmaxinstructions) or 8000
-    local maxproto = tonumber(self.opt.structuredmaxprotoinstructions) or 4000
+    local maxtotal = tonumber(self.opt.structuredmaxinstructions) or 32000
+    local maxproto = tonumber(self.opt.structuredmaxprotoinstructions) or 16000
     local structurederror
     if (maxtotal > 0 and totalinstructions > maxtotal) or (maxproto > 0 and maxprotoinstructions > maxproto) then
         structurederror = "LumenV4: STRUCTURED_COMPLEXITY total=" .. tostring(totalinstructions) .. " maxproto=" .. tostring(maxprotoinstructions)
     else
-        local budget = tonumber(self.opt.structuredbudget) or 1.25
+        local basebudget = tonumber(self.opt.structuredbudget) or 1.25
+        local adaptive = math.min(5, totalinstructions / 2500)
+        local budget = basebudget > 0 and (basebudget + adaptive) or 0
         self.slice = os.clock()
         self.deadline = budget > 0 and (self.slice + budget) or nil
         local ok, src, info = pcall(function() return self:decompileProto(proto, {}) end)
@@ -1271,14 +1494,31 @@ function decomp:decompileParsed(parsed)
 
     self.deadline = nil
     self.slice = os.clock()
+
+    local losslessReason = structurederror
+    self.losslessOnly = true
+    local basebudget = tonumber(self.opt.structuredbudget) or 1.25
+    local losslessBudget = math.max(2.0, basebudget + math.min(8, totalinstructions / 1500))
+    self.deadline = os.clock() + losslessBudget
+    local lok, lsrc, linfo = pcall(function() return self:decompileProto(proto, {}) end)
+    self.deadline = nil
+    self.losslessOnly = nil
+    if lok then
+        self.parsed = nil
+        linfo.structuredError = losslessReason
+        return lsrc, linfo
+    end
+
+    local losslesserror = tostring(lsrc)
+    self.slice = os.clock()
     local fok, fsrc, finfo = pcall(function()
-        return vmfallback.run(parsed, structurederror)
+        return vmfallback.run(parsed, losslessReason .. " | lossless retry: " .. losslesserror)
     end)
     self.parsed = nil
 
     if not fok then
         error("LumenV4: VM fallback generator failure after structured failure: " .. tostring(fsrc)
-            .. " | structured: " .. structurederror, 2)
+            .. " | structured: " .. structurederror .. " | lossless: " .. losslesserror, 2)
     end
     return fsrc, finfo
 end

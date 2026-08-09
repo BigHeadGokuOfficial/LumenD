@@ -233,7 +233,93 @@ local function verify(proto, aux, blocks, blockmap, nexts)
     return true
 end
 
+
+local function structural(blocks, ipdom, naturalloops, check)
+    local structure = { byHeader = {}, regions = {}, edgeKinds = {}, loopByBlock = {}, iterations = 0, verified = false }
+
+    local loopsizes = {}
+    for i, loop in ipairs(naturalloops or {}) do
+        local size = 0
+        for _ in pairs(loop.nodes or {}) do size += 1 end
+        loopsizes[i] = size
+    end
+    for bid = 1, #blocks do
+        local best, bestsize
+        for i, loop in ipairs(naturalloops or {}) do
+            if loop.nodes and loop.nodes[bid] then
+                local size = loopsizes[i]
+                if not bestsize or size < bestsize then best, bestsize = i, size end
+            end
+        end
+        structure.loopByBlock[bid] = best
+    end
+
+    for pred, block in ipairs(blocks) do
+        local li = structure.loopByBlock[pred]
+        local loop = li and naturalloops[li]
+        if loop then
+            local map = {}
+            structure.edgeKinds[pred] = map
+            for _, succ in ipairs(block.successors) do
+                if succ == loop.header then
+                    map[succ] = "continue"
+                elseif not loop.nodes[succ] then
+                    map[succ] = "break"
+                end
+            end
+            if not next(map) then structure.edgeKinds[pred] = nil end
+        end
+    end
+
+    local claimed = {}
+    local changed = true
+    local limit = math.max(8, #blocks * 2)
+    while changed do
+        structure.iterations += 1
+        if structure.iterations > limit then error("LumenV4: CFG_STRUCTURE region discovery failed to converge", 2) end
+        changed = false
+        for _, block in ipairs(blocks) do
+            if check then check() end
+            if #block.successors == 2 and not structure.byHeader[block.id] then
+                local join = ipdom[block.id]
+                if join and blocks[join] then
+                    local a, b = block.successors[1], block.successors[2]
+                    local region
+                    if a == join and b ~= join then
+                        region = { kind = "triangle", header = block.id, thenBlock = b, elseBlock = nil, join = join }
+                    elseif b == join and a ~= join then
+                        region = { kind = "triangle", header = block.id, thenBlock = a, elseBlock = nil, join = join }
+                    elseif a ~= join and b ~= join then
+                        region = { kind = "diamond", header = block.id, thenBlock = a, elseBlock = b, join = join }
+                    end
+                    if region then
+                        region.headerPC = block.endPC
+                        region.joinPC = blocks[join].startPC
+                        region.thenPC = region.thenBlock and blocks[region.thenBlock].startPC or nil
+                        region.elsePC = region.elseBlock and blocks[region.elseBlock].startPC or nil
+                        structure.byHeader[block.id] = region
+                        structure.regions[#structure.regions + 1] = region
+                        claimed[block.id] = true
+                        changed = true
+                    end
+                end
+            end
+        end
+    end
+
+    for _, region in ipairs(structure.regions) do
+        assert(blocks[region.header] and blocks[region.join], "LumenV4: CFG_STRUCTURE invalid region endpoint")
+        assert(region.header ~= region.join, "LumenV4: CFG_STRUCTURE self-joining region")
+        if region.thenBlock then assert(blocks[region.thenBlock], "LumenV4: CFG_STRUCTURE invalid then block") end
+        if region.elseBlock then assert(blocks[region.elseBlock], "LumenV4: CFG_STRUCTURE invalid else block") end
+    end
+    structure.verified = true
+    return structure
+end
+
 function graph.build(proto, check, limits)
+    local timings = {}
+    local graphstart = os.clock()
     local ops = proto.Instructions
     limits = limits or {}
     local maxinstructions = tonumber(limits.maxinstructions) or 0
@@ -330,12 +416,13 @@ function graph.build(proto, check, limits)
     if maxblocks > 0 and #blocks > maxblocks then
         error("LumenV4: STRUCTURED_COMPLEXITY cfg blocks " .. tostring(#blocks) .. " > " .. tostring(maxblocks), 2)
     end
+    timings.cfg = os.clock() - graphstart
     if check then check() end
-    local dominators = dom.compute(blocks, check)
-    local idom = immediatefromsets(blocks, dominators, check)
-    local postdom, ipdom, exitid = post.run(blocks, check)
-    local naturalloops = loops.find(blocks, dominators, check)
-    local sccs = tarjan(blocks, check)
+    local t = os.clock(); local dominators = dom.compute(blocks, check); timings.dominators = os.clock() - t
+    t = os.clock(); local idom = immediatefromsets(blocks, dominators, check); timings.idom = os.clock() - t
+    t = os.clock(); local postdom, ipdom, exitid = post.run(blocks, check); timings.postdominators = os.clock() - t
+    t = os.clock(); local naturalloops = loops.find(blocks, dominators, check); timings.loops = os.clock() - t
+    t = os.clock(); local sccs = tarjan(blocks, check); timings.scc = os.clock() - t
     local out = {
         proto = proto,
         aux = aux,
@@ -353,9 +440,11 @@ function graph.build(proto, check, limits)
         sccs = sccs,
         irreducible = false,
         registerStats = regs.stats(proto, aux),
+        timings = timings,
     }
+    local stime = os.clock(); out.structure = structural(blocks, ipdom, naturalloops, check); timings.structural = os.clock() - stime
     for _, component in ipairs(sccs) do if component.irreducible then out.irreducible = true break end end
-    out.verified = verify(proto, aux, blocks, blockmap, nexts)
+    out.verified = verify(proto, aux, blocks, blockmap, nexts) and out.structure.verified
     return out
 end
 
@@ -772,7 +861,7 @@ function ssa.build(proto, cfg, check, limits)
         inVersions = {}, outVersions = {}, useCount = {}, defUse = {}, undefByReg = {}, packsByPC = {},
         liveIn = livein, liveOut = liveout, liveAfter = liveafter,
         packInBlock = packinblock, packOutBlock = packoutblock, packBefore = packbefore,
-        packInput = packinput, ambiguousPack = ambiguouspack,
+        packInput = packinput, ambiguousPack = ambiguouspack, timings = timings,
     }
     local nextver = 1
     local function newver(kind, reg, pc, block)
@@ -949,7 +1038,8 @@ function ssa.build(proto, cfg, check, limits)
         end
         return true
     end
-    result.verified = verifyssa()
+    timings.ssa = os.clock() - ssastart
+    local vt = os.clock(); result.verified = verifyssa(); result.valuePackVerified = result.verified == true; timings.verify = os.clock() - vt
 
     function result:versionForUse(pc, reg) local u = self.usesByPC[pc]; return u and u[reg] or nil end
     function result:versionForDef(pc, reg) local d = self.defsByPC[pc]; return d and d[reg] or nil end
@@ -1007,9 +1097,13 @@ end
 function api:decompileBytecode(raw, opt)
     opt = cfg(opt)
 
+    local dt = os.clock()
     local parsed = parsebc(raw, opt)
+    local decode = os.clock() - dt
     local d = decomp.new(opt)
     local source, details = d:decompileParsed(parsed)
+    details.timings = details.timings or {}
+    details.timings.decode = decode
 
     return source, {
         version = ver.version,
@@ -2077,7 +2171,8 @@ end
 
 return pass
 ]===],
-    ["main.ast.printer"] = [===[
+    ["main.ast.printer"] = [===[local expr = require("main.output.expr")
+
 local printast = {}
 
 local function esc(s)
@@ -2089,6 +2184,7 @@ local function hasname(node, name)
     local pat = "%f[%w_]" .. esc(name) .. "%f[^%w_]"
     local function hit(s) return type(s) == "string" and s:find(pat) ~= nil end
     if hit(node.text) or hit(node.cond) or hit(node.head) or hit(node.args) then return true end
+    if node.values then for _, value in ipairs(node.values) do if hit(expr.str(value)) then return true end end end
     if node.kind == "if" then
         for _, b in ipairs(node.branches or {}) do
             if hit(b.cond) then return true end
@@ -2148,6 +2244,18 @@ local function block(out, b, depth, opt)
             local k = node.kind
             if k == "raw" or k == "return" or k == "break" or k == "continue" then
                 line(out, opt, depth, node.text, true)
+            elseif k == "assign" then
+                local names = {}
+                for i, name in ipairs(node.names or {}) do
+                    local an = node.annotations and node.annotations[i]
+                    names[i] = name .. (node.declare and an and (": " .. an) or "")
+                end
+                local vals = {}; for i, value in ipairs(node.values or {}) do vals[i] = expr.str(value) end
+                line(out, opt, depth, (node.declare and "local " or "") .. table.concat(names, ", ") .. " = " .. table.concat(vals, ", "), true)
+            elseif k == "decl" then
+                local names = {}
+                for i, name in ipairs(node.names or {}) do local an = node.annotations and node.annotations[i]; names[i] = name .. (an and (": " .. an) or "") end
+                line(out, opt, depth, "local " .. table.concat(names, ", "), true)
             elseif k == "if" then
                 for i, branch in ipairs(node.branches) do
                     line(out, opt, depth, (i == 1 and "if " or "elseif ") .. cond(opt, branch.cond) .. " then")
@@ -2444,9 +2552,9 @@ local base = {
     iridium = nil,
     fidelity = true,
     structuredbudget = 1.25,
-    structuredmaxinstructions = 8000,
-    structuredmaxprotoinstructions = 4000,
-    structuredmaxblocks = 256,
+    structuredmaxinstructions = 32000,
+    structuredmaxprotoinstructions = 16000,
+    structuredmaxblocks = 1024,
 }
 
 local map = {
@@ -2469,9 +2577,9 @@ return function(opt)
     if opt then for k, v in pairs(opt) do out[map[k] or k] = v end end
     out.doblocks = math.max(0, math.floor(tonumber(out.doblocks) or 0))
     out.structuredbudget = math.max(0, tonumber(out.structuredbudget) or 1.25)
-    out.structuredmaxinstructions = math.max(0, math.floor(tonumber(out.structuredmaxinstructions) or 8000))
-    out.structuredmaxprotoinstructions = math.max(0, math.floor(tonumber(out.structuredmaxprotoinstructions) or 4000))
-    out.structuredmaxblocks = math.max(0, math.floor(tonumber(out.structuredmaxblocks) or 256))
+    out.structuredmaxinstructions = math.max(0, math.floor(tonumber(out.structuredmaxinstructions) or 32000))
+    out.structuredmaxprotoinstructions = math.max(0, math.floor(tonumber(out.structuredmaxprotoinstructions) or 16000))
+    out.structuredmaxblocks = math.max(0, math.floor(tonumber(out.structuredmaxblocks) or 1024))
     if out.fidelity ~= false then
 
         out.fold = false
@@ -2518,19 +2626,100 @@ function ctx.new(proto, ir, naming, up, ast, opt)
         emit = {},
         group = {},
         tbl = {},
+        tblobj = {},
         top = nil,
         bad = {},
         vnames = {},
         nexttmp = 0,
+        symbolScopes = {},
+        symbolUses = {},
+        sequence = 0,
     }, ctx)
 
-    for _, name in ipairs(self.up) do naming:reserve(name) end
+    for i = 1, #self.up do
+        local name = self:upname(i)
+        if name then naming:reserve(name) end
+    end
     for r = 0, (proto.ParameterCount or 0) - 1 do
         local v = ir.ssa.params[r]
         local name = self:vname(v, r, nil, 1)
         self.declared[name] = 0
+        local symbol = self.ir:nameid(v)
+        if symbol then self.symbolScopes[symbol] = { depth = 0, seq = 0, name = name, parameter = true } end
     end
     return self
+end
+
+function ctx:updesc(index)
+    return self.up[index]
+end
+
+local function semanticupname(ref, seen)
+    if type(ref) == "string" then return ref end
+    if type(ref) ~= "table" then return nil end
+    if type(ref.name) == "string" and ref.name ~= "" then return ref.name end
+    seen = seen or {}
+    if seen[ref] then return nil end
+    seen[ref] = true
+
+    local name
+    if ref.kind == "self" then
+        name = ref.name
+    elseif ref.kind == "upvalue" then
+        name = semanticupname(ref.parent, seen)
+    elseif ref.kind == "ref" then
+        local owner = ref.owner
+        name = owner and owner.v4 and owner.v4.cellNames and owner.v4.cellNames[ref.cell] or nil
+    elseif ref.kind == "value" then
+        name = ref.name
+        if not name and ref.owner and ref.value then
+            name = ref.owner:vname(ref.value, ref.reg, ref.debugname, ref.pc)
+        end
+    end
+    if name and name ~= "" then ref.name = name end
+    return name
+end
+
+function ctx:upname(index)
+    local ref = self.up[index]
+    if ref == nil then return nil end
+    local name = semanticupname(ref)
+    if not name or name == "" then
+        error(("LumenV4: CAPTURE_VERIFY unresolved upvalue slot %d"):format(index), 2)
+    end
+    return name
+end
+
+local function semanticupcell(ref, seen)
+    if type(ref) ~= "table" then return nil end
+    if ref.cell then return ref.cell end
+    seen = seen or {}
+    if seen[ref] then return nil end
+    seen[ref] = true
+    if ref.kind == "upvalue" then return semanticupcell(ref.parent, seen) end
+    return nil
+end
+
+function ctx:upcell(index)
+    return semanticupcell(self.up[index])
+end
+
+function ctx:declaresymbol(symbol, name, depth)
+    if symbol == nil then return end
+    self.sequence += 1
+    local nextscope = { depth = depth or self.indent, seq = self.sequence, name = name }
+    local old = self.symbolScopes[symbol]
+    if not old or nextscope.depth < old.depth or (nextscope.depth == old.depth and nextscope.seq < old.seq) then
+        self.symbolScopes[symbol] = nextscope
+    end
+end
+
+function ctx:usesymbol(symbol, name)
+    if symbol == nil then return end
+    self.sequence += 1
+    local list = self.symbolUses[symbol]
+    if not list then list = {}; self.symbolUses[symbol] = list end
+    list[#list + 1] = { depth = self.indent, seq = self.sequence, name = name }
 end
 
 function ctx:out(s)
@@ -2649,7 +2838,11 @@ function ctx:reg(r, hint, pc)
 end
 
 function ctx:atom(r, hint, pc)
-    return ex.atom(self:useName(pc, r, hint), false)
+    local v = self:veruse(pc, r)
+    local symbol = v and self.ir:nameid(v) or ("r" .. tostring(r))
+    local name = self:useName(pc, r, hint)
+    if not self.alias[r] then self:usesymbol(symbol, name) end
+    return ex.localref(symbol, name)
 end
 
 function ctx:veruse(pc, r)
@@ -2670,11 +2863,11 @@ end
 
 function ctx:usex(pc, r, hint)
     local v = self:veruse(pc, r)
-    if v and self.tbl[v] then
+    if v and tab.get(self, v) then
         local node = self:usetbl(v, r, pc)
         if node then return node end
     end
-    if v and self.ir.const[v] then return ex.atom(self.ir.const[v], true) end
+    if v and self.ir.const[v] then return ex.literal(self.ir.const[v]) end
     if v and self.vals[v] then return self.vals[v] end
     return self:atom(r, hint, pc)
 end
@@ -2684,6 +2877,7 @@ function ctx:use(pc, r, hint)
 end
 
 function ctx:inline(pc, r, node)
+    if self.v4 and self.v4.dispatcher then return false end
     if self.naming:isDebugAt(r, pc) then return false end
     local v = self:verdef(pc, r)
     if not v or not self.ir.inline[v] then return false end
@@ -2719,12 +2913,14 @@ function ctx:set(pc, r, node, hint, raw)
     local depth = self.declared[name]
     local fresh = depth == nil or depth > self.indent
     local stmt
+    local symbol = v and self.ir:nameid(v) or ("r" .. tostring(r))
     if fresh then
         self.declared[name] = self.indent
+        self:declaresymbol(symbol, name, self.indent)
         local an = self:ann(r, pc)
-        stmt = self:out("local " .. name .. (an and (": " .. an) or "") .. " = " .. ex.str(node))
+        stmt = self.ast:add({ kind = "assign", names = { name }, symbols = { symbol }, values = { node }, declare = true, annotations = { an } })
     else
-        stmt = self:out(name .. " = " .. ex.str(node))
+        stmt = self.ast:add({ kind = "assign", names = { name }, symbols = { symbol }, values = { node }, declare = false })
     end
     if v then
         self.emit[v] = { node = stmt, name = name, fresh = fresh, depth = self.indent }
@@ -2739,7 +2935,10 @@ function ctx:decl(r, hint, pc)
     if depth == nil or depth > self.indent then
         self.declared[name] = self.indent
         local an = self:ann(r, pc)
-        self:out("local " .. name .. (an and (": " .. an) or ""))
+        local v = self:verdef(pc, r)
+        local symbol = v and self.ir:nameid(v) or ("r" .. tostring(r))
+        self:declaresymbol(symbol, name, self.indent)
+        self.ast:add({ kind = "decl", names = { name }, symbols = { symbol }, annotations = { an } })
     end
     return name
 end
@@ -2762,16 +2961,18 @@ function ctx:multi(pc, regs, rhs, hints, node)
         local typed = {}
         for i, name in ipairs(list) do
             self.declared[name] = self.indent
+            local v = self:verdef(pc, regs[i]); self:declaresymbol(v and self.ir:nameid(v) or ("r" .. tostring(regs[i])), name, self.indent)
             local an = self:ann(regs[i], pc)
             typed[i] = name .. (an and (": " .. an) or "")
         end
         nodes[#nodes + 1] = self:out("local " .. table.concat(typed, ", ") .. " = " .. rhs)
     else
         if fresh > 0 then
-            for _, name in ipairs(list) do
+            for i, name in ipairs(list) do
                 local depth = self.declared[name]
                 if depth == nil or depth > self.indent then
                     self.declared[name] = self.indent
+                    local v = self:verdef(pc, regs[i]); self:declaresymbol(v and self.ir:nameid(v) or ("r" .. tostring(regs[i])), name, self.indent)
                     nodes[#nodes + 1] = self:out("local " .. name)
                 end
             end
@@ -2880,10 +3081,249 @@ function ctx:hoist(pc)
         local depth = self.declared[name]
         if depth == nil or depth > self.indent then
             self.declared[name] = self.indent
+            self:declaresymbol(self.ir:nameid(item.p.id), name, self.indent)
             self:out("local " .. name)
         end
     end
 end
+function ctx:preparedispatch()
+    if self.dispatchStorage then return end
+    local storage = self.naming:unique("__slots")
+    local cells = self.naming:unique("__cells")
+    self.dispatchStorage = storage
+    self.dispatchCells = cells
+    self.declared[storage] = 0
+    self.declared[cells] = 0
+    self:out("local " .. storage .. " = {}")
+    self:out("local " .. cells .. " = {}")
+
+    local lexical = {}
+    for _, raw in pairs(self.ssa.params or {}) do
+        local id = self.ir:nameid(raw)
+        if id then lexical[id] = true end
+    end
+    for _, n in ipairs(self.ir.ops or {}) do
+        if n.name == "NEWCLOSURE" or n.name == "DUPCLOSURE" then
+            local id = self.ir:def(n.pc, n.op.A)
+            local fam = id and self.ir:nameid(id)
+            if fam then lexical[fam] = true end
+        end
+    end
+
+    self.dispatchLexical = lexical
+    self.dispatchNames = {}
+    self.dispatchPlainVname = self.basevname or self.vname
+    for cid in pairs(self.ir.cells or {}) do
+        self.v4.cellNames[cid] = cells .. "[" .. tostring(cid) .. "].v"
+    end
+
+    local oldvname = self.vname
+    self.vname = function(ctxself, value, reg, hint, pc)
+        local raw = value and ctxself.ir:resolve(value)
+        local cid
+        if pc and raw then
+            local def = ctxself.ssa.defsByPC[pc] and ctxself.ssa.defsByPC[pc][reg]
+            if def and ctxself.ir:resolve(def) == raw then cid = ctxself.ir.cellDef and ctxself.ir.cellDef[pc] and ctxself.ir.cellDef[pc][reg] end
+            if not cid then
+                local use = ctxself.ssa.usesByPC[pc] and ctxself.ssa.usesByPC[pc][reg]
+                if use and ctxself.ir:resolve(use) == raw then cid = ctxself.ir.cellUse and ctxself.ir.cellUse[pc] and ctxself.ir.cellUse[pc][reg] end
+            end
+        end
+        if cid then return cells .. "[" .. tostring(cid) .. "].v" end
+        local id = value and ctxself.ir:nameid(value)
+        if id and not lexical[id] then
+            local name = ctxself.dispatchNames[id]
+            if not name then
+                name = storage .. "[" .. tostring(id) .. "]"
+                ctxself.dispatchNames[id] = name
+                ctxself.declared[name] = 0
+                ctxself:declaresymbol(id, name, 0)
+            end
+            return name
+        end
+        local plain = ctxself.dispatchPlainVname
+        if plain then return plain(ctxself, value, reg, hint, pc) end
+        return oldvname(ctxself, value, reg, hint, pc)
+    end
+end
+
+function ctx:dispatchbase(value, reg, pc)
+    local id = value and self.ir:nameid(value)
+    if id and self.dispatchLexical and not self.dispatchLexical[id] then
+        local name = self.dispatchNames and self.dispatchNames[id]
+        if not name then
+            name = self.dispatchStorage .. "[" .. tostring(id) .. "]"
+            self.dispatchNames[id] = name
+            self.declared[name] = 0
+            self:declaresymbol(id, name, 0)
+        end
+        return name
+    end
+    local base = self.dispatchPlainVname or self.basevname
+    if base then return base(self, value, reg, nil, pc) end
+    return self:vname(value, reg, nil, pc)
+end
+
+function ctx:closecells(pc)
+    if not self.dispatchCells then return end
+    local map = self.ir.cellCloseValue and self.ir.cellCloseValue[pc]
+    if not map then return end
+    local regs = {}
+    for r in pairs(map) do regs[#regs + 1] = r end
+    table.sort(regs)
+    for _, r in ipairs(regs) do
+        local rec = map[r]
+        local value = rec and rec.value and self.ir:resolve(rec.value)
+        if value then
+            local base = self:dispatchbase(value, r, pc)
+            local cids = {}; for cid in pairs(rec.cells or {}) do cids[#cids + 1] = cid end
+            table.sort(cids)
+            for _, cid in ipairs(cids) do
+                local cell = self.dispatchCells .. "[" .. tostring(cid) .. "]"
+                self:out("if " .. cell .. " ~= nil then " .. base .. " = " .. cell .. ".v; " .. cell .. " = nil end")
+            end
+        end
+    end
+end
+
+function ctx:prepareoutssa()
+    local outssa = self.ir.outssa
+    if not outssa or not outssa.verified then
+        error("LumenV4: SSA_DESTRUCT out-of-SSA verification did not complete", 2)
+    end
+    self.outssaNames = self.outssaNames or {}
+    self.outssaEdges = self.outssaEdges or {}
+    local nameset, names = {}, {}
+    for pred, bysucc in pairs(outssa.edgeCopies or {}) do
+        for succ, copies in pairs(bysucc) do
+            for _, copy in ipairs(copies) do
+                local block = self.cfg.blocks[succ]
+                local name = self:vname(copy.dstValue, copy.reg, nil, block and block.startPC or 1)
+                self.outssaNames[copy.dst] = name
+                if not nameset[name] and self.declared[name] == nil then
+                    nameset[name] = true
+                    names[#names + 1] = name
+                    self.declared[name] = 0
+                    self:declaresymbol(copy.dst, name, 0)
+                end
+            end
+        end
+    end
+    table.sort(names)
+    for i = 1, #names, 12 do
+        local part = {}
+        for j = i, math.min(i + 11, #names) do part[#part + 1] = names[j] end
+        self:out("local " .. table.concat(part, ", "))
+    end
+    self.v4.outssaVerified = true
+    self.v4.outssaCopies = outssa.copyCount or 0
+end
+
+function ctx:hasedge(pred, succ)
+    local outssa = self.ir.outssa
+    local list = outssa and outssa.edgeCopies and outssa.edgeCopies[pred] and outssa.edgeCopies[pred][succ]
+    return list ~= nil and #list > 0
+end
+
+function ctx:edge(pred, succ)
+    if not pred or not succ or pred == succ then return end
+    local outssa = self.ir.outssa
+    local copies = outssa and outssa.edgeCopies and outssa.edgeCopies[pred] and outssa.edgeCopies[pred][succ]
+    if not copies or #copies == 0 then return end
+
+    self.outssaNames = self.outssaNames or {}
+    self.outssaEdges = self.outssaEdges or {}
+    local pending = {}
+    local pb, sb = self.cfg.blocks[pred], self.cfg.blocks[succ]
+    for _, copy in ipairs(copies) do
+        local dst = self.outssaNames[copy.dst] or self:vname(copy.dstValue, copy.reg, nil, sb and sb.startPC or 1)
+        self.outssaNames[copy.dst] = dst
+        local src
+        if copy.undef then
+            src = "nil"
+        else
+            src = self.outssaNames[copy.src] or self:vname(copy.srcValue, copy.reg, nil, pb and pb.endPC or 1)
+            self.outssaNames[copy.src] = src
+        end
+        if copy.src and not copy.undef then self:usesymbol(copy.src, src) end
+        if dst ~= src then pending[#pending + 1] = { dst = dst, src = src, variable = copy.undef ~= true } end
+    end
+
+    local serial = 0
+    while #pending > 0 do
+        serial += 1
+        if serial > #copies * 4 + 8 then error("LumenV4: SSA_DESTRUCT parallel copy resolution did not converge", 2) end
+        local used = {}
+        for _, copy in ipairs(pending) do if copy.variable then used[copy.src] = true end end
+        local pick
+        for i, copy in ipairs(pending) do
+            if not used[copy.dst] then pick = i break end
+        end
+        if pick then
+            local copy = table.remove(pending, pick)
+            self:out(copy.dst .. " = " .. copy.src)
+        else
+            local first = pending[1]
+            local tmp = self.naming:unique("phiTemp")
+            self:out("local " .. tmp .. " = " .. first.dst)
+            for _, copy in ipairs(pending) do
+                if copy.variable and copy.src == first.dst then copy.src = tmp end
+            end
+        end
+    end
+
+    local key = tostring(pred) .. ">" .. tostring(succ)
+    self.outssaEdges[key] = (self.outssaEdges[key] or 0) + 1
+end
+
+function ctx:edgepc(frompc, topc)
+    local pred = frompc and self.cfg.blockmap[frompc]
+    local succ = topc and self.cfg.blockmap[topc]
+    if pred and succ then self:edge(pred, succ) end
+end
+
+function ctx:verifyoutssa()
+    local outssa = self.ir.outssa
+    if not outssa or not outssa.verified then return false, "analysis" end
+    for pred, bysucc in pairs(outssa.edgeCopies or {}) do
+        for succ, copies in pairs(bysucc) do
+            if #copies > 0 then
+                local key = tostring(pred) .. ">" .. tostring(succ)
+                if not self.outssaEdges or not self.outssaEdges[key] then
+                    return false, key
+                end
+            end
+        end
+    end
+    return true
+end
+
+function ctx:verifyexpr()
+    for _, node in pairs(self.expr or {}) do ex.verify(node) end
+    for _, node in pairs(self.vals or {}) do ex.verify(node) end
+    self.v4.exprVerified = true
+    return true
+end
+
+function ctx:verifyscope()
+    for symbol, uses in pairs(self.symbolUses or {}) do
+        local decl = self.symbolScopes and self.symbolScopes[symbol]
+        if not decl then
+            error("LumenV4: SCOPE_VERIFY semantic symbol " .. tostring(symbol) .. " has no lexical declaration", 2)
+        end
+        for _, use in ipairs(uses) do
+            if decl.depth > use.depth then
+                error(("LumenV4: SCOPE_VERIFY symbol %s (%s) escapes declaration depth %d -> use depth %d"):format(tostring(symbol), tostring(use.name), decl.depth, use.depth), 2)
+            end
+            if decl.depth == use.depth and decl.seq > use.seq and not decl.parameter then
+                error(("LumenV4: SCOPE_VERIFY symbol %s (%s) used before declaration"):format(tostring(symbol), tostring(use.name)), 2)
+            end
+        end
+    end
+    self.v4.scopeVerified = true
+    return true
+end
+
 
 return ctx
 ]===],
@@ -3075,6 +3515,67 @@ local function closurechild(parsed, proto, op, byobject)
     end
 end
 
+local function sharddispatch(out, startindex, depth, leafsize)
+    leafsize = math.max(8, tonumber(leafsize) or 48)
+    local prefix = string.rep("    ", depth)
+    local raw = {}
+    for i = startindex, #out do raw[#raw + 1] = out[i] end
+    for i = #out, startindex, -1 do out[i] = nil end
+
+    local branches = {}
+    local current
+    for _, text in ipairs(raw) do
+        local pc = text:match("^" .. prefix .. "if __pc == (%-?%d+) then$")
+            or text:match("^" .. prefix .. "elseif __pc == (%-?%d+) then$")
+        if pc then
+            current = { pc = tonumber(pc), body = {} }
+            branches[#branches + 1] = current
+        elseif current then
+            current.body[#current.body + 1] = text
+        end
+    end
+
+    if #branches == 0 then
+        line(out, depth, "error(\"LumenV4 VM fallback: empty dispatcher\")")
+        return
+    end
+
+    local function body(branch, newdepth)
+        for _, text in ipairs(branch.body) do
+            local spaces = text:match("^(%s*)") or ""
+            local olddepth = math.floor(#spaces / 4)
+            local rel = math.max(0, olddepth - (depth + 1))
+            line(out, newdepth + rel, text:sub(#spaces + 1))
+        end
+    end
+
+    local function leaf(lo, hi, d)
+        for i = lo, hi do
+            local b = branches[i]
+            line(out, d, (i == lo and "if " or "elseif ") .. "__pc == " .. tostring(b.pc) .. " then")
+            body(b, d + 1)
+        end
+        line(out, d, "else")
+        line(out, d + 1, "error(\"LumenV4 VM fallback: invalid pc \" .. tostring(__pc))")
+        line(out, d, "end")
+    end
+
+    local function tree(lo, hi, d)
+        if hi - lo + 1 <= leafsize then
+            leaf(lo, hi, d)
+            return
+        end
+        local mid = math.floor((lo + hi) / 2)
+        line(out, d, "if __pc <= " .. tostring(branches[mid].pc) .. " then")
+        tree(lo, mid, d + 1)
+        line(out, d, "else")
+        tree(mid + 1, hi, d + 1)
+        line(out, d, "end")
+    end
+
+    tree(1, #branches, depth)
+end
+
 local function emitprotofactory(out, parsed, proto, id, byobject, pulse)
     local pcs, slots = realpcs(proto)
     local maxstack = math.max(1, tonumber(proto.MaxStackSize) or 255)
@@ -3136,6 +3637,7 @@ local function emitprotofactory(out, parsed, proto, id, byobject, pulse)
         end
     end
 
+    local dispatchstart = #out + 1
     local branchindex = 0
     for _, pc in ipairs(pcs) do
         if pulse then pulse() end
@@ -3368,9 +3870,7 @@ local function emitprotofactory(out, parsed, proto, id, byobject, pulse)
         end
     end
 
-    line(out, 3, "else")
-    line(out, 4, "error(\"LumenV4 VM fallback: invalid pc \" .. tostring(__pc))")
-    line(out, 3, "end")
+    sharddispatch(out, dispatchstart, 3, 48)
     line(out, 2, "end")
     line(out, 1, "end")
     line(out, 1, "return __fn")
@@ -3586,6 +4086,11 @@ function vm.run(parsed, reason)
         syntaxValid = true,
         originCoverageValid = true,
         coverage = 1,
+        reachableInstructions = decoded,
+        coveredInstructions = decoded,
+        structuredBlocks = 0,
+        fallbackBlocks = decoded,
+        captureVerified = true,
         verification = "decoded-bytecode-total-dispatch",
         structuredError = tostring(reason or ""),
     }
@@ -3628,22 +4133,32 @@ end
 
 function decomp:_state(proto, up, ph)
     self:_check()
-    local limits = {
-        maxinstructions = self.opt.structuredmaxprotoinstructions or self.opt.structuredmaxinstructions,
-        maxblocks = self.opt.structuredmaxblocks,
-    }
+    local limits
+    if self.losslessOnly then
+        local mi = tonumber(self.opt.structuredmaxprotoinstructions) or 16000
+        local mb = tonumber(self.opt.structuredmaxblocks) or 1024
+        limits = { maxinstructions = mi > 0 and math.max(mi, 65536) or 0, maxblocks = mb > 0 and math.max(mb, 4096) or 0 }
+    else
+        limits = {
+            maxinstructions = self.opt.structuredmaxprotoinstructions or self.opt.structuredmaxinstructions,
+            maxblocks = self.opt.structuredmaxblocks,
+        }
+    end
     local ir = irbuild.run(proto, function() self:_check() end, limits)
     ir.paramhints = ph or {}
     self:_check()
     ir = irpass.run(ir, self.opt, function() self:_check() end)
     self:_check()
+    local nt = os.clock()
     local naming = names.new(ir.cfg.registerStats, self.opt, proto)
+    ir.timings = ir.timings or {}; ir.timings.symbolNaming = os.clock() - nt
     local st = context.new(proto, ir, naming, up, lower.new(), self.opt)
-    st.v4 = { fallback = false, visited = {}, status = "STRUCTURED", cellNames = {} }
+    st.v4 = { fallback = false, visited = {}, status = "STRUCTURED", cellNames = {}, captureVerified = true, childCaptures = 0, timings = ir.timings }
 
 
     if ir.cells and next(ir.cells) then
         local oldvname = st.vname
+        st.basevname = oldvname
         local ids = {}
         for cid in pairs(ir.cells) do ids[#ids + 1] = cid end
         table.sort(ids)
@@ -3663,7 +4178,17 @@ function decomp:_state(proto, up, ph)
             end
         end
         st.vname = function(self, value, reg, hint, pc)
-            local cid = value and ((self.ir.cellOfValue and self.ir.cellOfValue[value]) or resolvedcell[self.ir:resolve(value)])
+            local raw = value and self.ir:resolve(value)
+            local cid
+            if pc and raw then
+                local def = self.ssa.defsByPC[pc] and self.ssa.defsByPC[pc][reg]
+                if def and self.ir:resolve(def) == raw then cid = self.ir.cellDef and self.ir.cellDef[pc] and self.ir.cellDef[pc][reg] end
+                if not cid then
+                    local use = self.ssa.usesByPC[pc] and self.ssa.usesByPC[pc][reg]
+                    if use and self.ir:resolve(use) == raw then cid = self.ir.cellUse and self.ir.cellUse[pc] and self.ir.cellUse[pc][reg] end
+                end
+            end
+            if not cid then cid = value and ((self.ir.cellOfValue and self.ir.cellOfValue[value]) or resolvedcell[raw]) end
             local cellname = cid and self.v4.cellNames[cid]
             if cellname then return cellname end
             return oldvname(self, value, reg, hint, pc)
@@ -3671,26 +4196,8 @@ function decomp:_state(proto, up, ph)
     end
 
 
-    for bid, phis in pairs(ir.phis or {}) do
-        local block = assert(ir.cfg.blocks[bid], "LumenV4: phi references invalid CFG block")
-        for reg, phi in pairs(phis) do
-            local pid = ir:resolve(phi.id)
-            if pid and not ir.dead[pid] then
-                local target = st:vname(pid, reg, nil, block.startPC)
-                for pred, raw in pairs(phi.incoming or {}) do
-                    local rid = ir:resolve(raw)
-                    local value = rid and ir.vals[rid] or nil
-                    if value and value.kind ~= "undef" then
-                        local pb = assert(ir.cfg.blocks[pred], "LumenV4: phi references invalid predecessor")
-                        local source = st:vname(rid, reg, nil, pb.endPC)
-                        if source ~= target then
-                            error(("LumenV4: UNSUPPORTED SSA destruction mismatch for phi v%d r%d: b%d uses %s, target is %s")
-                                :format(pid, reg, pred, tostring(source), tostring(target)), 2)
-                        end
-                    end
-                end
-            end
-        end
+    if not ir.outssa or ir.outssa.verified ~= true then
+        error("LumenV4: SSA_DESTRUCT out-of-SSA verification did not complete", 2)
     end
     st.v4.ssaDestructionVerified = true
     return st
@@ -3780,18 +4287,7 @@ function decomp:_op(st, pc)
     end
 
     local name = ins.name(op)
-    local nx
-
-    if name == "NEWTABLE" then
-        st:set(pc, op.A, ex.atom("{}", false))
-        nx = st:next(pc)
-    elseif name == "DUPTABLE" then
-        local constant = st.proto.Constants and st.proto.Constants[(op.D or 0) + 1]
-        st:set(pc, op.A, ex.atom(lit.constant(constant), false))
-        nx = st:next(pc)
-    else
-        nx = ops.run(self, st, pc)
-    end
+    local nx = ops.run(self, st, pc)
 
     if pack.producesTop then
         local produced = st.top
@@ -3814,6 +4310,12 @@ function decomp:_op(st, pc)
         end
         st.top = nil
     end
+    local bid = st.cfg.blockmap[pc]
+    local sid = nx and st.cfg.blockmap[nx]
+    local block = bid and st.cfg.blocks[bid]
+    if not (st.v4 and st.v4.dispatcher) and bid and sid and bid ~= sid and block and #block.successors == 1 and block.successors[1] == sid then
+        st:edge(bid, sid)
+    end
     return nx
 end
 
@@ -3822,23 +4324,40 @@ function decomp:_child(proto, up, ph)
     local st = self:_state(proto, up, ph)
     local args = arguments(st, proto)
     preparepacks(st)
-    self:_region(st, 1, #proto.Instructions + 1, {})
+    local scopeclock
 
-    if hashard(st) then
+    if not self.losslessOnly then
+        scopeclock = os.clock(); st:prepareoutssa(); st.v4.timings.scope = (st.v4.timings.scope or 0) + (os.clock() - scopeclock)
+        local structureclock = os.clock(); self:_region(st, 1, #proto.Instructions + 1, {}); st.v4.timings.structuring = (st.v4.timings.structuring or 0) + (os.clock() - structureclock)
+        local outok, outwhy = st:verifyoutssa()
+        if not outok then st.bad[#st.bad + 1] = "SSA_DESTRUCT structured edge not represented: " .. tostring(outwhy) end
+    end
 
-        st = self:_state(proto, up, ph)
-        args = arguments(st, proto)
-        preparepacks(st)
+    if self.losslessOnly or hashard(st) then
+        if not self.losslessOnly then
+            local base = tonumber(self.opt.structuredbudget) or 1.25
+            local extra = math.min(5, #(proto.Instructions or {}) / 1500)
+            self.deadline = os.clock() + math.max(1.5, base + extra)
+            st = self:_state(proto, up, ph)
+            args = arguments(st, proto)
+            preparepacks(st)
+        end
         st.v4.fallback = true
         st.v4.status = "LOSSLESS_FALLBACK"
-        self:_dispatcher(st)
+        st:preparedispatch()
+        scopeclock = os.clock(); st:prepareoutssa(); st.v4.timings.scope = (st.v4.timings.scope or 0) + (os.clock() - scopeclock)
+        local dispatchclock = os.clock(); self:_dispatcher(st); st.v4.timings.lossless = (st.v4.timings.lossless or 0) + (os.clock() - dispatchclock)
+        local fallbackok, fallbackwhy = st:verifyoutssa()
+        if not fallbackok then st.bad[#st.bad + 1] = "SSA_DESTRUCT fallback edge not represented: " .. tostring(fallbackwhy) end
         if hashard(st) then
             error("LumenV4: UNSUPPORTED semantic lowering issue: " .. table.concat(st.bad, " | "), 2)
         end
     end
 
     self:_check()
-    local root = astpass.run(st.ast:done(), self.opt)
+    local verifyclock = os.clock(); st:verifyexpr(); st.v4.timings.expressionVerify = os.clock() - verifyclock
+    local scopeverifyclock = os.clock(); st:verifyscope(); st.v4.timings.scopeVerify = os.clock() - scopeverifyclock
+    local astclock = os.clock(); local root = astpass.run(st.ast:done(), self.opt); st.v4.timings.ast = os.clock() - astclock
     self:_check()
     return root, st, args
 end
@@ -3870,8 +4389,9 @@ function decomp:_numfor(st, pc, op, stop, active)
     if step ~= "1" then head ..= ", " .. step end
     st:out(head .. " do"); st.indent += 1
     st.alias[varreg] = var; st.declared[var] = st.indent
+    if lv then st:declaresymbol(st.ir:nameid(lv), var, st.indent) end
     local prev, olddepth = active.loop, active.loopdepth
-    active.loop = { breakpc = info.exit, contpc = loop }; active.loopdepth = depth
+    active.loop = { breakpc = info.exit, contpc = loop, headerpc = pc, kind = "numeric" }; active.loopdepth = depth
     self:_region(st, bodystart, loop, active)
     active.loop, active.loopdepth = prev, olddepth
     st:trim(st.indent); st.indent -= 1; st:out("end"); st.alias[varreg] = old
@@ -3885,11 +4405,12 @@ function decomp:_genfor(st, pc, op, stop, active)
     local loop, lop = info.loop, info.op
     local aux = lop.AuxValue and lop.AuxValue.Value or 0
     local n = math.max(1, bit32.band(aux, 0xff))
-    local depth, vars, old = (active.loopdepth or 0) + 1, {}, {}
+    local depth, vars, old, varids = (active.loopdepth or 0) + 1, {}, {}, {}
     for i = 1, n do
         local r = op.A + 2 + i; old[r] = st.alias[r]
         local hint = i == 1 and (n == 1 and "item" or "key") or (i == 2 and "value" or ("value" .. tostring(i)))
         local v = st:verdef(loop, r)
+        varids[i] = v
         vars[i] = not loopused(st, r, st:next(pc), loop) and "_" or st:vname(v, r, hint, loop)
     end
     local src
@@ -3900,9 +4421,12 @@ function decomp:_genfor(st, pc, op, stop, active)
     elseif ins.name(op) == "FORGPREP_NEXT" then src = "pairs(" .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ")"
     else src = ex.str(st:loopx(pc, loop, op.A)) .. ", " .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ", " .. ex.str(st:loopx(pc, loop, op.A + 2)) end
     st:out("for " .. table.concat(vars, ", ") .. " in " .. src .. " do"); st.indent += 1
-    for i = 1, n do local r = op.A + 2 + i; st.alias[r] = vars[i]; st.declared[vars[i]] = st.indent end
+    for i = 1, n do
+        local r = op.A + 2 + i; st.alias[r] = vars[i]; st.declared[vars[i]] = st.indent
+        if varids[i] and vars[i] ~= "_" then st:declaresymbol(st.ir:nameid(varids[i]), vars[i], st.indent) end
+    end
     local prev, olddepth = active.loop, active.loopdepth
-    active.loop = { breakpc = info.exit, contpc = loop }; active.loopdepth = depth
+    active.loop = { breakpc = info.exit, contpc = loop, headerpc = pc, kind = "generic" }; active.loopdepth = depth
     self:_region(st, st:next(pc), loop, active)
     active.loop, active.loopdepth = prev, olddepth
     st:trim(st.indent); st.indent -= 1; st:out("end")
@@ -3912,16 +4436,39 @@ function decomp:_genfor(st, pc, op, stop, active)
 end
 
 function decomp:_emitif(st, info, active, word)
+    local condpcs = info.condpcs or { info.head }
+    local single = #condpcs == 1 and condpcs[1] ~= nil
+    local falsepc = single and condpcs[1] or nil
+    local falseentry = info.c or info.join
+    local falsepred = falsepc and st.cfg.blockmap[falsepc] or nil
+    local falsesucc = falseentry and st.cfg.blockmap[falseentry] or nil
+    local falsecopy = falsepred and falsesucc and st:hasedge(falsepred, falsesucc) or false
+
     st:out((word or "if") .. " " .. ex.str(info.cond) .. " then"); st.indent += 1
+    if single then st:edgepc(info.last or info.head, info.a) end
     local old = active.join; active.join = info.join
     self:_region(st, info.a, info.b, active); active.join = old
     st:trim(st.indent); st.indent -= 1
+
     if info.c then
         local sub = branch.elseifInfo(st, info.c, info.join)
-        if sub then self:_emitif(st, sub, active, "elseif"); return end
-        st:out("else"); st.indent += 1; old = active.join; active.join = info.join
-        self:_region(st, info.c, info.d, active); active.join = old
+        if sub and not falsecopy then
+            self:_emitif(st, sub, active, "elseif")
+            return
+        end
+        st:out("else"); st.indent += 1
+        if single then st:edgepc(falsepc, info.c) end
+        if sub then
+            self:_emitif(st, sub, active, "if")
+        else
+            old = active.join; active.join = info.join
+            self:_region(st, info.c, info.d, active); active.join = old
+        end
         st:trim(st.indent); st.indent -= 1
+    elseif falsecopy then
+        st:out("else"); st.indent += 1
+        st:edgepc(falsepc, info.join)
+        st.indent -= 1
     end
     st:out("end")
 end
@@ -3943,7 +4490,7 @@ function decomp:_region(st, start, stop, active)
 
                 st:hoist(pc)
                 active["repeat:" .. tostring(pc)] = true; st:out("repeat"); st.indent += 1
-                local prev = active.loop; active.loop = { breakpc = rep.exit, contpc = rep.cont }
+                local prev = active.loop; active.loop = { breakpc = rep.exit, contpc = rep.cont, headerpc = pc, kind = "repeat" }
                 self:_region(st, rep.body, rep.latch, active); active.loop = prev
                 local x = cond.fall(st, rep.latch, st.proto.Instructions[rep.latch]); st.v4.visited[rep.latch] = true
                 st:trim(st.indent); st.indent -= 1; st:out("until " .. ex.str(x)); active["repeat:" .. tostring(pc)] = nil; pc = rep.exit
@@ -3953,7 +4500,7 @@ function decomp:_region(st, start, stop, active)
 
                     st:hoist(pc)
                     st:out("while true do"); st.indent += 1; local prev = active.loop
-                    active.loop = { breakpc = forever.exit, contpc = forever.cont, cont2 = forever.latch }
+                    active.loop = { breakpc = forever.exit, contpc = forever.cont, cont2 = forever.latch, headerpc = pc, kind = "forever" }
                     self:_region(st, forever.body, forever.latch, active); active.loop = prev; st.v4.visited[forever.latch] = true
                     st:trim(st.indent); st.indent -= 1; st:out("end"); pc = forever.exit
                 else
@@ -3966,8 +4513,21 @@ function decomp:_region(st, start, stop, active)
                         else st:badpc(pc, "unrecognized CMPPROTO inline guard -> " .. tostring(target)); pc = st:next(pc) end
                     elseif ins.isConditional(op) and name ~= "FORNLOOP" and name ~= "FORGLOOP" then
                         local loop, target = active.loop, ins.jumpTarget(pc, op)
-                        if loop and target == loop.breakpc then st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then break end"); pc = st:next(pc)
-                        elseif loop and (target == loop.contpc or target == loop.cont2) then st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then continue end"); pc = st:next(pc)
+                        local edgekind = loops.edgeKind(st, pc, target, active)
+                        if loop and (target == loop.breakpc or edgekind == "break") then
+                            local from, to = st.cfg.blockmap[pc], st.cfg.blockmap[target]
+                            if from and to and st:hasedge(from, to) then
+                                st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then"); st.indent += 1
+                                st:edge(from, to); st:out("break"); st.indent -= 1; st:out("end")
+                            else st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then break end") end
+                            pc = st:next(pc)
+                        elseif loop and (target == loop.contpc or target == loop.cont2 or edgekind == "continue") then
+                            local from, to = st.cfg.blockmap[pc], st.cfg.blockmap[target]
+                            if from and to and st:hasedge(from, to) then
+                                st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then"); st.indent += 1
+                                st:edge(from, to); st:out("continue"); st.indent -= 1; st:out("end")
+                            else st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then continue end") end
+                            pc = st:next(pc)
                         else
                             local bp = cond.bool(st, pc, op)
                             if bp then pc = bp
@@ -3975,7 +4535,7 @@ function decomp:_region(st, start, stop, active)
                                 local wh = loops.whileInfo(st, pc)
                                 if wh and wh.exit <= stop then
                                     st:hoist(pc); st:out("while " .. ex.str(wh.cond) .. " do"); st.indent += 1
-                                    local prev = active.loop; active.loop = { breakpc = wh.exit, contpc = wh.cont }
+                                    local prev = active.loop; active.loop = { breakpc = wh.exit, contpc = wh.cont, headerpc = pc, kind = "while" }
                                     self:_region(st, wh.body, wh.bodyend, active); active.loop = prev
                                     st:trim(st.indent); st.indent -= 1; st:out("end"); pc = wh.exit
                                 else
@@ -3987,9 +4547,10 @@ function decomp:_region(st, start, stop, active)
                         end
                     elseif name == "JUMP" or name == "JUMPBACK" or name == "JUMPX" then
                         local target, loop = ins.jumpTarget(pc, op), active.loop
-                        if loop and target == loop.breakpc then st:out("break"); pc = st:next(pc)
-                        elseif loop and (target == loop.contpc or target == loop.cont2) then st:out("continue"); pc = st:next(pc)
-                        elseif target == stop or target == active.join then pc = stop
+                        local edgekind = loops.edgeKind(st, pc, target, active)
+                        if loop and (target == loop.breakpc or edgekind == "break") then st:edgepc(pc, target); st:out("break"); pc = st:next(pc)
+                        elseif loop and (target == loop.contpc or target == loop.cont2 or edgekind == "continue") then st:edgepc(pc, target); st:out("continue"); pc = st:next(pc)
+                        elseif target == stop or target == active.join then st:edgepc(pc, target); pc = stop
                         else st:badpc(pc, "unstructured jump -> " .. tostring(target)); pc = st:next(pc) end
                     else pc = self:_op(st, pc) end
                 end
@@ -4002,19 +4563,37 @@ end
 local function dispatcherunsupported(st)
     for _, n in ipairs(st.ir.ops) do
         local name = n.name
-        if name == "FORNPREP" or name == "FORNLOOP" or name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" or name == "FORGLOOP" then
-            return "dispatcher requires VM loop-state emulation for " .. name .. " at pc " .. tostring(n.pc)
+        if name == "CMPPROTO" then
+            return "CMPPROTO cannot be represented losslessly in source fallback at pc " .. tostring(n.pc)
         end
-        if name == "CMPPROTO" then return "CMPPROTO cannot be represented losslessly in source fallback at pc " .. tostring(n.pc) end
-        if name == "CLOSEUPVALS" then return "dispatcher would change upvalue close/cell lifetime at pc " .. tostring(n.pc) end
-        if name == "CAPTURE" and n.op.A == 1 then return "dispatcher would hoist a by-reference captured local cell at pc " .. tostring(n.pc) end
     end
 end
 
 function decomp:_dispatcher(st)
+    st.v4.dispatcher = true
     local why = dispatcherunsupported(st)
     if why then error("LumenV4: UNSUPPORTED lossless fallback: " .. why, 2) end
 
+    local fornum = st.naming:unique("__fornum")
+    local iterprep = st.naming:unique("__iterprep")
+    st:out("local function " .. fornum .. "(v)")
+    st.indent += 1
+    st:out("if type(v) == \"number\" then return v end")
+    st:out("local n = tonumber(v)")
+    st:out("if n == nil then error(\"invalid 'for' limit/step/index (number expected)\", 2) end")
+    st:out("return n")
+    st.indent -= 1; st:out("end")
+    st:out("local function " .. iterprep .. "(v)")
+    st.indent += 1
+    st:out("local mt")
+    st:out("if type(getrawmetatable) == \"function\" then local ok, raw = pcall(getrawmetatable, v); if ok then mt = raw end end")
+    st:out("if mt == nil then mt = getmetatable(v) end")
+    st:out("local it = type(mt) == \"table\" and mt.__iter or nil")
+    st:out("if it ~= nil then return it(v) end")
+    st:out("if type(mt) == \"table\" and mt.__call ~= nil then return v, nil, nil end")
+    st:out("if type(v) == \"table\" then return next, v, nil end")
+    st:out("return v, nil, nil")
+    st.indent -= 1; st:out("end")
 
     local nameset, ordered = {}, {}
     for id, v in ipairs(st.ir.vals) do
@@ -4043,25 +4622,77 @@ function decomp:_dispatcher(st)
             if not st.consumed[pc] then
                 local op, name = st.proto.Instructions[pc], ins.name(st.proto.Instructions[pc])
                 local last = pi == #b.pcs
-                if last and ins.isConditional(op) then
+                if last and name == "FORNPREP" then
+                    local a = op.A
+                    local oldlimit, oldstep, oldidx = st:use(pc, a), st:use(pc, a + 1), st:use(pc, a + 2)
+                    local limit = st:set(pc, a, ex.atom(fornum .. "(" .. oldlimit .. ")", false)) or st:defName(pc, a)
+                    local step = st:set(pc, a + 1, ex.atom(fornum .. "(" .. oldstep .. ")", false)) or st:defName(pc, a + 1)
+                    local idx = st:set(pc, a + 2, ex.atom(fornum .. "(" .. oldidx .. ")", false)) or st:defName(pc, a + 2)
+                    local target, fall = st.cfg.blockmap[ins.jumpTarget(pc, op)], st.cfg.blockmap[st:next(pc)]
+                    if not target or not fall then error("LumenV4: invalid FORNPREP edge at pc " .. tostring(pc), 2) end
+                    st:out("if (" .. step .. " > 0 and " .. idx .. " <= " .. limit .. ") or (not (" .. step .. " > 0) and " .. limit .. " <= " .. idx .. ") then")
+                    st.indent += 1; st:edge(b.id, fall); st:out(state .. " = " .. tostring(fall)); st.indent -= 1
+                    st:out("else"); st.indent += 1; st:edge(b.id, target); st:out(state .. " = " .. tostring(target)); st.indent -= 1; st:out("end")
+                elseif last and name == "FORNLOOP" then
+                    local a = op.A
+                    local limit, step, oldidx = st:use(pc, a), st:use(pc, a + 1), st:use(pc, a + 2)
+                    local idx = st:set(pc, a + 2, ex.atom(oldidx .. " + " .. step, false)) or st:defName(pc, a + 2)
+                    local target, fall = st.cfg.blockmap[ins.jumpTarget(pc, op)], st.cfg.blockmap[st:next(pc)]
+                    if not target or not fall then error("LumenV4: invalid FORNLOOP edge at pc " .. tostring(pc), 2) end
+                    st:out("if (" .. step .. " > 0 and " .. idx .. " <= " .. limit .. ") or (not (" .. step .. " > 0) and " .. limit .. " <= " .. idx .. ") then")
+                    st.indent += 1; st:edge(b.id, target); st:out(state .. " = " .. tostring(target)); st.indent -= 1
+                    st:out("else"); st.indent += 1; st:edge(b.id, fall); st:out(state .. " = " .. tostring(fall)); st.indent -= 1; st:out("end")
+                elseif last and (name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT") then
+                    local a = op.A
+                    local g0, s0, i0 = st:use(pc, a), st:use(pc, a + 1), st:use(pc, a + 2)
+                    local gtmp = st.naming:unique("iterator")
+                    local stmp = st.naming:unique("state")
+                    local itmp = st.naming:unique("index")
+                    if name == "FORGPREP" then
+                        st:out("local " .. gtmp .. ", " .. stmp .. ", " .. itmp .. " = " .. g0 .. ", " .. s0 .. ", " .. i0)
+                        st:out("if type(" .. gtmp .. ") ~= \"function\" then " .. gtmp .. ", " .. stmp .. ", " .. itmp .. " = " .. iterprep .. "(" .. gtmp .. ") end")
+                    else
+                        st:out("local " .. gtmp .. ", " .. stmp .. ", " .. itmp .. " = " .. g0 .. ", " .. s0 .. ", " .. i0)
+                    end
+                    st:set(pc, a, ex.atom(gtmp, false))
+                    st:set(pc, a + 1, ex.atom(stmp, false))
+                    st:set(pc, a + 2, ex.atom(itmp, false))
+                    local target = st.cfg.blockmap[ins.jumpTarget(pc, op)]
+                    if not target then error("LumenV4: invalid FORGPREP edge at pc " .. tostring(pc), 2) end
+                    st:edge(b.id, target); st:out(state .. " = " .. tostring(target))
+                elseif last and name == "FORGLOOP" then
+                    local a = op.A
+                    local count = math.max(1, bit32.band((op.AuxValue and op.AuxValue.Value or 0), 0xff))
+                    local ret = st.naming:unique("iterResult")
+                    st:out("local " .. ret .. " = table.pack((" .. st:use(pc, a) .. ")(" .. st:use(pc, a + 1) .. ", " .. st:use(pc, a + 2) .. "))")
+                    local indexname = st:set(pc, a + 2, ex.atom(ret .. "[1]", false)) or st:defName(pc, a + 2)
+                    for i = 1, count do st:set(pc, a + 2 + i, ex.atom(ret .. "[" .. tostring(i) .. "]", false)) end
+                    local target, fall = st.cfg.blockmap[ins.jumpTarget(pc, op)], st.cfg.blockmap[st:next(pc)]
+                    if not target or not fall then error("LumenV4: invalid FORGLOOP edge at pc " .. tostring(pc), 2) end
+                    st:out("if " .. indexname .. " ~= nil then")
+                    st.indent += 1; st:edge(b.id, target); st:out(state .. " = " .. tostring(target)); st.indent -= 1
+                    st:out("else"); st.indent += 1; st:edge(b.id, fall); st:out(state .. " = " .. tostring(fall)); st.indent -= 1; st:out("end")
+                elseif last and ins.isConditional(op) then
                     local target, fall = st.cfg.blockmap[ins.jumpTarget(pc, op)], st.cfg.blockmap[st:next(pc)]
                     if not target or not fall then error("LumenV4: invalid dispatcher conditional edge at pc " .. tostring(pc), 2) end
                     st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then")
-                    st.indent += 1; st:out(state .. " = " .. tostring(target)); st.indent -= 1
-                    st:out("else"); st.indent += 1; st:out(state .. " = " .. tostring(fall)); st.indent -= 1; st:out("end")
+                    st.indent += 1; st:edge(b.id, target); st:out(state .. " = " .. tostring(target)); st.indent -= 1
+                    st:out("else"); st.indent += 1; st:edge(b.id, fall); st:out(state .. " = " .. tostring(fall)); st.indent -= 1; st:out("end")
                 elseif last and (name == "JUMP" or name == "JUMPBACK" or name == "JUMPX") then
                     local target = st.cfg.blockmap[ins.jumpTarget(pc, op)]
                     if not target then error("LumenV4: invalid dispatcher jump edge at pc " .. tostring(pc), 2) end
+                    st:edge(b.id, target)
                     st:out(state .. " = " .. tostring(target))
                 elseif last and name == "LOADB" and (op.C or 0) ~= 0 then
                     self:_op(st, pc)
                     local target = st.cfg.blockmap[pc + op.C + 1]
                     if not target then error("LumenV4: invalid LOADB edge at pc " .. tostring(pc), 2) end
+                    st:edge(b.id, target)
                     st:out(state .. " = " .. tostring(target))
                 else
                     self:_op(st, pc)
                     if last and name ~= "RETURN" then
-                        if #b.successors == 1 then st:out(state .. " = " .. tostring(b.successors[1]))
+                        if #b.successors == 1 then st:edge(b.id, b.successors[1]); st:out(state .. " = " .. tostring(b.successors[1]))
                         elseif #b.successors == 0 then st:out("break")
                         elseif #b.successors > 1 then error("LumenV4: unhandled multi-successor block at pc " .. tostring(pc), 2) end
                     end
@@ -4073,6 +4704,7 @@ function decomp:_dispatcher(st)
     st:out("else"); st.indent += 1; st:out("error(\"LumenV4: invalid dispatcher state \" .. tostring(" .. state .. "))"); st.indent -= 1
     st:out("end")
     st.indent -= 1; st:out("end")
+    st.v4.dispatcher = nil
 end
 
 local function metrics(st)
@@ -4086,9 +4718,35 @@ local function metrics(st)
     return reachable, covered, reachable == 0 and 1 or covered / reachable
 end
 
+local function capturebackstop(src)
+    for text in tostring(src or ""):gmatch("[^\r\n]+") do
+        local lhs, rhs = text:match("^%s*local%s+([%a_][%w_]*)%s*=%s*([%a_][%w_]*)%s*;?%s*$")
+        if lhs and lhs == rhs and (lhs:match("^upvalue%d+$") or lhs:match("^capture%d*Value%d*$") or lhs:match("^cell%d+$")) then
+            return false, lhs
+        end
+    end
+    return true
+end
+
 function decomp:decompileProto(proto, up)
     local root, st = self:_child(proto, up or {})
-    local src = printer.run(root, self.opt)
+    if not st.v4 or st.v4.captureVerified ~= true then
+        error("LumenV4: CAPTURE_VERIFY structured capture verification did not complete", 2)
+    end
+    if not st.v4.ssaDestructionVerified or not st.v4.outssaVerified or not st.ir.outssa or st.ir.outssa.verified ~= true then
+        error("LumenV4: SSA_DESTRUCT structured out-of-SSA verification did not complete", 2)
+    end
+    if not st.ir.objectVerified then error("LumenV4: OBJECT_VERIFY object identity verification did not complete", 2) end
+    if not st.ssa.valuePackVerified then error("LumenV4: VALUEPACK_VERIFY ValuePack verification did not complete", 2) end
+    if not st.v4.exprVerified then error("LumenV4: EXPR_VERIFY semantic expression verification did not complete", 2) end
+    if not st.v4.scopeVerified then error("LumenV4: SCOPE_VERIFY scope verification did not complete", 2) end
+    if not st.cfg.verified or not st.cfg.structure or not st.cfg.structure.verified then error("LumenV4: CFG_STRUCTURE verification did not complete", 2) end
+    local printclock = os.clock(); local src = printer.run(root, self.opt); st.v4.timings.printing = os.clock() - printclock
+    local verifyclock = os.clock()
+    local capok, capname = capturebackstop(src)
+    if not capok then
+        error("LumenV4: CAPTURE_VERIFY accidental self-initialization for " .. tostring(capname), 2)
+    end
     local reachable, covered, coverage = metrics(st)
     if covered ~= reachable then
         error(("LumenV4: PARTIAL origin coverage %d/%d (%.2f%%)"):format(covered, reachable, coverage * 100), 2)
@@ -4112,19 +4770,22 @@ function decomp:decompileProto(proto, up)
         error("LumenV4: UNSUPPORTED syntax verification requires loadstring()", 2)
     end
 
-    local header = ("-- LumenV4 status=%s coverage=%.2f reachable=%d covered=%d blocks=%d structuredBlocks=%d fallbackBlocks=%d phis=%d undefs=%d packs=%d cells=%d objects=%d escapedObjects=%d irreducible=%d bytecodeVersion=%d ssa=true parser=true diagnostics=%d\n")
+    local header = ("-- LumenV4 status=%s coverage=%.2f reachable=%d covered=%d blocks=%d structuredBlocks=%d fallbackBlocks=%d phis=%d undefs=%d packs=%d cells=%d objects=%d escapedObjects=%d irreducible=%d bytecodeVersion=%d ssa=true outssa=true copies=%d parser=true capture=true objects=true valuepacks=true scope=true expr=true cfgstructure=true diagnostics=%d\n")
         :format(st.v4.status, coverage * 100, reachable, covered, #st.cfg.blocks, structuredblocks, fallbackblocks,
-            ss.phis or 0, ss.undefs or 0, packcount, cellcount, objectcount, escapedobjects, irreducible, bytecodeversion, #st.bad)
+            ss.phis or 0, ss.undefs or 0, packcount, cellcount, objectcount, escapedobjects, irreducible, bytecodeversion, st.ir.outssa.copyCount or 0, #st.bad)
     src = header .. src
     local check, err = loadstring(src, "@LumenV4/verify")
     if not check then error("LumenV4: INVALID emitted Luau: " .. tostring(err), 2) end
+    st.v4.timings.verification = os.clock() - verifyclock
 
     return src, {
         status = st.v4.status, cfg = st.cfg, ir = st.ir, ssa = st.ssa, ssaSummary = ss, issues = st.bad,
         coverage = coverage, coveredInstructions = covered, reachableInstructions = reachable, fallback = st.v4.fallback,
-        syntaxValid = true, originCoverageValid = true, verification = "syntax+CFG-origin-invariants",
+        syntaxValid = true, originCoverageValid = true, verification = "syntax+CFG-origin+SSA+out-of-SSA+capture+object+scope+expression-invariants", captureVerified = true, outssaVerified = true,
+        objectVerified = true, valuePackVerified = true, scopeVerified = true, expressionVerified = true, cfgStructureVerified = true,
+        outssaCopyCount = st.ir.outssa.copyCount or 0, outssaCoalesced = st.ir.outssa.coalesced or 0,
         objectCount = objectcount, escapedObjects = escapedobjects, cellCount = cellcount, valuePackCount = packcount,
-        irreducible = st.cfg.irreducible == true, bytecodeVersion = bytecodeversion,
+        irreducible = st.cfg.irreducible == true, bytecodeVersion = bytecodeversion, timings = st.v4.timings,
     }
 end
 
@@ -4140,13 +4801,15 @@ function decomp:decompileParsed(parsed)
         totalinstructions += n
         if n > maxprotoinstructions then maxprotoinstructions = n end
     end
-    local maxtotal = tonumber(self.opt.structuredmaxinstructions) or 8000
-    local maxproto = tonumber(self.opt.structuredmaxprotoinstructions) or 4000
+    local maxtotal = tonumber(self.opt.structuredmaxinstructions) or 32000
+    local maxproto = tonumber(self.opt.structuredmaxprotoinstructions) or 16000
     local structurederror
     if (maxtotal > 0 and totalinstructions > maxtotal) or (maxproto > 0 and maxprotoinstructions > maxproto) then
         structurederror = "LumenV4: STRUCTURED_COMPLEXITY total=" .. tostring(totalinstructions) .. " maxproto=" .. tostring(maxprotoinstructions)
     else
-        local budget = tonumber(self.opt.structuredbudget) or 1.25
+        local basebudget = tonumber(self.opt.structuredbudget) or 1.25
+        local adaptive = math.min(5, totalinstructions / 2500)
+        local budget = basebudget > 0 and (basebudget + adaptive) or 0
         self.slice = os.clock()
         self.deadline = budget > 0 and (self.slice + budget) or nil
         local ok, src, info = pcall(function() return self:decompileProto(proto, {}) end)
@@ -4160,14 +4823,31 @@ function decomp:decompileParsed(parsed)
 
     self.deadline = nil
     self.slice = os.clock()
+
+    local losslessReason = structurederror
+    self.losslessOnly = true
+    local basebudget = tonumber(self.opt.structuredbudget) or 1.25
+    local losslessBudget = math.max(2.0, basebudget + math.min(8, totalinstructions / 1500))
+    self.deadline = os.clock() + losslessBudget
+    local lok, lsrc, linfo = pcall(function() return self:decompileProto(proto, {}) end)
+    self.deadline = nil
+    self.losslessOnly = nil
+    if lok then
+        self.parsed = nil
+        linfo.structuredError = losslessReason
+        return lsrc, linfo
+    end
+
+    local losslesserror = tostring(lsrc)
+    self.slice = os.clock()
     local fok, fsrc, finfo = pcall(function()
-        return vmfallback.run(parsed, structurederror)
+        return vmfallback.run(parsed, losslessReason .. " | lossless retry: " .. losslesserror)
     end)
     self.parsed = nil
 
     if not fok then
         error("LumenV4: VM fallback generator failure after structured failure: " .. tostring(fsrc)
-            .. " | structured: " .. structurederror, 2)
+            .. " | structured: " .. structurederror .. " | lossless: " .. losslesserror, 2)
     end
     return fsrc, finfo
 end
@@ -4247,12 +4927,14 @@ function ops.run(d, st, pc)
     local a, b, c, dd = op.A, op.B, op.C, op.D
     local aux = op.AuxValue and op.AuxValue.Value or 0
 
-    if name == "NOP" or name == "BREAK" or name == "CLOSEUPVALS" or name == "PREPVARARGS" or name == "COVERAGE" or name == "NATIVECALL" then
-    elseif name == "LOADNIL" then st:set(pc, a, ex.atom("nil", true))
+    if name == "CLOSEUPVALS" then
+        if st.v4 and st.v4.dispatcher then st:closecells(pc) end
+    elseif name == "NOP" or name == "BREAK" or name == "PREPVARARGS" or name == "COVERAGE" or name == "NATIVECALL" then
+    elseif name == "LOADNIL" then st:set(pc, a, ex.literal("nil"))
     elseif name == "LOADB" then
-        st:set(pc, a, ex.atom(b == 1 and "true" or "false", true))
+        st:set(pc, a, ex.literal(b == 1 and "true" or "false"))
         if c ~= 0 then return pc + c + 1 end
-    elseif name == "LOADN" then st:set(pc, a, ex.atom(tostring(dd), true))
+    elseif name == "LOADN" then st:set(pc, a, ex.literal(tostring(dd)))
     elseif name == "LOADK" then
         local k = getk(st.proto, dd)
         local raw = k and k.__type == "String" and lit.rawStringConstant(k) or nil
@@ -4265,15 +4947,17 @@ function ops.run(d, st, pc)
         st:set(pc, a, st:usex(pc, b), nil, st:raw(pc, b))
     elseif name == "GETGLOBAL" then
         local g = lit.rawStringConstant(getk(st.proto, aux)) or "unknownGlobal"
-        st:set(pc, a, ex.atom(g, false), g)
+        st:set(pc, a, ex.global(g), g)
     elseif name == "SETGLOBAL" then
         local g = lit.rawStringConstant(getk(st.proto, aux)) or "unknownGlobal"
         st:out(g .. " = " .. st:use(pc, a))
     elseif name == "GETUPVAL" then
-        local u = st.up[b + 1] or ("upvalue" .. tostring(b))
+        local u = st:upname(b + 1)
+        if not u then error(("LumenV4: CAPTURE_VERIFY GETUPVAL missing slot U%d at pc %d"):format(b, pc), 2) end
         st:set(pc, a, ex.atom(u, false), u)
     elseif name == "SETUPVAL" then
-        local u = st.up[b + 1] or ("upvalue" .. tostring(b))
+        local u = st:upname(b + 1)
+        if not u then error(("LumenV4: CAPTURE_VERIFY SETUPVAL missing slot U%d at pc %d"):format(b, pc), 2) end
         st:out(u .. " = " .. st:use(pc, a))
     elseif name == "GETIMPORT" then
         local v = lit.rawStringConstant(getk(st.proto, dd)) or lit.constant(getk(st.proto, dd))
@@ -4282,10 +4966,10 @@ function ops.run(d, st, pc)
         st:set(pc, a, ex.prop(st:usex(pc, b), "[" .. st:use(pc, c) .. "]"))
     elseif name == "SETTABLE" then
         local tv = st:veruse(pc, b)
-        local t = tv and st.tbl[tv]
+        local t = tv and tab.get(st, tv)
         local sv = st:veruse(pc, a)
         local kv = st:veruse(pc, c)
-        if t and not t.done and sv ~= tv and kv ~= tv then
+        if tab.canput(t, pc) and sv ~= tv and kv ~= tv then
             t.entries[#t.entries + 1] = { kind = "key", key = st:use(pc, c), val = st:usex(pc, a) }
         else
             st:out(st:use(pc, b) .. "[" .. st:use(pc, c) .. "] = " .. st:use(pc, a))
@@ -4299,9 +4983,9 @@ function ops.run(d, st, pc)
         local ki = name == "SETUDATAKS" and bit32.band(aux, 0xffff) or aux
         local f = lit.rawStringConstant(getk(st.proto, ki)) or "?"
         local tv = st:veruse(pc, b)
-        local t = tv and st.tbl[tv]
+        local t = tv and tab.get(st, tv)
         local sv = st:veruse(pc, a)
-        if t and not t.done and lit.identifier(f) and sv ~= tv then
+        if tab.canput(t, pc) and lit.identifier(f) and sv ~= tv then
             tab.put(t, "field", f, st:usex(pc, a))
         else
             st:out(lit.property(st:use(pc, b), f) .. " = " .. st:use(pc, a))
@@ -4310,9 +4994,9 @@ function ops.run(d, st, pc)
         st:set(pc, a, ex.prop(st:usex(pc, b), "[" .. tostring(c + 1) .. "]"))
     elseif name == "SETTABLEN" then
         local tv = st:veruse(pc, b)
-        local t = tv and st.tbl[tv]
+        local t = tv and tab.get(st, tv)
         local sv = st:veruse(pc, a)
-        if t and not t.done and sv ~= tv then
+        if tab.canput(t, pc) and sv ~= tv then
             local idx = c + 1
             local kind = idx == #t.entries + 1 and "list" or "key"
             t.entries[#t.entries + 1] = { kind = kind, key = tostring(idx), val = st:usex(pc, a) }
@@ -4342,39 +5026,16 @@ function ops.run(d, st, pc)
             st:out("return " .. table.concat(vals, ", "))
         end
     elseif name == "NEWTABLE" then
-        local v = st:verdef(pc, a)
-        local safe = v ~= nil and not st.naming:isDebugAt(a, pc)
-        local real = 0
-        if safe then
-            local block = st.cfg.blockmap[pc]
-            for _, u in ipairs(st.ir:uses(v) or {}) do
-                if not u.pc or st.cfg.blockmap[u.pc] ~= block then safe = false break end
-                if not st:tblmut(u, a) then real += 1 end
-            end
-        end
-        if safe then st.tbl[v] = { reg = a, entries = {}, real = real, done = false }
-        else st:set(pc, a, ex.atom("{}", false)) end
+        local t = tab.begin(st, pc, a, {}, {})
+        if not t then st:set(pc, a, ex.atom("{}", false)) end
     elseif name == "DUPTABLE" then
-        local v = st:verdef(pc, a)
-        local safe = v ~= nil and not st.naming:isDebugAt(a, pc)
-        local real = 0
-        if safe then
-            local block = st.cfg.blockmap[pc]
-            for _, u in ipairs(st.ir:uses(v) or {}) do
-                if not u.pc or st.cfg.blockmap[u.pc] ~= block then safe = false break end
-                if not st:tblmut(u, a) then real += 1 end
-            end
-        end
-        if safe then
-            local entries, slots = tab.seed(getk(st.proto, dd))
-            st.tbl[v] = { reg = a, entries = entries, slots = slots, real = real, done = false }
-        else
-            st:set(pc, a, ex.atom(lit.constant(getk(st.proto, dd)), false))
-        end
+        local entries, slots = tab.seed(getk(st.proto, dd))
+        local t = tab.begin(st, pc, a, entries, slots)
+        if not t then st:set(pc, a, ex.atom(lit.constant(getk(st.proto, dd)), false)) end
     elseif name == "SETLIST" then
         local start = aux
         local tv = st:veruse(pc, a)
-        local t = tv and st.tbl[tv]
+        local t = tv and tab.get(st, tv)
         local vals = {}
         local mult = false
         if c == 0 then
@@ -4392,9 +5053,10 @@ function ops.run(d, st, pc)
         local selfref = false
         for i = 1, #vals do
             local r = b + i - 1
-            if st:veruse(pc, r) == tv then selfref = true break end
+            local rv = st:veruse(pc, r)
+            if t and rv and st.ir.objectId and st.ir:objectId(rv) == t.oid then selfref = true break end
         end
-        if t and not t.done and not selfref then
+        if tab.canput(t, pc) and not selfref then
             for i, v in ipairs(vals) do
                 local idx = start + i - 1
                 local kind = idx == #t.entries + 1 and "list" or "key"
@@ -4425,7 +5087,9 @@ function ops.run(d, st, pc)
         local ck = getk(st.proto, dd)
         local child
         if d.parsed and ck and ck.__type == "Closure" then child = d.parsed.Protos[(ck.Value or 0) + 1] end
-        if child then func.emit(d, st, pc, a, child, {}, st:next(pc))
+        if child then
+            local caps, nx = func.caps(st, pc, child, "dup")
+            func.emit(d, st, pc, a, child, caps, nx)
         else st:badpc(pc, "missing DUPCLOSURE proto"); st:set(pc, a, ex.atom("function(...) end", false)) end
     elseif name == "ADD" or name == "SUB" or name == "MUL" or name == "DIV" or name == "MOD" or name == "POW" or name == "IDIV" or name == "AND" or name == "OR" then
         local map = { ADD = "+", SUB = "-", MUL = "*", DIV = "/", MOD = "%", POW = "^", IDIV = "//", AND = "and", OR = "or" }
@@ -4576,31 +5240,76 @@ local config = require("main.config")
 
 local dump = {}
 
-local function accept(stat, source)
+local function accept(stat, source, info)
     stat.good += 1
-    local status = source:match('^local __lumenmeta = "LumenV4 status=([A-Z_]+)')
-    if status == "LOSSLESS_FALLBACK" or status == "VM_FALLBACK" then
-        stat.fallback += 1
-    elseif status == "STRUCTURED" then
+    info = type(info) == "table" and info or nil
+
+    local status = info and info.status or source:match("^%-%- LumenV4 status=([A-Z_]+)")
+    local reachable = info and tonumber(info.reachableInstructions) or tonumber(source:match("reachable=(%d+)")) or 0
+    local covered = info and tonumber(info.coveredInstructions) or tonumber(source:match("covered=(%d+)")) or 0
+
+    if status == "STRUCTURED" then
         stat.structured += 1
+        stat.structuredReachable += reachable
+    elseif status == "LOSSLESS_FALLBACK" then
+        stat.lossless += 1
+        stat.fallback += 1
+        stat.losslessReachable += reachable
+    elseif status == "VM_FALLBACK" then
+        stat.vm += 1
+        stat.fallback += 1
+        stat.vmReachable += reachable
     else
         stat.unknown += 1
     end
-    local reachable, covered = source:match("reachable=(%d+) covered=(%d+)")
-    stat.reachable += tonumber(reachable) or 0
-    stat.covered += tonumber(covered) or 0
-    local sb, fb = source:match("structuredBlocks=(%d+) fallbackBlocks=(%d+)")
-    stat.sblocks += tonumber(sb) or 0
-    stat.fblocks += tonumber(fb) or 0
-    stat.phis += tonumber(source:match("phis=(%d+)")) or 0
-    stat.packs += tonumber(source:match("packs=(%d+)")) or 0
-    stat.cells += tonumber(source:match("cells=(%d+)")) or 0
-    stat.objects += tonumber(source:match("objects=(%d+)")) or 0
-    stat.escaped += tonumber(source:match("escapedObjects=(%d+)")) or 0
-    stat.irreducible += tonumber(source:match("irreducible=(%d+)")) or 0
-    local bv = tonumber(source:match("bytecodeVersion=(%d+)"))
+
+    stat.reachable += reachable
+    stat.covered += covered
+
+    local blocks = info and info.cfg and info.cfg.blocks and #info.cfg.blocks or nil
+    local sb = tonumber(source:match("structuredBlocks=(%d+)")) or 0
+    local fb = tonumber(source:match("fallbackBlocks=(%d+)")) or 0
+    if info and blocks then
+        if status == "STRUCTURED" then sb, fb = blocks, 0
+        elseif status == "LOSSLESS_FALLBACK" then sb, fb = 0, blocks end
+    elseif info and status == "VM_FALLBACK" then
+        sb, fb = tonumber(info.structuredBlocks) or 0, tonumber(info.fallbackBlocks) or reachable
+    end
+    stat.sblocks += sb
+    stat.fblocks += fb
+
+    local ss = info and info.ssaSummary or nil
+    stat.phis += ss and tonumber(ss.phis) or tonumber(source:match("phis=(%d+)")) or 0
+    stat.packs += info and tonumber(info.valuePackCount) or tonumber(source:match("packs=(%d+)")) or 0
+    stat.cells += info and tonumber(info.cellCount) or tonumber(source:match("cells=(%d+)")) or 0
+    stat.objects += info and tonumber(info.objectCount) or tonumber(source:match("objects=(%d+)")) or 0
+    stat.escaped += info and tonumber(info.escapedObjects) or tonumber(source:match("escapedObjects=(%d+)")) or 0
+    stat.irreducible += info and (info.irreducible and 1 or 0) or tonumber(source:match("irreducible=(%d+)")) or 0
+
+    if info and info.captureVerified == false then stat.captureFailures += 1 end
+    local tm = info and info.timings
+    if type(tm) == "table" then
+        local cfgtime = type(tm.cfg) == "table" and tm.cfg or {}
+        local ssatime = type(tm.ssaDetail) == "table" and tm.ssaDetail or {}
+        local passes = type(tm.passes) == "table" and tm.passes or {}
+        local stage = stat.stage
+        stage.decode += tonumber(tm.decode) or 0
+        stage.cfg += tonumber(cfgtime.cfg) or tonumber(tm.graph) or 0
+        stage.dominators += tonumber(cfgtime.dominators) or 0
+        stage.postdominators += tonumber(cfgtime.postdominators) or 0
+        stage.ssa += tonumber(ssatime.ssa) or tonumber(tm.ssa) or 0
+        stage.cells += tonumber(tm.cells) or 0
+        stage.objects += tonumber(tm.objects) or 0
+        stage.packs += tonumber(ssatime.packs) or 0
+        stage.structuring += tonumber(tm.structuring) or 0
+        stage.outssa += tonumber(passes.outssa) or 0
+        stage.naming += (tonumber(passes.naming) or 0) + (tonumber(tm.symbolNaming) or 0)
+        stage.printing += tonumber(tm.printing) or 0
+        stage.verification += (tonumber(tm.verification) or 0) + (tonumber(tm.expressionVerify) or 0)
+    end
+    local bv = info and tonumber(info.bytecodeVersion) or tonumber(source:match("bytecodeVersion=(%d+)"))
     if bv then stat.versions[bv] = (stat.versions[bv] or 0) + 1 end
-    if source:find("parser=true", 1, true) then stat.syntax += 1 end
+    if info and info.syntaxValid == true or source:find("parser=true", 1, true) then stat.syntax += 1 end
 end
 
 local function rootdir()
@@ -4620,6 +5329,14 @@ local function decompfail(stat, cache, obj, err)
     elseif err:find("LumenV4: INVALID", 1, true) then stat.invalid += 1
     elseif err:find("LumenV4: UNSUPPORTED", 1, true) then stat.unsupported += 1
     else stat.other += 1 end
+    if err:find("CAPTURE_VERIFY", 1, true) then stat.captureFailures += 1 end
+    if err:find("SSA destruction", 1, true) or err:find("OUT_OF_SSA", 1, true) or err:find("SSA_DESTRUCT", 1, true) then stat.ssaFailures += 1 end
+    if err:find("unstructured", 1, true) or err:find("STRUCTURED_BUDGET", 1, true) or err:find("STRUCTURED_COMPLEXITY", 1, true) or err:find("CFG_STRUCTURE", 1, true) then stat.cfgFailures += 1 end
+    if err:find("ObjectId", 1, true) or err:find("table identity", 1, true) or err:find("OBJECT_VERIFY", 1, true) then stat.tableFailures += 1 end
+    if err:find("SCOPE_VERIFY", 1, true) then stat.scopeFailures += 1 end
+    if err:find("EXPR_VERIFY", 1, true) then stat.expressionFailures += 1 end
+    if err:find("ValuePack", 1, true) then stat.packFailures += 1 end
+    if err:find("recursion depth", 1, true) or err:find("compiler", 1, true) and err:find("VM fallback", 1, true) then stat.compilerFailures += 1 end
     cache[obj] = { success = false, error = err }
     local line = st.path(obj) .. " :: " .. err
     stat.errors[#stat.errors + 1] = line
@@ -4713,7 +5430,7 @@ local function serial(lumen, jobs, opt, stat, cache, label)
         local res = lumen:tryDecompileBytecode(job.raw, cfg)
         if res.success and type(res.source) == "string" and res.source ~= "" then
             cache[job.obj] = res.source
-            accept(stat, res.source)
+            accept(stat, res.source, res.metadata and res.metadata.details)
         else
             decompfail(stat, cache, job.obj, res.error)
         end
@@ -4730,7 +5447,7 @@ local function serial(lumen, jobs, opt, stat, cache, label)
 end
 
 local actorcode = [[
-local id, src, vendor, smart, funcs, guards, fold, conds, blocks = ...
+local id, src, vendor, smart, funcs, guards, fold, conds, blocks, fidelity, structuredBudget, structuredMax, structuredProtoMax, structuredBlocks = ...
 local ch = get_comm_channel(id)
 local genv = type(getgenv) == "function" and getgenv() or _G
 local okv, v = pcall(function()
@@ -4766,6 +5483,11 @@ local dec = {
     fold = fold,
     conditions = conds,
     doblocks = blocks,
+    fidelity = fidelity,
+    structuredbudget = structuredBudget,
+    structuredmaxinstructions = structuredMax,
+    structuredmaxprotoinstructions = structuredProtoMax,
+    structuredmaxblocks = structuredBlocks,
 }
 local con
 con = ch.Event:Connect(function(kind, jid, raw)
@@ -4774,11 +5496,11 @@ con = ch.Event:Connect(function(kind, jid, raw)
         return
     end
     if kind ~= "job" then return end
-    local good, out = pcall(function() return api:decompileBytecode(raw, dec) end)
+    local good, out, meta = pcall(function() return api:decompileBytecode(raw, dec) end)
     if good and type(out) == "string" and out ~= "" then
-        ch:Fire("done", jid, true, out)
+        ch:Fire("done", jid, true, out, meta and meta.details)
     else
-        ch:Fire("done", jid, false, tostring(out))
+        ch:Fire("done", jid, false, tostring(out), nil)
     end
 end)
 ch:Fire("boot", true, "")
@@ -4833,16 +5555,16 @@ local function actors(lumen, jobs, opt, stat, cache)
         if #live >= want then break end
         local id, ch = create_comm_channel()
         local w = { id = id, ch = ch, actor = actor, ready = false, dead = false, busy = false, sent = 0 }
-        w.con = ch.Event:Connect(function(kind, a, b, c)
+        w.con = ch.Event:Connect(function(kind, a, b, c, d)
             if kind == "boot" then
                 if a then w.ready = true else w.dead = true; w.err = tostring(b) end
             elseif kind == "done" then
                 qtail += 1
-                q[qtail] = { w = w, jid = a, ok = b, out = c }
+                q[qtail] = { w = w, jid = a, ok = b, out = c, info = d }
             end
         end)
         ws[#ws + 1] = w
-        local rok, rerr = pcall(run_on_actor, actor, actorcode, id, src, vendor, dc.smartnames ~= false, dc.functions ~= false, dc.guards ~= false, dc.fold ~= false, dc.conditions ~= false, dc.doblocks or 0)
+        local rok, rerr = pcall(run_on_actor, actor, actorcode, id, src, vendor, dc.smartnames ~= false, dc.functions ~= false, dc.guards ~= false, dc.fold ~= false, dc.conditions ~= false, dc.doblocks or 0, dc.fidelity ~= false, dc.structuredbudget, dc.structuredmaxinstructions, dc.structuredmaxprotoinstructions, dc.structuredmaxblocks)
         if not rok then
             w.dead = true
             w.err = tostring(rerr)
@@ -4906,7 +5628,7 @@ local function actors(lumen, jobs, opt, stat, cache)
                 local job = jobs[jid]
                 if r.ok and type(r.out) == "string" and r.out ~= "" then
                     cache[job.obj] = r.out
-                    accept(stat, r.out)
+                    accept(stat, r.out, r.info)
                 else
                     retry[#retry + 1] = job
                 end
@@ -4959,7 +5681,7 @@ local function actors(lumen, jobs, opt, stat, cache)
                 local res = lumen:tryDecompileBytecode(job.raw, cfg)
                 if res.success and type(res.source) == "string" and res.source ~= "" then
                     cache[job.obj] = res.source
-                    accept(stat, res.source)
+                    accept(stat, res.source, res.metadata and res.metadata.details)
                 else
                     decompfail(stat, cache, job.obj, res.error)
                 end
@@ -5037,11 +5759,27 @@ local function summary(root, stat)
         "Bytecode available: " .. tostring(stat.available),
         "Accepted source (syntax + origin coverage): " .. tostring(stat.good),
         "Structured accepted: " .. tostring(stat.structured),
+        "Lossless fallback accepted: " .. tostring(stat.lossless),
+        "VM fallback accepted: " .. tostring(stat.vm),
         "Lossless/VM fallback accepted: " .. tostring(stat.fallback),
+        "Reachable instructions structured: " .. tostring(stat.structuredReachable),
+        "Reachable instructions lossless fallback: " .. tostring(stat.losslessReachable),
+        "Reachable instructions VM fallback: " .. tostring(stat.vmReachable),
+        "Structured instruction %: " .. (stat.reachable > 0 and string.format("%.2f%%", stat.structuredReachable * 100 / stat.reachable) or "0.00%"),
+        "Lossless instruction %: " .. (stat.reachable > 0 and string.format("%.2f%%", stat.losslessReachable * 100 / stat.reachable) or "0.00%"),
+        "VM instruction %: " .. (stat.reachable > 0 and string.format("%.2f%%", stat.vmReachable * 100 / stat.reachable) or "0.00%"),
         "Partial: " .. tostring(stat.partial),
         "Invalid output: " .. tostring(stat.invalid),
         "Unsupported: " .. tostring(stat.unsupported),
         "Other failures: " .. tostring(stat.other),
+        "Capture verifier failures: " .. tostring(stat.captureFailures),
+        "SSA destruction failures: " .. tostring(stat.ssaFailures),
+        "CFG structuring/complexity failures: " .. tostring(stat.cfgFailures),
+        "Table identity failures: " .. tostring(stat.tableFailures),
+        "ValuePack failures: " .. tostring(stat.packFailures),
+        "Scope verifier failures: " .. tostring(stat.scopeFailures),
+        "Expression verifier failures: " .. tostring(stat.expressionFailures),
+        "Compiler-size fallback failures: " .. tostring(stat.compilerFailures),
         "Syntax-valid source: " .. tostring(stat.syntax) .. "/" .. tostring(stat.good),
         "Reachable instruction coverage: " .. (stat.reachable > 0 and string.format("%.2f%%", stat.covered * 100 / stat.reachable) or "100.00%"),
         "Structured blocks: " .. tostring(stat.sblocks),
@@ -5068,6 +5806,20 @@ local function summary(root, stat)
         "ConstantFolding: " .. tostring(stat.decompiler and stat.decompiler.fold ~= false),
         "ConditionalStructurer: " .. tostring(stat.decompiler and stat.decompiler.conditions ~= false),
         "DoBlockInsertionThreshold: " .. tostring(stat.decompiler and stat.decompiler.doblocks or 0),
+        "FidelityMode: " .. tostring(stat.decompiler and stat.decompiler.fidelity ~= false),
+        "Stage decode seconds: " .. string.format("%.3f", stat.stage.decode or 0),
+        "Stage cfg seconds: " .. string.format("%.3f", stat.stage.cfg or 0),
+        "Stage dominators seconds: " .. string.format("%.3f", stat.stage.dominators or 0),
+        "Stage postdominators seconds: " .. string.format("%.3f", stat.stage.postdominators or 0),
+        "Stage SSA seconds: " .. string.format("%.3f", stat.stage.ssa or 0),
+        "Stage CellId seconds: " .. string.format("%.3f", stat.stage.cells or 0),
+        "Stage ObjectId seconds: " .. string.format("%.3f", stat.stage.objects or 0),
+        "Stage ValuePack seconds: " .. string.format("%.3f", stat.stage.packs or 0),
+        "Stage structuring seconds: " .. string.format("%.3f", stat.stage.structuring or 0),
+        "Stage out-of-SSA seconds: " .. string.format("%.3f", stat.stage.outssa or 0),
+        "Stage naming seconds: " .. string.format("%.3f", stat.stage.naming or 0),
+        "Stage printing seconds: " .. string.format("%.3f", stat.stage.printing or 0),
+        "Stage verification seconds: " .. string.format("%.3f", stat.stage.verification or 0),
         "Acquire seconds: " .. string.format("%.3f", stat.acquireTime or 0),
         "Acquire batch: " .. tostring(stat.acquireBatch or 0),
         "Acquire budget ms: " .. string.format("%.2f", stat.acquireBudgetMs or 0),
@@ -5101,8 +5853,21 @@ function dump.run(lumen, opt)
         available = 0,
         good = 0,
         structured = 0,
+        lossless = 0,
+        vm = 0,
         fallback = 0,
         unknown = 0,
+        structuredReachable = 0,
+        losslessReachable = 0,
+        vmReachable = 0,
+        captureFailures = 0,
+        ssaFailures = 0,
+        cfgFailures = 0,
+        tableFailures = 0,
+        packFailures = 0,
+        scopeFailures = 0,
+        expressionFailures = 0,
+        compilerFailures = 0,
         partial = 0,
         invalid = 0,
         unsupported = 0,
@@ -5142,6 +5907,7 @@ function dump.run(lumen, opt)
         rate = 0,
         parallel = 1,
         decompiler = config(decopt(opt)),
+        stage = { decode = 0, cfg = 0, dominators = 0, postdominators = 0, ssa = 0, cells = 0, objects = 0, packs = 0, structuring = 0, outssa = 0, naming = 0, printing = 0, verification = 0 },
     }
     local made = {}
     tree.mkall(root, made)
@@ -5249,7 +6015,7 @@ function dump.auto(lumen, boot)
     local writebudget = tonumber(val("WriteBudgetMs")) or 8
     local dopt = val("DecompilerOptions")
     if type(dopt) ~= "table" then dopt = {} end
-    local names = { "SmartVariableRenamer", "FunctionDeclarations", "GuardClauses", "ConstantFolding", "ConditionalStructurer", "DoBlockInsertionThreshold" }
+    local names = { "SmartVariableRenamer", "FunctionDeclarations", "GuardClauses", "ConstantFolding", "ConditionalStructurer", "DoBlockInsertionThreshold", "FidelityMode", "StructuredBudgetSeconds", "StructuredMaxInstructions", "StructuredMaxProtoInstructions", "StructuredMaxBlocks" }
     for _, name in ipairs(names) do
         local v = val(name)
         if v ~= nil then dopt[name] = v end
@@ -5405,7 +6171,7 @@ local function analyzecells(out, check)
         end
     end
 
-    local valuecells, closesites = {}, {}
+    local valuecells, closesites, celluse, celldef, closevalue = {}, {}, {}, {}, {}
     local function markvalue(version, set)
         if not version or not set or not next(set) then return end
         local dst = valuecells[version]
@@ -5415,6 +6181,8 @@ local function analyzecells(out, check)
 
     for _, b in ipairs(out.cfg.blocks) do
         local state = copystate(instate[b.id])
+        local current = {}
+        for r, version in pairs(out.ssa.inVersions[b.id] or {}) do current[r] = version end
         for _, pc in ipairs(b.pcs) do
             local op = out.proto.Instructions[pc]
             local name = ins.name(op)
@@ -5427,12 +6195,27 @@ local function analyzecells(out, check)
                 set[capturecell[pc]] = true
             end
 
-            for r, version in pairs(uses) do markvalue(version, state[r]) end
-            for r, version in pairs(defs) do markvalue(version, state[r]) end
+            for r, version in pairs(uses) do
+                markvalue(version, state[r])
+                if state[r] and next(state[r]) then
+                    local m = celluse[pc]; if not m then m = {}; celluse[pc] = m end
+                    m[r] = copyset(state[r])
+                end
+            end
+            for r, version in pairs(defs) do
+                markvalue(version, state[r])
+                if state[r] and next(state[r]) then
+                    local m = celldef[pc]; if not m then m = {}; celldef[pc] = m end
+                    m[r] = copyset(state[r])
+                end
+                current[r] = version
+            end
 
             if name == "CLOSEUPVALS" then
                 for r, set in pairs(state) do
                     if r >= (op.A or 0) then
+                        local cm = closevalue[pc]; if not cm then cm = {}; closevalue[pc] = cm end
+                        cm[r] = { value = current[r], cells = copyset(set) }
                         for cid in pairs(set) do
                             local list = closesites[cid]
                             if not list then list = {}; closesites[cid] = list end
@@ -5460,11 +6243,10 @@ local function analyzecells(out, check)
         local first
         for cid in pairs(set or {}) do if first then join(first, cid) else first = cid end end
     end
-    for _, set in pairs(valuecells) do joinset(set) end
     for _, state in pairs(instate) do for _, set in pairs(state) do joinset(set) end end
     for _, state in pairs(outstate) do for _, set in pairs(state) do joinset(set) end end
 
-    local cells, cellofvalue = {}, {}
+    local cells, cellofvalue, cellsets = {}, {}, {}
     for pc, cid in pairs(capturecell) do
         local rid = root(cid)
         capturecell[pc] = rid
@@ -5473,13 +6255,43 @@ local function analyzecells(out, check)
         c.captures[#c.captures + 1] = pc
     end
     for version, set in pairs(valuecells) do
-        local rid
-        for cid in pairs(set) do rid = root(cid); break end
-        if rid then
-            cellofvalue[version] = rid
+        local roots, count, only = {}, 0, nil
+        for cid in pairs(set) do
+            local rid = root(cid)
+            if not roots[rid] then roots[rid] = true; count += 1; only = rid end
+        end
+        cellsets[version] = roots
+        if count == 1 then cellofvalue[version] = only end
+        for rid in pairs(roots) do
             local c = cells[rid]
             if not c then c = { id = rid, reg = capturereg[rid], captures = {}, closes = {}, values = {} }; cells[rid] = c end
             c.values[version] = true
+        end
+    end
+
+    local function rootmap(source)
+        local outmap = {}
+        for pc, regsmap in pairs(source) do
+            local pm = {}; outmap[pc] = pm
+            for r, set in pairs(regsmap) do
+                local rid
+                for cid in pairs(set) do
+                    local nextid = root(cid)
+                    if rid and rid ~= nextid then error("LumenV4: CellId point state contains distinct cells", 2) end
+                    rid = nextid
+                end
+                if rid then pm[r] = rid end
+            end
+        end
+        return outmap
+    end
+    celluse = rootmap(celluse)
+    celldef = rootmap(celldef)
+    for pc, regsmap in pairs(closevalue) do
+        for _, rec in pairs(regsmap) do
+            local roots = {}
+            for cid in pairs(rec.cells or {}) do roots[root(cid)] = true end
+            rec.cells = roots
         end
     end
     for cid, sites in pairs(closesites) do
@@ -5491,6 +6303,10 @@ local function analyzecells(out, check)
 
     out.cells = cells
     out.cellOfValue = cellofvalue
+    out.cellSetsByValue = cellsets
+    out.cellUse = celluse
+    out.cellDef = celldef
+    out.cellCloseValue = closevalue
     out.captureCell = capturecell
     out.cellInState = instate
     out.cellOutState = outstate
@@ -5581,9 +6397,24 @@ local function analyzeobjects(out, check)
         end
     end
 
+    for value, os in pairs(sets) do
+        assert(out.vals[value] ~= nil, "LumenV4: OBJECT_VERIFY set references unknown SSA value")
+        for oid in pairs(os) do assert(objects[oid] ~= nil, "LumenV4: OBJECT_VERIFY set references unknown ObjectId") end
+    end
+    for oid, obj in pairs(objects) do
+        local op = out.proto.Instructions[obj.allocPC]
+        local name = op and ins.name(op) or nil
+        assert(name == "NEWTABLE" or name == "DUPTABLE" or name == "NEWCLASS", "LumenV4: OBJECT_VERIFY ObjectId has invalid allocation")
+        assert(obj.id == oid, "LumenV4: OBJECT_VERIFY ObjectId mismatch")
+        for value in pairs(obj.aliases or {}) do
+            assert(sets[value] and sets[value][oid], "LumenV4: OBJECT_VERIFY alias does not point back to object")
+        end
+    end
+
     out.objectSets = sets
     out.objects = objects
     out.objectIterations = iterations
+    out.objectVerified = true
     function out:objectIds(valueid) return self.objectSets[self:resolve(valueid)] or {} end
     function out:objectId(valueid)
         local one
@@ -5594,8 +6425,9 @@ local function analyzeobjects(out, check)
 end
 
 function build.run(proto, check, limits)
-    local cfg = graph.build(proto, check, limits)
-    local flow = ssa.build(proto, cfg, check, limits)
+    local timings = {}
+    local t = os.clock(); local cfg = graph.build(proto, check, limits); timings.graph = os.clock() - t
+    t = os.clock(); local flow = ssa.build(proto, cfg, check, limits); timings.ssa = os.clock() - t
     assert(flow.converged, "LumenV4: refusing non-converged SSA")
     local out = fn.new(proto, cfg, flow)
     for id, src in ipairs(flow.versions) do
@@ -5621,8 +6453,11 @@ function build.run(proto, check, limits)
         end
     end
     out:reindex()
-    analyzecells(out, check)
-    analyzeobjects(out, check)
+    t = os.clock(); analyzecells(out, check); timings.cells = os.clock() - t
+    t = os.clock(); analyzeobjects(out, check); timings.objects = os.clock() - t
+    out.timings = timings
+    out.timings.cfg = cfg.timings or {}
+    out.timings.ssaDetail = flow.timings or {}
     return out
 end
 return build
@@ -6274,13 +7109,17 @@ function opt.new()
         ConstantFolding = true,
         ConditionalStructurer = true,
         DoBlockInsertionThreshold = 0,
+        FidelityMode = true,
+        StructuredBudgetSeconds = 1.25,
+        StructuredMaxInstructions = 32000,
+        StructuredMaxProtoInstructions = 16000,
+        StructuredMaxBlocks = 1024,
     }
 end
 
 return opt
 ]===],
-    ["main.output.expr"] = [===[
-local expr = {}
+    ["main.output.expr"] = [===[local expr = {}
 
 local prec = {
     ["or"] = 1,
@@ -6301,53 +7140,103 @@ local prec = {
     ["^"] = 8,
 }
 
-local function node(s, p, stable, kind, a, b, op)
-    return { s = s, p = p or 99, stable = stable == true, kind = kind, a = a, b = b, op = op }
-end
-
-local function text(v)
-    return type(v) == "table" and v.s or tostring(v)
-end
-
-local function wrap(v, p, right, op)
+local function render(v)
     if type(v) ~= "table" then return tostring(v) end
-    if v.p < p then return "(" .. v.s .. ")" end
-    if v.p == p then
-        if p == 3 then return "(" .. v.s .. ")" end
-        if op == "^" and not right then return "(" .. v.s .. ")" end
-        if op == ".." and not right then return "(" .. v.s .. ")" end
-        if right and op ~= "^" and op ~= ".." then return "(" .. v.s .. ")" end
+    local kind = v.kind
+    if kind == "atom" or kind == "raw" or kind == "literal" or kind == "local" or kind == "global" then
+        return tostring(v.value or "")
+    elseif kind == "bin" then
+        local p = v.p
+        local function wrap(x, right)
+            if type(x) ~= "table" then return tostring(x) end
+            local text = render(x)
+            if x.p < p then return "(" .. text .. ")" end
+            if x.p == p then
+                if p == 3 then return "(" .. text .. ")" end
+                if v.op == "^" and not right then return "(" .. text .. ")" end
+                if v.op == ".." and not right then return "(" .. text .. ")" end
+                if right and v.op ~= "^" and v.op ~= ".." then return "(" .. text .. ")" end
+            end
+            return text
+        end
+        return wrap(v.a, false) .. " " .. v.op .. " " .. wrap(v.b, true)
+    elseif kind == "un" then
+        local a = render(v.a)
+        if type(v.a) == "table" and v.a.p < v.p then a = "(" .. a .. ")" end
+        return v.op == "not" and ("not " .. a) or (v.op .. a)
+    elseif kind == "prop" then
+        local a = render(v.a)
+        if type(v.a) == "table" and v.a.p < 9 then a = "(" .. a .. ")" end
+        return a .. tostring(v.field or "")
+    elseif kind == "call" then
+        local fn = render(v.fn)
+        if type(v.fn) == "table" and v.fn.p < 9 then fn = "(" .. fn .. ")" end
+        if v.method then fn = fn .. ":" .. tostring(v.method) end
+        local args = {}
+        for i, arg in ipairs(v.args or {}) do args[i] = render(arg) end
+        return fn .. "(" .. table.concat(args, ", ") .. ")"
+    elseif kind == "table" then
+        local out = {}
+        for _, field in ipairs(v.fields or {}) do
+            if field.kind == "list" then
+                out[#out + 1] = render(field.value)
+            elseif field.kind == "field" then
+                out[#out + 1] = tostring(field.key) .. " = " .. render(field.value)
+            else
+                out[#out + 1] = "[" .. tostring(field.key) .. "] = " .. render(field.value)
+            end
+        end
+        return #out == 0 and "{}" or ("{ " .. table.concat(out, ", ") .. " }")
     end
-    return v.s
+    error("LumenV4: EXPR_VERIFY unknown semantic expression kind " .. tostring(kind), 2)
+end
+
+local function node(kind, p, stable, data)
+    local out = { kind = kind, p = p or 99, stable = stable == true }
+    for k, v in pairs(data or {}) do out[k] = v end
+    out.s = render(out)
+    return out
 end
 
 function expr.atom(s, stable)
-    return node(s, 99, stable, "atom")
+    return node("atom", 99, stable, { value = s })
+end
+
+function expr.raw(s, stable)
+    return node("raw", 99, stable, { value = s })
+end
+
+function expr.literal(s)
+    return node("literal", 99, true, { value = s })
+end
+
+function expr.localref(symbol, name)
+    return node("local", 99, false, { symbol = symbol, value = name })
+end
+
+function expr.global(name)
+    return node("global", 99, false, { value = name })
 end
 
 function expr.bin(a, op, b)
     local p = prec[op] or 5
-    return node(wrap(a, p, false, op) .. " " .. op .. " " .. wrap(b, p, true, op), p, a.stable and b.stable, "bin", a, b, op)
+    return node("bin", p, type(a) == "table" and a.stable and type(b) == "table" and b.stable, { a = a, b = b, op = op })
 end
 
 function expr.un(op, a)
-    local p = 7
-    local s = type(a) == "table" and (a.p < p and "(" .. a.s .. ")" or a.s) or tostring(a)
-    if op == "not" then
-        return node("not " .. s, p, a.stable, "un", a, nil, op)
-    end
-    return node(op .. s, p, a.stable, "un", a, nil, op)
+    return node("un", 7, type(a) == "table" and a.stable, { a = a, op = op })
 end
 
 function expr.prop(a, field)
-    local base = type(a) == "table" and (a.p < 9 and "(" .. a.s .. ")" or a.s) or tostring(a)
-    return node(base .. field, 10, false, "prop", a, field)
+    return node("prop", 10, false, { a = a, field = field })
 end
 
 function expr.call(fn, args, method)
-    local base = type(fn) == "table" and (fn.p < 9 and "(" .. fn.s .. ")" or fn.s) or tostring(fn)
-    if method then base = base .. ":" .. method end
-    return node(base .. "(" .. table.concat(args, ", ") .. ")", 10, false, "call", fn, args, method)
+    return node("call", 10, false, { fn = fn, args = args or {}, method = method })
+end
+
+function expr.table(fields)
+    return node("table", 99, false, { fields = fields or {} })
 end
 
 function expr.join(list, op)
@@ -6357,9 +7246,42 @@ function expr.join(list, op)
 end
 
 function expr.str(v)
-    return text(v)
+    return render(v)
 end
 
+local function verify(v, seen)
+    if type(v) ~= "table" then return true end
+    seen = seen or {}
+    if seen[v] then return true end
+    seen[v] = true
+    local kind = v.kind
+    if kind == "local" then
+        assert(v.symbol ~= nil, "LumenV4: EXPR_VERIFY local expression has no SymbolId")
+        assert(type(v.value) == "string" and v.value ~= "", "LumenV4: EXPR_VERIFY local expression has no display name")
+    elseif kind == "global" or kind == "literal" or kind == "atom" or kind == "raw" then
+        assert(v.value ~= nil, "LumenV4: EXPR_VERIFY atom has no value")
+    elseif kind == "bin" then
+        assert(v.op and v.a ~= nil and v.b ~= nil, "LumenV4: EXPR_VERIFY malformed binary expression")
+        verify(v.a, seen); verify(v.b, seen)
+    elseif kind == "un" then
+        assert(v.op and v.a ~= nil, "LumenV4: EXPR_VERIFY malformed unary expression")
+        verify(v.a, seen)
+    elseif kind == "prop" then
+        assert(v.a ~= nil and v.field ~= nil, "LumenV4: EXPR_VERIFY malformed property expression")
+        verify(v.a, seen)
+    elseif kind == "call" then
+        assert(v.fn ~= nil and type(v.args) == "table", "LumenV4: EXPR_VERIFY malformed call expression")
+        verify(v.fn, seen); for _, a in ipairs(v.args) do verify(a, seen) end
+    elseif kind == "table" then
+        for _, field in ipairs(v.fields or {}) do assert(field.value ~= nil, "LumenV4: EXPR_VERIFY table field has no value"); verify(field.value, seen) end
+    else
+        error("LumenV4: EXPR_VERIFY unknown expression kind " .. tostring(kind), 2)
+    end
+    assert(render(v) == v.s, "LumenV4: EXPR_VERIFY cached rendering diverged from semantic tree")
+    return true
+end
+
+expr.verify = verify
 return expr
 ]===],
     ["main.output.literals"] = [===[
@@ -6740,7 +7662,8 @@ function pass.run(ir, check)
     for id, v in pairs(ir.vals) do
         if check then check() end
         id = ir:resolve(id)
-        if id and not ir.dead[id] and v.kind == "def" and not mutable[id] then
+        local protected = id and ir.outssa and ir.outssa.materialize and ir.outssa.materialize[id]
+        if id and not ir.dead[id] and v.kind == "def" and not mutable[id] and not protected then
             local u = ir:only(id)
             local n = v.pc and ir.bypc[v.pc]
             if u and u.pc and n and ir.cfg.blockmap[v.pc] == ir.cfg.blockmap[u.pc] then
@@ -6757,7 +7680,8 @@ function pass.run(ir, check)
 
     for id in pairs(ir.const) do
         id = ir:resolve(id)
-        if id and not mutable[id] then
+        local protected = id and ir.outssa and ir.outssa.materialize and ir.outssa.materialize[id]
+        if id and not mutable[id] and not protected then
             local ok = ir:count(id) > 0
             for _, u in ipairs(ir:uses(id) or {}) do
                 local useop = u.pc and ir.bypc[u.pc] or nil
@@ -6771,40 +7695,449 @@ end
 
 return pass
 ]===],
-    ["main.passes.names"] = [===[
-local pass = {}
+    ["main.passes.names"] = [===[local pass = {}
 
-function pass.run(ir)
-    local parent = {}
+local function copyset(src)
+    local out = {}
+    for k in pairs(src or {}) do out[k] = true end
+    return out
+end
+
+local function seteq(a, b)
+    a, b = a or {}, b or {}
+    for k in pairs(a) do if not b[k] then return false end end
+    for k in pairs(b) do if not a[k] then return false end end
+    return true
+end
+
+local function union(dst, src)
+    for k in pairs(src or {}) do dst[k] = true end
+end
+
+local function addpair(graph, a, b)
+    if not a or not b or a == b then return end
+    local ga = graph[a]
+    if not ga then ga = {}; graph[a] = ga end
+    local gb = graph[b]
+    if not gb then gb = {}; graph[b] = gb end
+    ga[b] = true
+    gb[a] = true
+end
+
+local function cellmap(ir)
+    local out = {}
+    for raw, set in pairs(ir.cellSetsByValue or {}) do
+        local id = ir:resolve(raw)
+        if id then
+            local count, only = 0, nil
+            for cid in pairs(set or {}) do count += 1; only = cid end
+            local marker = count == 1 and only or (count > 1 and ("multi:" .. tostring(id)) or nil)
+            if marker then
+                local old = out[id]
+                if old and old ~= marker then
+                    error(("LumenV4: SSA_DESTRUCT value v%d aliases incompatible CellIds %s/%s"):format(id, tostring(old), tostring(marker)), 2)
+                end
+                out[id] = marker
+            end
+        end
+    end
+    for raw, cid in pairs(ir.cellOfValue or {}) do
+        local id = ir:resolve(raw)
+        if id and out[id] == nil then out[id] = cid end
+    end
+    return out
+end
+
+local function buildliveness(ir)
+    local cfg = ir.cfg
+    local use, def, phidef, edgeuse = {}, {}, {}, {}
+
+    for _, block in ipairs(cfg.blocks) do
+        local bid = block.id
+        local u, d, pd = {}, {}, {}
+        local phis = ir.phis[bid]
+        if phis then
+            for _, phi in pairs(phis) do
+                local id = ir:resolve(phi.id)
+                if id and not ir.dead[id] and ir:count(id) > 0 then
+                    d[id] = true
+                    pd[id] = true
+                end
+            end
+        end
+
+        for _, pc in ipairs(block.pcs) do
+            local uses = ir.ssa.usesByPC[pc]
+            if uses then
+                for _, raw in pairs(uses) do
+                    local id = ir:resolve(raw)
+                    if id and not ir.dead[id] and not d[id] then u[id] = true end
+                end
+            end
+            local defs = ir.ssa.defsByPC[pc]
+            if defs then
+                for _, raw in pairs(defs) do
+                    local id = ir:resolve(raw)
+                    if id and not ir.dead[id] then d[id] = true end
+                end
+            end
+        end
+        use[bid], def[bid], phidef[bid] = u, d, pd
+    end
+
+    for succ, phis in pairs(ir.phis) do
+        for _, phi in pairs(phis) do
+            local dst = ir:resolve(phi.id)
+            if dst and not ir.dead[dst] and ir:count(dst) > 0 then
+                for pred, raw in pairs(phi.incoming or {}) do
+                    local id = ir:resolve(raw)
+                    if id and not ir.dead[id] then
+                        local bypred = edgeuse[pred]
+                        if not bypred then bypred = {}; edgeuse[pred] = bypred end
+                        local set = bypred[succ]
+                        if not set then set = {}; bypred[succ] = set end
+                        set[id] = true
+                    end
+                end
+            end
+        end
+    end
+
+    local lin, lout = {}, {}
+    for _, block in ipairs(cfg.blocks) do lin[block.id], lout[block.id] = {}, {} end
+
+    local changed, iterations = true, 0
+    local limit = math.max(64, #cfg.blocks * 512)
+    while changed do
+        iterations += 1
+        if iterations > limit then error("LumenV4: SSA_DESTRUCT liveness failed to converge", 2) end
+        changed = false
+        for i = #cfg.blocks, 1, -1 do
+            local block = cfg.blocks[i]
+            local bid = block.id
+            local out = {}
+            for _, succ in ipairs(block.successors) do
+                local sin = lin[succ] or {}
+                local spd = phidef[succ] or {}
+                for id in pairs(sin) do if not spd[id] then out[id] = true end end
+                local eu = edgeuse[bid] and edgeuse[bid][succ]
+                union(out, eu)
+            end
+            local inn = copyset(use[bid])
+            for id in pairs(out) do if not def[bid][id] then inn[id] = true end end
+            if not seteq(lout[bid], out) then lout[bid] = out; changed = true end
+            if not seteq(lin[bid], inn) then lin[bid] = inn; changed = true end
+        end
+    end
+
+    return {
+        use = use,
+        def = def,
+        phiDef = phidef,
+        edgeUse = edgeuse,
+        liveIn = lin,
+        liveOut = lout,
+        iterations = iterations,
+    }
+end
+
+local function interference(ir, live)
+    local graph = {}
+    for id in pairs(ir.vals) do graph[id] = graph[id] or {} end
+
+    for _, block in ipairs(ir.cfg.blocks) do
+        local now = copyset(live.liveOut[block.id])
+
+        for i = #block.pcs, 1, -1 do
+            local pc = block.pcs[i]
+            local defs = {}
+            for _, raw in pairs(ir.ssa.defsByPC[pc] or {}) do
+                local id = ir:resolve(raw)
+                if id and not ir.dead[id] then defs[id] = true end
+            end
+            for d in pairs(defs) do
+                for v in pairs(now) do addpair(graph, d, v) end
+            end
+            for d in pairs(defs) do now[d] = nil end
+            for _, raw in pairs(ir.ssa.usesByPC[pc] or {}) do
+                local id = ir:resolve(raw)
+                if id and not ir.dead[id] then now[id] = true end
+            end
+        end
+
+        local phis = ir.phis[block.id]
+        if phis then
+            local pdefs, incoming = {}, {}
+            for _, phi in pairs(phis) do
+                local d = ir:resolve(phi.id)
+                if d and not ir.dead[d] and ir:count(d) > 0 then
+                    pdefs[d] = true
+                    for _, raw in pairs(phi.incoming or {}) do
+                        local id = ir:resolve(raw)
+                        if id then incoming[id] = true end
+                    end
+                end
+            end
+            for d in pairs(pdefs) do
+                for v in pairs(now) do
+                    if not incoming[v] then addpair(graph, d, v) end
+                end
+                for other in pairs(pdefs) do addpair(graph, d, other) end
+            end
+        end
+    end
+
+    return graph
+end
+
+local function coalesce(ir, graph, cells)
+    local parent, members, groupcell = {}, {}, {}
+
+    for id in pairs(ir.vals) do
+        id = ir:resolve(id)
+        if id and not parent[id] then
+            parent[id] = id
+            members[id] = { [id] = true }
+            groupcell[id] = cells[id]
+        end
+    end
 
     local function root(x)
         x = ir:resolve(x)
         if not x then return nil end
         local p = parent[x]
-        if not p then parent[x] = x return x end
+        if not p then
+            parent[x], members[x], groupcell[x] = x, { [x] = true }, cells[x]
+            return x
+        end
         if p ~= x then parent[x] = root(p) end
         return parent[x]
     end
 
-    local function join(a, b)
-        a, b = root(a), root(b)
-        if a and b and a ~= b then parent[b] = a end
+    local function compatible(a, b)
+        local ca, cb = groupcell[a], groupcell[b]
+        return ca == cb or (ca == nil and cb == nil)
     end
 
-    for id in pairs(ir.vals) do parent[id] = id end
+    local function conflicts(a, b)
+        for x in pairs(members[a]) do
+            local gx = graph[x]
+            if gx then
+                for y in pairs(members[b]) do if gx[y] then return true end end
+            end
+        end
+        return false
+    end
 
-    for _, phis in pairs(ir.phis) do
-        for _, p in pairs(phis) do
-            local pid = ir:resolve(p.id)
-            if pid and not ir.dead[pid] and ir:count(pid) > 0 then
-                for raw in pairs(p.inputs or {}) do join(pid, raw) end
+    local function join(a, b)
+        a, b = root(a), root(b)
+        if not a or not b or a == b then return true end
+        local av, bv = ir.vals[a], ir.vals[b]
+        if (av and av.kind == "undef") or (bv and bv.kind == "undef") then return false end
+        if not compatible(a, b) or conflicts(a, b) then return false end
+        local keep, drop = a, b
+        if drop < keep then keep, drop = drop, keep end
+        parent[drop] = keep
+        for id in pairs(members[drop]) do members[keep][id] = true end
+        members[drop] = nil
+        groupcell[keep] = groupcell[keep] or groupcell[drop]
+        groupcell[drop] = nil
+        return true
+    end
+
+    local candidates = {}
+    for bid, phis in pairs(ir.phis) do
+        for reg, phi in pairs(phis) do
+            local dst = ir:resolve(phi.id)
+            if dst and not ir.dead[dst] and ir:count(dst) > 0 then
+                local preds = {}
+                for pred in pairs(phi.incoming or {}) do preds[#preds + 1] = pred end
+                table.sort(preds)
+                for _, pred in ipairs(preds) do
+                    local src = ir:resolve(phi.incoming[pred])
+                    if src and not ir.dead[src] then
+                        candidates[#candidates + 1] = { kind = "phi", dst = dst, src = src, bid = bid, pred = pred, reg = reg }
+                    end
+                end
             end
         end
     end
 
-    local fam = {}
-    for id in pairs(ir.vals) do fam[id] = root(id) end
-    ir.family = fam
+    for _, n in ipairs(ir.ops or {}) do
+        if n.name == "MOVE" then
+            local dst = ir:def(n.pc, n.op.A)
+            local src = ir:use(n.pc, n.op.B)
+            if dst and src and dst ~= src then
+                candidates[#candidates + 1] = { kind = "move", dst = dst, src = src, pc = n.pc }
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        if a.kind ~= b.kind then return a.kind == "phi" end
+        local ap, bp = a.pc or (a.bid * 65536 + a.pred), b.pc or (b.bid * 65536 + b.pred)
+        return ap < bp
+    end)
+
+    local merged = 0
+    for _, c in ipairs(candidates) do if join(c.dst, c.src) then merged += 1 end end
+
+    local family = {}
+    for id in pairs(ir.vals) do
+        local rid = ir:resolve(id)
+        if rid then family[id] = root(rid) end
+    end
+
+    return family, root, members, merged
+end
+
+local function buildcopies(ir, family)
+    local edge = {}
+    local count = 0
+
+    for succ, phis in pairs(ir.phis) do
+        local block = ir.cfg.blocks[succ]
+        if block then
+            for reg, phi in pairs(phis) do
+                local dst = ir:resolve(phi.id)
+                if dst and not ir.dead[dst] and ir:count(dst) > 0 then
+                    local df = family[dst] or dst
+                    for _, pred in ipairs(block.predecessors) do
+                        local raw = phi.incoming and phi.incoming[pred]
+                        local src = raw and ir:resolve(raw) or nil
+                        local sf = src and (family[src] or src) or nil
+                        if sf ~= df then
+                            local bypred = edge[pred]
+                            if not bypred then bypred = {}; edge[pred] = bypred end
+                            local list = bypred[succ]
+                            if not list then list = {}; bypred[succ] = list end
+                            list[#list + 1] = {
+                                dst = df,
+                                src = sf,
+                                dstValue = dst,
+                                srcValue = src,
+                                reg = reg,
+                                phi = phi.id,
+                                undef = src and ir.vals[src] and ir.vals[src].kind == "undef" or src == nil,
+                            }
+                            count += 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    for _, bysucc in pairs(edge) do
+        for _, list in pairs(bysucc) do
+            table.sort(list, function(a, b)
+                if a.reg ~= b.reg then return a.reg < b.reg end
+                return (a.dst or 0) < (b.dst or 0)
+            end)
+        end
+    end
+    return edge, count
+end
+
+local function verify(ir, outssa)
+    local family = outssa.family
+    local graph = outssa.interference
+    local cells = outssa.cells
+
+    local seenfamilies = {}
+    for id in pairs(ir.vals) do
+        local rid = ir:resolve(id)
+        if rid and family[rid] then
+            local f = family[rid]
+            local list = seenfamilies[f]
+            if not list then list = {}; seenfamilies[f] = list end
+            list[#list + 1] = rid
+        end
+    end
+
+    for _, list in pairs(seenfamilies) do
+        local cell
+        for i = 1, #list do
+            local a = list[i]
+            local ca = cells[a]
+            if ca then
+                if cell and cell ~= ca then error("LumenV4: SSA_DESTRUCT coalesced distinct CellIds", 2) end
+                cell = ca
+            end
+            for j = i + 1, #list do
+                local b = list[j]
+                if graph[a] and graph[a][b] then
+                    error(("LumenV4: SSA_DESTRUCT coalesced interfering values v%d/v%d"):format(a, b), 2)
+                end
+            end
+        end
+    end
+
+    for succ, phis in pairs(ir.phis) do
+        local block = assert(ir.cfg.blocks[succ], "LumenV4: SSA_DESTRUCT phi block missing")
+        for reg, phi in pairs(phis) do
+            local dst = ir:resolve(phi.id)
+            if dst and not ir.dead[dst] and ir:count(dst) > 0 then
+                for _, pred in ipairs(block.predecessors) do
+                    local raw = phi.incoming and phi.incoming[pred]
+                    if raw == nil and not phi.missing then
+                        error(("LumenV4: SSA_DESTRUCT phi v%d r%d missing predecessor b%d"):format(dst, reg, pred), 2)
+                    end
+                    local src = raw and ir:resolve(raw) or nil
+                    local df = family[dst] or dst
+                    local sf = src and (family[src] or src) or nil
+                    if sf ~= df then
+                        local found = false
+                        for _, copy in ipairs(outssa.edgeCopies[pred] and outssa.edgeCopies[pred][succ] or {}) do
+                            if copy.dst == df and copy.src == sf and copy.reg == reg then found = true break end
+                        end
+                        if not found then
+                            error(("LumenV4: SSA_DESTRUCT missing edge copy b%d->b%d r%d"):format(pred, succ, reg), 2)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return true
+end
+
+function pass.run(ir)
+    local live = buildliveness(ir)
+    local cells = cellmap(ir)
+    local graph = interference(ir, live)
+    local family, _, members, merged = coalesce(ir, graph, cells)
+    local copies, copycount = buildcopies(ir, family)
+
+    local materialize = {}
+    for _, bysucc in pairs(copies) do
+        for _, list in pairs(bysucc) do
+            for _, copy in ipairs(list) do
+                if copy.dst then materialize[copy.dst] = true end
+                if copy.src and not copy.undef then materialize[copy.src] = true end
+            end
+        end
+    end
+    for id, fam in pairs(family) do if materialize[fam] then materialize[id] = true end end
+
+    ir.family = family
+    ir.outssa = {
+        liveIn = live.liveIn,
+        liveOut = live.liveOut,
+        edgeUse = live.edgeUse,
+        livenessIterations = live.iterations,
+        interference = graph,
+        cells = cells,
+        members = members,
+        family = family,
+        edgeCopies = copies,
+        copyCount = copycount,
+        coalesced = merged,
+        materialize = materialize,
+        verified = false,
+    }
+    ir.outssa.verified = verify(ir, ir.outssa)
     return ir
 end
 
@@ -6813,6 +8146,7 @@ return pass
     ["main.passes.pipeline"] = [===[
 
 local dead = require("main.passes.deadcode")
+local simplify = require("main.passes.simplify")
 local names = require("main.passes.names")
 local prov = require("main.passes.provenance")
 local inline = require("main.passes.inline")
@@ -6823,27 +8157,32 @@ local pipe = {}
 
 function pipe.run(ir, opt, check)
     opt = opt or {}
-
+    ir.timings = ir.timings or {}
+    local pt = ir.timings.passes or {}
+    ir.timings.passes = pt
+    local t
 
     if check then check() end
-    if opt.dce ~= false then dead.run(ir, check) end
+    if opt.dce ~= false then t = os.clock(); dead.run(ir, check); pt.deadcode = os.clock() - t end
+    if check then check() end
+    t = os.clock(); simplify.run(ir); pt.simplify = os.clock() - t
     if check then check() end
 
-
-    names.run(ir)
+    t = os.clock(); names.run(ir); pt.outssa = os.clock() - t
     if check then check() end
     if opt.smartnames ~= false then
-        prov.run(ir)
+        t = os.clock(); prov.run(ir); pt.naming = os.clock() - t
         if check then check() end
     else
         ir.bestname, ir.namescore, ir.hints, ir.origin = {}, {}, {}, {}
+        pt.naming = 0
     end
 
-    if opt.inline ~= false then inline.run(ir, check) end
+    if opt.inline ~= false then t = os.clock(); inline.run(ir, check); pt.inline = os.clock() - t end
     if check then check() end
-    cond.run(ir)
+    t = os.clock(); cond.run(ir); pt.conditions = os.clock() - t
     if check then check() end
-    flow.run(ir)
+    t = os.clock(); flow.run(ir); pt.flow = os.clock() - t
     if check then check() end
     return ir
 end
@@ -7233,19 +8572,65 @@ local cond = require("main.recover.conditions")
 
 local branch = {}
 
+
+local function graphinfo(st, pc, stop)
+    local bid = st.cfg.blockmap[pc]
+    local block = bid and st.cfg.blocks[bid]
+    local structure = st.cfg.structure
+    local region = structure and structure.byHeader and structure.byHeader[bid]
+    local op = st.proto.Instructions[pc]
+    if not block or block.endPC ~= pc or not region or not op or not ins.isConditional(op) then return nil end
+
+    local joinpc = region.joinPC
+    if not joinpc or joinpc <= pc or joinpc > stop then return nil end
+    local jumppc, fallpc = ins.jumpTarget(pc, op), st:next(pc)
+    local jumpbid, fallbid = st.cfg.blockmap[jumppc], st.cfg.blockmap[fallpc]
+
+    if region.kind == "triangle" then
+        local bodybid = region.thenBlock
+        local body = bodybid and st.cfg.blocks[bodybid]
+        if not body or body.startPC <= pc or body.startPC >= joinpc then return nil end
+        if st.cfg.ipdom[bodybid] ~= region.join then return nil end
+        local condition
+        if jumpbid == bodybid and fallbid == region.join then condition = cond.jump(st, pc, op)
+        elseif fallbid == bodybid and jumpbid == region.join then condition = cond.fall(st, pc, op)
+        else return nil end
+        return {
+            cond = condition, a = body.startPC, b = joinpc, join = joinpc,
+            head = pc, last = pc, condpcs = { pc }, graph = true, region = region,
+        }
+    elseif region.kind == "diamond" then
+        local ab, bb = st.cfg.blocks[region.thenBlock], st.cfg.blocks[region.elseBlock]
+        if not ab or not bb then return nil end
+        if st.cfg.ipdom[ab.id] ~= region.join or st.cfg.ipdom[bb.id] ~= region.join then return nil end
+        local first, second = ab, bb
+        if second.startPC < first.startPC then first, second = second, first end
+        if first.startPC <= pc or second.startPC <= first.startPC or second.startPC >= joinpc then return nil end
+        local condition
+        if jumpbid == first.id then condition = cond.jump(st, pc, op)
+        elseif fallbid == first.id then condition = cond.fall(st, pc, op)
+        else return nil end
+        return {
+            cond = condition, a = first.startPC, b = second.startPC,
+            c = second.startPC, d = joinpc, join = joinpc,
+            head = pc, last = pc, condpcs = { pc }, graph = true, region = region,
+        }
+    end
+end
+
 function branch.info(st, pc, stop)
     local ch = cond.chain(st, pc)
-    if not ch or ch.exit <= ch.body then return nil end
+    if not ch or ch.exit <= ch.body then return graphinfo(st, pc, stop) end
 
     local join = st:join(pc)
 
-    if not join or join <= pc or join > stop then return nil end
-    if ch.exit > join then return nil end
+    if not join or join <= pc or join > stop then return graphinfo(st, pc, stop) end
+    if ch.exit > join then return graphinfo(st, pc, stop) end
 
     if ch.exit == join then
-        return { cond = ch.cond, a = ch.body, b = join, join = join }
+        return { cond = ch.cond, a = ch.body, b = join, join = join, head = pc, last = ch.last, condpcs = ch.pcs }
     end
-    return { cond = ch.cond, a = ch.body, b = ch.exit, c = ch.exit, d = join, join = join }
+    return { cond = ch.cond, a = ch.body, b = ch.exit, c = ch.exit, d = join, join = join, head = pc, last = ch.last, condpcs = ch.pcs }
 end
 
 function branch.elseifInfo(st, pc, join)
@@ -7335,6 +8720,7 @@ function cond.chain(st, pc)
     local exit = ins.jumpTarget(pc, first)
     local cur = pc
     local list = {}
+    local pcs = {}
     local count = 0
 
     while true do
@@ -7343,23 +8729,25 @@ function cond.chain(st, pc)
         if not ins.isConditional(op) or name == "FORNLOOP" or name == "FORGLOOP" then break end
         if ins.jumpTarget(cur, op) ~= exit then break end
         list[#list + 1] = cond.fall(st, cur, op)
+        pcs[#pcs + 1] = cur
         count += 1
         local nx = st:next(cur)
         local nop = st.proto.Instructions[nx]
         if not nop or not ins.isConditional(nop) then
-            return { cond = ex.join(list, "and"), body = nx, exit = exit, last = cur }
+            return { cond = ex.join(list, "and"), body = nx, exit = exit, last = cur, pcs = pcs }
         end
         if ins.jumpTarget(nx, nop) ~= exit then break end
         cur = nx
     end
 
     if count > 1 then
-        return { cond = ex.join(list, "and"), body = st:next(cur), exit = exit, last = cur }
+        return { cond = ex.join(list, "and"), body = st:next(cur), exit = exit, last = cur, pcs = pcs }
     end
 
     local body = exit
     local p = pc
     local ors = {}
+    local orpcs = {}
     while p < body do
         local op = st.proto.Instructions[p]
         if not op or not ins.isConditional(op) then break end
@@ -7367,16 +8755,18 @@ function cond.chain(st, pc)
         local jt = ins.jumpTarget(p, op)
         if jt == body and nx < body then
             ors[#ors + 1] = cond.jump(st, p, op)
+            orpcs[#orpcs + 1] = p
             p = nx
         elseif nx == body and jt > body then
             ors[#ors + 1] = cond.fall(st, p, op)
-            return { cond = ex.join(ors, "or"), body = body, exit = jt, last = p }
+            orpcs[#orpcs + 1] = p
+            return { cond = ex.join(ors, "or"), body = body, exit = jt, last = p, pcs = orpcs }
         else
             break
         end
     end
 
-    return { cond = cond.fall(st, pc, first), body = st:next(pc), exit = exit, last = pc }
+    return { cond = cond.fall(st, pc, first), body = st:next(pc), exit = exit, last = pc, pcs = { pc } }
 end
 
 function cond.bool(st, pc, op)
@@ -7448,21 +8838,133 @@ local function cbhints(st, pc, r)
     return pend and meth[pend.method] or nil
 end
 
-local function capturename(st, cp, kind, src, debugname)
-
-
-    local parent
-    if kind == 0 or kind == 1 then
-        parent = st:useName(cp, src, nil)
-    else
-        parent = st.up[src + 1] or ("upvalue" .. tostring(src))
+local function valuecap(st, cp, src, slot, debugname, selfreg)
+    local raw = st:veruse(cp, src)
+    if not raw then
+        error(("LumenV4: CAPTURE_VERIFY value capture references undefined parent register R%d at pc %d"):format(src, cp), 2)
     end
-    if not parent or parent == "" then parent = debugname end
-    return parent or ("upvalue" .. tostring(src))
+    local value = st.ir:resolve(raw)
+    if src == selfreg then
+        return {
+            kind = "self",
+            mode = 0,
+            value = value,
+            reg = src,
+            pc = cp,
+            slot = slot,
+            owner = st,
+            debugname = debugname,
+        }
+    end
+    local snap = st.naming:unique("capture" .. tostring(slot) .. "Value")
+    st.declared[snap] = st.indent
+    st:out("local " .. snap .. " = " .. st:use(cp, src))
+    return {
+        kind = "value",
+        mode = 0,
+        value = value,
+        reg = src,
+        pc = cp,
+        slot = slot,
+        owner = st,
+        name = snap,
+        debugname = debugname,
+    }
 end
 
-function fn.caps(st, pc, child)
+local function refcap(st, cp, src, slot, debugname)
+    local raw = st:veruse(cp, src)
+    if not raw then
+        error(("LumenV4: CAPTURE_VERIFY ref capture references undefined parent register R%d at pc %d"):format(src, cp), 2)
+    end
+    local value = st.ir:resolve(raw)
+    local cell = st.ir.captureCell and st.ir.captureCell[cp]
+    if not cell and st.ir.cellOfValue then cell = st.ir.cellOfValue[raw] or st.ir.cellOfValue[value] end
+    if not cell then
+        error(("LumenV4: CAPTURE_VERIFY REF capture has no CellId for R%d at pc %d"):format(src, cp), 2)
+    end
+    local name
+    if st.dispatchCells then
+        local box = st.dispatchCells .. "[" .. tostring(cell) .. "]"
+        local base = st:dispatchbase(value, src, cp)
+        st:out("if " .. box .. " == nil then " .. box .. " = {v = " .. base .. "} end")
+        local snap = st.naming:unique("capture" .. tostring(slot) .. "Cell")
+        st.declared[snap] = st.indent
+        st:out("local " .. snap .. " = " .. box)
+        name = snap .. ".v"
+    end
+    return {
+        kind = "ref",
+        mode = 1,
+        value = value,
+        cell = cell,
+        reg = src,
+        pc = cp,
+        slot = slot,
+        owner = st,
+        name = name,
+        debugname = debugname,
+    }
+end
+
+local function upcap(st, cp, src, slot, debugname)
+    local parent = st:updesc(src + 1)
+    if not parent then
+        error(("LumenV4: CAPTURE_VERIFY UPVAL capture references missing parent upvalue U%d at pc %d"):format(src, cp), 2)
+    end
+    return {
+        kind = "upvalue",
+        mode = 2,
+        parent = parent,
+        cell = st:upcell(src + 1),
+        source = src,
+        pc = cp,
+        slot = slot,
+        owner = st,
+        debugname = debugname,
+    }
+end
+
+function fn.verify(child, caps, pc)
+    local want = child.UpvalueCount or 0
+    if #caps ~= want then
+        error(("LumenV4: CAPTURE_VERIFY NEWCLOSURE at pc %d capture slot mismatch %d/%d"):format(pc, #caps, want), 2)
+    end
+    for i = 1, want do
+        local cap = caps[i]
+        if type(cap) ~= "table" then
+            error(("LumenV4: CAPTURE_VERIFY slot %d at pc %d is not semantic"):format(i, pc), 2)
+        end
+        if cap.slot ~= i then
+            error(("LumenV4: CAPTURE_VERIFY slot index mismatch %d/%s at pc %d"):format(i, tostring(cap.slot), pc), 2)
+        end
+        if cap.kind == "self" then
+            if not cap.value or not cap.name then
+                error(("LumenV4: CAPTURE_VERIFY recursive value slot %d at pc %d has no function identity"):format(i, pc), 2)
+            end
+        elseif cap.kind == "value" then
+            if not cap.value or not cap.name then
+                error(("LumenV4: CAPTURE_VERIFY value slot %d at pc %d has no snapshot identity"):format(i, pc), 2)
+            end
+        elseif cap.kind == "ref" then
+            if not cap.cell then
+                error(("LumenV4: CAPTURE_VERIFY ref slot %d at pc %d has no CellId"):format(i, pc), 2)
+            end
+        elseif cap.kind == "upvalue" then
+            if not cap.parent then
+                error(("LumenV4: CAPTURE_VERIFY inherited slot %d at pc %d has no parent upvalue"):format(i, pc), 2)
+            end
+        else
+            error(("LumenV4: CAPTURE_VERIFY invalid capture kind %s at pc %d"):format(tostring(cap.kind), pc), 2)
+        end
+    end
+    return true
+end
+
+function fn.caps(st, pc, child, closurekind)
     local out = {}
+    local closureop = st.proto.Instructions[pc]
+    local selfreg = closureop and closureop.A or nil
     local nx = st:next(pc)
     for i = 1, (child.UpvalueCount or 0) do
         local cp = nx
@@ -7470,38 +8972,30 @@ function fn.caps(st, pc, child)
         local du = child.Upvalues and child.Upvalues[i]
         local dn = du and du.Name
         if not op or ins.name(op) ~= "CAPTURE" then
-            error(("LumenV4: UNSUPPORTED NEWCLOSURE at pc %d expected CAPTURE %d/%d"):format(pc, i, child.UpvalueCount or 0), 2)
+            error(("LumenV4: CAPTURE_VERIFY NEWCLOSURE at pc %d expected CAPTURE %d/%d"):format(pc, i, child.UpvalueCount or 0), 2)
         end
 
         local kind, src = op.A, op.B
-        if kind ~= 0 and kind ~= 1 and kind ~= 2 then
-            error(("LumenV4: UNSUPPORTED CAPTURE kind %s at pc %d"):format(tostring(kind), cp), 2)
+        if closurekind == "dup" and kind == 1 then
+            error(("LumenV4: CAPTURE_VERIFY DUPCLOSURE at pc %d cannot REF capture at pc %d"):format(pc, cp), 2)
         end
-        if kind == 0 or kind == 1 then
-            if not st:veruse(cp, src) then
-                error(("LumenV4: UNSUPPORTED CAPTURE references undefined parent register R%d at pc %d"):format(src, cp), 2)
-            end
-        elseif not st.up[src + 1] then
-            error(("LumenV4: UNSUPPORTED CAPTURE_UPVAL references missing parent upvalue U%d at pc %d"):format(src, cp), 2)
-        end
-
         if kind == 0 then
-
-
-            local snap = st.naming:unique("capture" .. tostring(i) .. "Value")
-            st.declared[snap] = st.indent
-            st:out("local " .. snap .. " = " .. st:use(cp, src))
-            out[i] = snap
+            out[i] = valuecap(st, cp, src, i, dn, selfreg)
+        elseif kind == 1 then
+            out[i] = refcap(st, cp, src, i, dn)
+        elseif kind == 2 then
+            out[i] = upcap(st, cp, src, i, dn)
         else
-            out[i] = capturename(st, cp, kind, src, dn)
+            error(("LumenV4: CAPTURE_VERIFY invalid CAPTURE mode %s at pc %d"):format(tostring(kind), cp), 2)
         end
         st.consumed[cp] = true
         nx = st:next(cp)
     end
     local extra = st.proto.Instructions[nx]
     if extra and ins.name(extra) == "CAPTURE" then
-        error(("LumenV4: UNSUPPORTED NEWCLOSURE at pc %d has more CAPTURE instructions than child upvalues"):format(pc), 2)
+        error(("LumenV4: CAPTURE_VERIFY NEWCLOSURE at pc %d has more CAPTURE instructions than child upvalues"):format(pc), 2)
     end
+    fn.verify(child, out, pc)
     return out, nx
 end
 
@@ -7528,12 +9022,31 @@ local function direct(st, pc, r, nx)
 end
 
 function fn.emit(d, st, pc, r, child, caps, nx)
+    caps = caps or {}
     local hint = child.Name
     if hint == nil or hint == "" then hint = st.ir.bestname and st.ir.bestname[st.ir:nameid(st:verdef(pc, r))] end
     if hint == nil or hint == "" then hint = "fn" .. tostring(r) end
-    local root, sub, args = d:_child(child, caps, cbhints(st, pc, r))
+
     local target, assign, store = direct(st, pc, r, nx or st:next(pc))
-    if target then
+    local value = st:verdef(pc, r)
+    local symbol = value and st.ir:nameid(value) or ("r" .. tostring(r))
+    local localname = st:defName(pc, r, hint)
+    local selfcapture = false
+    for _, cap in ipairs(caps) do
+        if cap.kind == "self" then
+            selfcapture = true
+            cap.name = localname
+        end
+    end
+    fn.verify(child, caps, pc)
+
+    local root, sub, args = d:_child(child, caps, cbhints(st, pc, r))
+    if not sub.v4 or sub.v4.captureVerified ~= true then
+        error(("LumenV4: CAPTURE_VERIFY child at pc %d did not pass capture verification"):format(pc), 2)
+    end
+    st.v4.childCaptures = (st.v4.childCaptures or 0) + #caps
+
+    if target and not selfcapture then
         st.consumed[store] = true
         if not assign and target:find("%.") and args[1] and (args[1]:match("^self%s*[:$]") or args[1] == "self") then
             local base, field = target:match("^(.*)%.([%a_][%w_]*)$")
@@ -7541,13 +9054,22 @@ function fn.emit(d, st, pc, r, child, caps, nx)
         end
         st.ast:add({ kind = "function", name = target, args = table.concat(args, ", "), body = root, localfn = false, assign = assign })
     else
-        local name = st:defName(pc, r, hint)
-        local depth = st.declared[name]
-        if depth == nil or depth > st.indent then
-            st.declared[name] = st.indent
-            st.ast:add({ kind = "function", name = name, args = table.concat(args, ", "), body = root, localfn = true, assign = false })
+        local depth = st.declared[localname]
+        local lexical = lit.identifier(localname)
+        if lexical and (depth == nil or depth > st.indent) then
+            st.declared[localname] = st.indent
+            st:declaresymbol(symbol, localname, st.indent)
+            st.ast:add({ kind = "function", name = localname, symbol = symbol, args = table.concat(args, ", "), body = root, localfn = true, assign = false })
         else
-            st.ast:add({ kind = "function", name = name, args = table.concat(args, ", "), body = root, localfn = false, assign = true })
+            if depth == nil or depth > st.indent then
+                st.declared[localname] = st.indent
+                st:declaresymbol(symbol, localname, st.indent)
+            end
+            st.ast:add({ kind = "function", name = localname, symbol = symbol, args = table.concat(args, ", "), body = root, localfn = false, assign = true })
+        end
+        if target then
+            st.consumed[store] = true
+            st:out(target .. " = " .. localname)
         end
     end
     for _, issue in ipairs(sub.bad) do st.bad[#st.bad + 1] = issue end
@@ -7659,10 +9181,24 @@ function loops.genInfo(st, pc, op, stop)
     return { loop = loop, op = lop, exit = st:next(loop) }
 end
 
+
+function loops.edgeKind(st, pc, target, active)
+    local loop = active and active.loop
+    if not loop or not loop.headerpc or loop.kind == "repeat" then return nil end
+    local structure = st.cfg.structure
+    if not structure then return nil end
+    local from, to = st.cfg.blockmap[pc], st.cfg.blockmap[target]
+    if not from or not to then return nil end
+    local li = structure.loopByBlock and structure.loopByBlock[from]
+    local natural = li and st.cfg.loops[li]
+    if not natural or natural.headerPC ~= loop.headerpc then return nil end
+    local map = structure.edgeKinds and structure.edgeKinds[from]
+    return map and map[to] or nil
+end
+
 return loops
 ]===],
-    ["main.recover.tables"] = [===[
-local ins = require("main.bytecode.instructions")
+    ["main.recover.tables"] = [===[local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 local ex = require("main.output.expr")
 
@@ -7722,24 +9258,135 @@ function tab.mut(st, use, r)
     return false
 end
 
-function tab.expr(t)
-    local out = {}
-    for _, e in ipairs(t.entries) do
-        if not e.pending and e.val then
-            if e.kind == "list" then
-                out[#out + 1] = ex.str(e.val)
-            elseif e.kind == "field" then
-                out[#out + 1] = e.key .. " = " .. ex.str(e.val)
-            else
-                out[#out + 1] = "[" .. e.key .. "] = " .. ex.str(e.val)
+local function sameobject(st, value, oid)
+    if not value or not oid or not st.ir.objectId then return false end
+    return st.ir:objectId(value) == oid
+end
+
+local function mutation(st, pc, oid)
+    local op = st.proto.Instructions[pc]
+    if not op then return false end
+    local name = ins.name(op)
+    local uses = st.ssa.usesByPC[pc] or {}
+    local base
+    if name == "SETTABLE" or name == "SETTABLEKS" or name == "SETUDATAKS" or name == "SETTABLEN" then base = uses[op.B]
+    elseif name == "SETLIST" then base = uses[op.A]
+    else return false end
+    if not sameobject(st, base, oid) then return false end
+
+    if name == "SETTABLE" then
+        if sameobject(st, uses[op.A], oid) or sameobject(st, uses[op.C], oid) then return false, "self" end
+    elseif name == "SETTABLEKS" or name == "SETUDATAKS" or name == "SETTABLEN" then
+        if sameobject(st, uses[op.A], oid) then return false, "self" end
+    elseif name == "SETLIST" then
+        local _, _, pack = require("main.analysis.registers").readWrite(op)
+        if op.C == 0 and pack.openReadFrom then return false, "open" end
+        local last = op.C > 1 and (op.B + op.C - 2) or (op.B - 1)
+        for r = op.B, last do if sameobject(st, uses[r], oid) then return false, "self" end end
+    end
+    return true
+end
+
+local function linear(cfg, first, second)
+    if first == second then return true end
+    local seen = {}
+    local cur = first
+    while cur and not seen[cur] do
+        seen[cur] = true
+        local b = cfg.blocks[cur]
+        if not b or #b.successors ~= 1 then return false end
+        local nx = b.successors[1]
+        local nb = cfg.blocks[nx]
+        if not nb or #nb.predecessors ~= 1 or nb.predecessors[1] ~= cur then return false end
+        if nx == second then return true end
+        cur = nx
+    end
+    return false
+end
+
+function tab.get(st, value)
+    if not value then return nil end
+    local direct = st.tbl[value]
+    if direct then return direct end
+    local oid = st.ir.objectId and st.ir:objectId(value)
+    return oid and st.tblobj and st.tblobj[oid] or nil
+end
+
+function tab.begin(st, pc, reg, seed, slots)
+    local value = st:verdef(pc, reg)
+    if not value or not st.ir.objectId then return nil end
+    local oid = st.ir:objectId(value)
+    if not oid then return nil end
+    local object = st.ir.objects and st.ir.objects[oid]
+    if not object or object.allocPC ~= pc then return nil end
+
+    local t = {
+        oid = oid,
+        value = value,
+        reg = reg,
+        entries = seed or {},
+        slots = slots,
+        real = 0,
+        done = false,
+        allowed = {},
+        allocPC = pc,
+        object = object,
+    }
+
+    local uses = {}
+    for alias in pairs(object.aliases or {}) do
+        for _, use in ipairs(st.ir:uses(alias) or {}) do
+            if use.pc and use.pc > pc then uses[use.pc] = true end
+        end
+    end
+    local pcs = {}
+    for upc in pairs(uses) do pcs[#pcs + 1] = upc end
+    table.sort(pcs)
+
+    local allocblock = st.cfg.blockmap[pc]
+    local lastblock = allocblock
+    local observed = false
+    for _, upc in ipairs(pcs) do
+        local ub = st.cfg.blockmap[upc]
+        local ok, why = mutation(st, upc, oid)
+        if ok and not observed and ub and linear(st.cfg, lastblock, ub) then
+            t.allowed[upc] = true
+            lastblock = ub
+        else
+            local op = st.proto.Instructions[upc]
+            local name = op and ins.name(op)
+            if name ~= "MOVE" and not (ok and why == nil) then
+                observed = true
+                t.real += 1
+            elseif not ok then
+                observed = true
+                t.real += 1
             end
         end
     end
-    return ex.atom(#out == 0 and "{}" or ("{ " .. table.concat(out, ", ") .. " }"), false)
+
+    st.tblobj = st.tblobj or {}
+    st.tblobj[oid] = t
+    st.tbl[value] = t
+    return t
+end
+
+function tab.canput(t, pc)
+    return t and not t.done and t.allowed and t.allowed[pc] == true
+end
+
+function tab.expr(t)
+    local fields = {}
+    for _, e in ipairs(t.entries) do
+        if not e.pending and e.val then
+            fields[#fields + 1] = { kind = e.kind, key = e.key, value = e.val }
+        end
+    end
+    return ex.table(fields)
 end
 
 function tab.use(st, v, r, pc)
-    local t = st.tbl[v]
+    local t = tab.get(st, v)
     if not t or t.done then return nil end
     t.done = true
     local node = tab.expr(t)
@@ -10823,7 +12470,7 @@ Main = (function()
 				if enum and enum ~= "" then return {Name = enum,Category = "Enum"} end
 				local name = engine or script or "string"
 				if primitive[name] then return {Name = name,Category = "Primitive"} end
-				if name == "EnumItem" or name == "Enum" or (script and sub(script,1,5) == "Enum.") then
+				if name == "EnumItem" or name == "Enum" or (script and string.sub(script,1,5) == "Enum.") then
 					return {Name = enum or script or "Enum",Category = "Enum"}
 				end
 				if name == "Object" then name = "Instance" end
@@ -11588,7 +13235,93 @@ local function verify(proto, aux, blocks, blockmap, nexts)
     return true
 end
 
+
+local function structural(blocks, ipdom, naturalloops, check)
+    local structure = { byHeader = {}, regions = {}, edgeKinds = {}, loopByBlock = {}, iterations = 0, verified = false }
+
+    local loopsizes = {}
+    for i, loop in ipairs(naturalloops or {}) do
+        local size = 0
+        for _ in pairs(loop.nodes or {}) do size += 1 end
+        loopsizes[i] = size
+    end
+    for bid = 1, #blocks do
+        local best, bestsize
+        for i, loop in ipairs(naturalloops or {}) do
+            if loop.nodes and loop.nodes[bid] then
+                local size = loopsizes[i]
+                if not bestsize or size < bestsize then best, bestsize = i, size end
+            end
+        end
+        structure.loopByBlock[bid] = best
+    end
+
+    for pred, block in ipairs(blocks) do
+        local li = structure.loopByBlock[pred]
+        local loop = li and naturalloops[li]
+        if loop then
+            local map = {}
+            structure.edgeKinds[pred] = map
+            for _, succ in ipairs(block.successors) do
+                if succ == loop.header then
+                    map[succ] = "continue"
+                elseif not loop.nodes[succ] then
+                    map[succ] = "break"
+                end
+            end
+            if not next(map) then structure.edgeKinds[pred] = nil end
+        end
+    end
+
+    local claimed = {}
+    local changed = true
+    local limit = math.max(8, #blocks * 2)
+    while changed do
+        structure.iterations += 1
+        if structure.iterations > limit then error("LumenV4: CFG_STRUCTURE region discovery failed to converge", 2) end
+        changed = false
+        for _, block in ipairs(blocks) do
+            if check then check() end
+            if #block.successors == 2 and not structure.byHeader[block.id] then
+                local join = ipdom[block.id]
+                if join and blocks[join] then
+                    local a, b = block.successors[1], block.successors[2]
+                    local region
+                    if a == join and b ~= join then
+                        region = { kind = "triangle", header = block.id, thenBlock = b, elseBlock = nil, join = join }
+                    elseif b == join and a ~= join then
+                        region = { kind = "triangle", header = block.id, thenBlock = a, elseBlock = nil, join = join }
+                    elseif a ~= join and b ~= join then
+                        region = { kind = "diamond", header = block.id, thenBlock = a, elseBlock = b, join = join }
+                    end
+                    if region then
+                        region.headerPC = block.endPC
+                        region.joinPC = blocks[join].startPC
+                        region.thenPC = region.thenBlock and blocks[region.thenBlock].startPC or nil
+                        region.elsePC = region.elseBlock and blocks[region.elseBlock].startPC or nil
+                        structure.byHeader[block.id] = region
+                        structure.regions[#structure.regions + 1] = region
+                        claimed[block.id] = true
+                        changed = true
+                    end
+                end
+            end
+        end
+    end
+
+    for _, region in ipairs(structure.regions) do
+        assert(blocks[region.header] and blocks[region.join], "LumenV4: CFG_STRUCTURE invalid region endpoint")
+        assert(region.header ~= region.join, "LumenV4: CFG_STRUCTURE self-joining region")
+        if region.thenBlock then assert(blocks[region.thenBlock], "LumenV4: CFG_STRUCTURE invalid then block") end
+        if region.elseBlock then assert(blocks[region.elseBlock], "LumenV4: CFG_STRUCTURE invalid else block") end
+    end
+    structure.verified = true
+    return structure
+end
+
 function graph.build(proto, check, limits)
+    local timings = {}
+    local graphstart = os.clock()
     local ops = proto.Instructions
     limits = limits or {}
     local maxinstructions = tonumber(limits.maxinstructions) or 0
@@ -11685,12 +13418,13 @@ function graph.build(proto, check, limits)
     if maxblocks > 0 and #blocks > maxblocks then
         error("LumenV4: STRUCTURED_COMPLEXITY cfg blocks " .. tostring(#blocks) .. " > " .. tostring(maxblocks), 2)
     end
+    timings.cfg = os.clock() - graphstart
     if check then check() end
-    local dominators = dom.compute(blocks, check)
-    local idom = immediatefromsets(blocks, dominators, check)
-    local postdom, ipdom, exitid = post.run(blocks, check)
-    local naturalloops = loops.find(blocks, dominators, check)
-    local sccs = tarjan(blocks, check)
+    local t = os.clock(); local dominators = dom.compute(blocks, check); timings.dominators = os.clock() - t
+    t = os.clock(); local idom = immediatefromsets(blocks, dominators, check); timings.idom = os.clock() - t
+    t = os.clock(); local postdom, ipdom, exitid = post.run(blocks, check); timings.postdominators = os.clock() - t
+    t = os.clock(); local naturalloops = loops.find(blocks, dominators, check); timings.loops = os.clock() - t
+    t = os.clock(); local sccs = tarjan(blocks, check); timings.scc = os.clock() - t
     local out = {
         proto = proto,
         aux = aux,
@@ -11708,9 +13442,11 @@ function graph.build(proto, check, limits)
         sccs = sccs,
         irreducible = false,
         registerStats = regs.stats(proto, aux),
+        timings = timings,
     }
+    local stime = os.clock(); out.structure = structural(blocks, ipdom, naturalloops, check); timings.structural = os.clock() - stime
     for _, component in ipairs(sccs) do if component.irreducible then out.irreducible = true break end end
-    out.verified = verify(proto, aux, blocks, blockmap, nexts)
+    out.verified = verify(proto, aux, blocks, blockmap, nexts) and out.structure.verified
     return out
 end
 
@@ -12127,7 +13863,7 @@ function ssa.build(proto, cfg, check, limits)
         inVersions = {}, outVersions = {}, useCount = {}, defUse = {}, undefByReg = {}, packsByPC = {},
         liveIn = livein, liveOut = liveout, liveAfter = liveafter,
         packInBlock = packinblock, packOutBlock = packoutblock, packBefore = packbefore,
-        packInput = packinput, ambiguousPack = ambiguouspack,
+        packInput = packinput, ambiguousPack = ambiguouspack, timings = timings,
     }
     local nextver = 1
     local function newver(kind, reg, pc, block)
@@ -12304,7 +14040,8 @@ function ssa.build(proto, cfg, check, limits)
         end
         return true
     end
-    result.verified = verifyssa()
+    timings.ssa = os.clock() - ssastart
+    local vt = os.clock(); result.verified = verifyssa(); result.valuePackVerified = result.verified == true; timings.verify = os.clock() - vt
 
     function result:versionForUse(pc, reg) local u = self.usesByPC[pc]; return u and u[reg] or nil end
     function result:versionForDef(pc, reg) local d = self.defsByPC[pc]; return d and d[reg] or nil end
@@ -13277,7 +15014,8 @@ end
 
 return pass
 ]===],
-    ["main.ast.printer"] = [===[
+    ["main.ast.printer"] = [===[local expr = require("main.output.expr")
+
 local printast = {}
 
 local function esc(s)
@@ -13289,6 +15027,7 @@ local function hasname(node, name)
     local pat = "%f[%w_]" .. esc(name) .. "%f[^%w_]"
     local function hit(s) return type(s) == "string" and s:find(pat) ~= nil end
     if hit(node.text) or hit(node.cond) or hit(node.head) or hit(node.args) then return true end
+    if node.values then for _, value in ipairs(node.values) do if hit(expr.str(value)) then return true end end end
     if node.kind == "if" then
         for _, b in ipairs(node.branches or {}) do
             if hit(b.cond) then return true end
@@ -13348,6 +15087,18 @@ local function block(out, b, depth, opt)
             local k = node.kind
             if k == "raw" or k == "return" or k == "break" or k == "continue" then
                 line(out, opt, depth, node.text, true)
+            elseif k == "assign" then
+                local names = {}
+                for i, name in ipairs(node.names or {}) do
+                    local an = node.annotations and node.annotations[i]
+                    names[i] = name .. (node.declare and an and (": " .. an) or "")
+                end
+                local vals = {}; for i, value in ipairs(node.values or {}) do vals[i] = expr.str(value) end
+                line(out, opt, depth, (node.declare and "local " or "") .. table.concat(names, ", ") .. " = " .. table.concat(vals, ", "), true)
+            elseif k == "decl" then
+                local names = {}
+                for i, name in ipairs(node.names or {}) do local an = node.annotations and node.annotations[i]; names[i] = name .. (an and (": " .. an) or "") end
+                line(out, opt, depth, "local " .. table.concat(names, ", "), true)
             elseif k == "if" then
                 for i, branch in ipairs(node.branches) do
                     line(out, opt, depth, (i == 1 and "if " or "elseif ") .. cond(opt, branch.cond) .. " then")
@@ -13644,9 +15395,9 @@ local base = {
     iridium = nil,
     fidelity = true,
     structuredbudget = 1.25,
-    structuredmaxinstructions = 8000,
-    structuredmaxprotoinstructions = 4000,
-    structuredmaxblocks = 256,
+    structuredmaxinstructions = 32000,
+    structuredmaxprotoinstructions = 16000,
+    structuredmaxblocks = 1024,
 }
 
 local map = {
@@ -13669,9 +15420,9 @@ return function(opt)
     if opt then for k, v in pairs(opt) do out[map[k] or k] = v end end
     out.doblocks = math.max(0, math.floor(tonumber(out.doblocks) or 0))
     out.structuredbudget = math.max(0, tonumber(out.structuredbudget) or 1.25)
-    out.structuredmaxinstructions = math.max(0, math.floor(tonumber(out.structuredmaxinstructions) or 8000))
-    out.structuredmaxprotoinstructions = math.max(0, math.floor(tonumber(out.structuredmaxprotoinstructions) or 4000))
-    out.structuredmaxblocks = math.max(0, math.floor(tonumber(out.structuredmaxblocks) or 256))
+    out.structuredmaxinstructions = math.max(0, math.floor(tonumber(out.structuredmaxinstructions) or 32000))
+    out.structuredmaxprotoinstructions = math.max(0, math.floor(tonumber(out.structuredmaxprotoinstructions) or 16000))
+    out.structuredmaxblocks = math.max(0, math.floor(tonumber(out.structuredmaxblocks) or 1024))
     if out.fidelity ~= false then
 
         out.fold = false
@@ -13718,19 +15469,100 @@ function ctx.new(proto, ir, naming, up, ast, opt)
         emit = {},
         group = {},
         tbl = {},
+        tblobj = {},
         top = nil,
         bad = {},
         vnames = {},
         nexttmp = 0,
+        symbolScopes = {},
+        symbolUses = {},
+        sequence = 0,
     }, ctx)
 
-    for _, name in ipairs(self.up) do naming:reserve(name) end
+    for i = 1, #self.up do
+        local name = self:upname(i)
+        if name then naming:reserve(name) end
+    end
     for r = 0, (proto.ParameterCount or 0) - 1 do
         local v = ir.ssa.params[r]
         local name = self:vname(v, r, nil, 1)
         self.declared[name] = 0
+        local symbol = self.ir:nameid(v)
+        if symbol then self.symbolScopes[symbol] = { depth = 0, seq = 0, name = name, parameter = true } end
     end
     return self
+end
+
+function ctx:updesc(index)
+    return self.up[index]
+end
+
+local function semanticupname(ref, seen)
+    if type(ref) == "string" then return ref end
+    if type(ref) ~= "table" then return nil end
+    if type(ref.name) == "string" and ref.name ~= "" then return ref.name end
+    seen = seen or {}
+    if seen[ref] then return nil end
+    seen[ref] = true
+
+    local name
+    if ref.kind == "self" then
+        name = ref.name
+    elseif ref.kind == "upvalue" then
+        name = semanticupname(ref.parent, seen)
+    elseif ref.kind == "ref" then
+        local owner = ref.owner
+        name = owner and owner.v4 and owner.v4.cellNames and owner.v4.cellNames[ref.cell] or nil
+    elseif ref.kind == "value" then
+        name = ref.name
+        if not name and ref.owner and ref.value then
+            name = ref.owner:vname(ref.value, ref.reg, ref.debugname, ref.pc)
+        end
+    end
+    if name and name ~= "" then ref.name = name end
+    return name
+end
+
+function ctx:upname(index)
+    local ref = self.up[index]
+    if ref == nil then return nil end
+    local name = semanticupname(ref)
+    if not name or name == "" then
+        error(("LumenV4: CAPTURE_VERIFY unresolved upvalue slot %d"):format(index), 2)
+    end
+    return name
+end
+
+local function semanticupcell(ref, seen)
+    if type(ref) ~= "table" then return nil end
+    if ref.cell then return ref.cell end
+    seen = seen or {}
+    if seen[ref] then return nil end
+    seen[ref] = true
+    if ref.kind == "upvalue" then return semanticupcell(ref.parent, seen) end
+    return nil
+end
+
+function ctx:upcell(index)
+    return semanticupcell(self.up[index])
+end
+
+function ctx:declaresymbol(symbol, name, depth)
+    if symbol == nil then return end
+    self.sequence += 1
+    local nextscope = { depth = depth or self.indent, seq = self.sequence, name = name }
+    local old = self.symbolScopes[symbol]
+    if not old or nextscope.depth < old.depth or (nextscope.depth == old.depth and nextscope.seq < old.seq) then
+        self.symbolScopes[symbol] = nextscope
+    end
+end
+
+function ctx:usesymbol(symbol, name)
+    if symbol == nil then return end
+    self.sequence += 1
+    local list = self.symbolUses[symbol]
+    if not list then list = {}; self.symbolUses[symbol] = list end
+    list[#list + 1] = { depth = self.indent, seq = self.sequence, name = name }
 end
 
 function ctx:out(s)
@@ -13849,7 +15681,11 @@ function ctx:reg(r, hint, pc)
 end
 
 function ctx:atom(r, hint, pc)
-    return ex.atom(self:useName(pc, r, hint), false)
+    local v = self:veruse(pc, r)
+    local symbol = v and self.ir:nameid(v) or ("r" .. tostring(r))
+    local name = self:useName(pc, r, hint)
+    if not self.alias[r] then self:usesymbol(symbol, name) end
+    return ex.localref(symbol, name)
 end
 
 function ctx:veruse(pc, r)
@@ -13870,11 +15706,11 @@ end
 
 function ctx:usex(pc, r, hint)
     local v = self:veruse(pc, r)
-    if v and self.tbl[v] then
+    if v and tab.get(self, v) then
         local node = self:usetbl(v, r, pc)
         if node then return node end
     end
-    if v and self.ir.const[v] then return ex.atom(self.ir.const[v], true) end
+    if v and self.ir.const[v] then return ex.literal(self.ir.const[v]) end
     if v and self.vals[v] then return self.vals[v] end
     return self:atom(r, hint, pc)
 end
@@ -13884,6 +15720,7 @@ function ctx:use(pc, r, hint)
 end
 
 function ctx:inline(pc, r, node)
+    if self.v4 and self.v4.dispatcher then return false end
     if self.naming:isDebugAt(r, pc) then return false end
     local v = self:verdef(pc, r)
     if not v or not self.ir.inline[v] then return false end
@@ -13919,12 +15756,14 @@ function ctx:set(pc, r, node, hint, raw)
     local depth = self.declared[name]
     local fresh = depth == nil or depth > self.indent
     local stmt
+    local symbol = v and self.ir:nameid(v) or ("r" .. tostring(r))
     if fresh then
         self.declared[name] = self.indent
+        self:declaresymbol(symbol, name, self.indent)
         local an = self:ann(r, pc)
-        stmt = self:out("local " .. name .. (an and (": " .. an) or "") .. " = " .. ex.str(node))
+        stmt = self.ast:add({ kind = "assign", names = { name }, symbols = { symbol }, values = { node }, declare = true, annotations = { an } })
     else
-        stmt = self:out(name .. " = " .. ex.str(node))
+        stmt = self.ast:add({ kind = "assign", names = { name }, symbols = { symbol }, values = { node }, declare = false })
     end
     if v then
         self.emit[v] = { node = stmt, name = name, fresh = fresh, depth = self.indent }
@@ -13939,7 +15778,10 @@ function ctx:decl(r, hint, pc)
     if depth == nil or depth > self.indent then
         self.declared[name] = self.indent
         local an = self:ann(r, pc)
-        self:out("local " .. name .. (an and (": " .. an) or ""))
+        local v = self:verdef(pc, r)
+        local symbol = v and self.ir:nameid(v) or ("r" .. tostring(r))
+        self:declaresymbol(symbol, name, self.indent)
+        self.ast:add({ kind = "decl", names = { name }, symbols = { symbol }, annotations = { an } })
     end
     return name
 end
@@ -13962,16 +15804,18 @@ function ctx:multi(pc, regs, rhs, hints, node)
         local typed = {}
         for i, name in ipairs(list) do
             self.declared[name] = self.indent
+            local v = self:verdef(pc, regs[i]); self:declaresymbol(v and self.ir:nameid(v) or ("r" .. tostring(regs[i])), name, self.indent)
             local an = self:ann(regs[i], pc)
             typed[i] = name .. (an and (": " .. an) or "")
         end
         nodes[#nodes + 1] = self:out("local " .. table.concat(typed, ", ") .. " = " .. rhs)
     else
         if fresh > 0 then
-            for _, name in ipairs(list) do
+            for i, name in ipairs(list) do
                 local depth = self.declared[name]
                 if depth == nil or depth > self.indent then
                     self.declared[name] = self.indent
+                    local v = self:verdef(pc, regs[i]); self:declaresymbol(v and self.ir:nameid(v) or ("r" .. tostring(regs[i])), name, self.indent)
                     nodes[#nodes + 1] = self:out("local " .. name)
                 end
             end
@@ -14080,10 +15924,249 @@ function ctx:hoist(pc)
         local depth = self.declared[name]
         if depth == nil or depth > self.indent then
             self.declared[name] = self.indent
+            self:declaresymbol(self.ir:nameid(item.p.id), name, self.indent)
             self:out("local " .. name)
         end
     end
 end
+function ctx:preparedispatch()
+    if self.dispatchStorage then return end
+    local storage = self.naming:unique("__slots")
+    local cells = self.naming:unique("__cells")
+    self.dispatchStorage = storage
+    self.dispatchCells = cells
+    self.declared[storage] = 0
+    self.declared[cells] = 0
+    self:out("local " .. storage .. " = {}")
+    self:out("local " .. cells .. " = {}")
+
+    local lexical = {}
+    for _, raw in pairs(self.ssa.params or {}) do
+        local id = self.ir:nameid(raw)
+        if id then lexical[id] = true end
+    end
+    for _, n in ipairs(self.ir.ops or {}) do
+        if n.name == "NEWCLOSURE" or n.name == "DUPCLOSURE" then
+            local id = self.ir:def(n.pc, n.op.A)
+            local fam = id and self.ir:nameid(id)
+            if fam then lexical[fam] = true end
+        end
+    end
+
+    self.dispatchLexical = lexical
+    self.dispatchNames = {}
+    self.dispatchPlainVname = self.basevname or self.vname
+    for cid in pairs(self.ir.cells or {}) do
+        self.v4.cellNames[cid] = cells .. "[" .. tostring(cid) .. "].v"
+    end
+
+    local oldvname = self.vname
+    self.vname = function(ctxself, value, reg, hint, pc)
+        local raw = value and ctxself.ir:resolve(value)
+        local cid
+        if pc and raw then
+            local def = ctxself.ssa.defsByPC[pc] and ctxself.ssa.defsByPC[pc][reg]
+            if def and ctxself.ir:resolve(def) == raw then cid = ctxself.ir.cellDef and ctxself.ir.cellDef[pc] and ctxself.ir.cellDef[pc][reg] end
+            if not cid then
+                local use = ctxself.ssa.usesByPC[pc] and ctxself.ssa.usesByPC[pc][reg]
+                if use and ctxself.ir:resolve(use) == raw then cid = ctxself.ir.cellUse and ctxself.ir.cellUse[pc] and ctxself.ir.cellUse[pc][reg] end
+            end
+        end
+        if cid then return cells .. "[" .. tostring(cid) .. "].v" end
+        local id = value and ctxself.ir:nameid(value)
+        if id and not lexical[id] then
+            local name = ctxself.dispatchNames[id]
+            if not name then
+                name = storage .. "[" .. tostring(id) .. "]"
+                ctxself.dispatchNames[id] = name
+                ctxself.declared[name] = 0
+                ctxself:declaresymbol(id, name, 0)
+            end
+            return name
+        end
+        local plain = ctxself.dispatchPlainVname
+        if plain then return plain(ctxself, value, reg, hint, pc) end
+        return oldvname(ctxself, value, reg, hint, pc)
+    end
+end
+
+function ctx:dispatchbase(value, reg, pc)
+    local id = value and self.ir:nameid(value)
+    if id and self.dispatchLexical and not self.dispatchLexical[id] then
+        local name = self.dispatchNames and self.dispatchNames[id]
+        if not name then
+            name = self.dispatchStorage .. "[" .. tostring(id) .. "]"
+            self.dispatchNames[id] = name
+            self.declared[name] = 0
+            self:declaresymbol(id, name, 0)
+        end
+        return name
+    end
+    local base = self.dispatchPlainVname or self.basevname
+    if base then return base(self, value, reg, nil, pc) end
+    return self:vname(value, reg, nil, pc)
+end
+
+function ctx:closecells(pc)
+    if not self.dispatchCells then return end
+    local map = self.ir.cellCloseValue and self.ir.cellCloseValue[pc]
+    if not map then return end
+    local regs = {}
+    for r in pairs(map) do regs[#regs + 1] = r end
+    table.sort(regs)
+    for _, r in ipairs(regs) do
+        local rec = map[r]
+        local value = rec and rec.value and self.ir:resolve(rec.value)
+        if value then
+            local base = self:dispatchbase(value, r, pc)
+            local cids = {}; for cid in pairs(rec.cells or {}) do cids[#cids + 1] = cid end
+            table.sort(cids)
+            for _, cid in ipairs(cids) do
+                local cell = self.dispatchCells .. "[" .. tostring(cid) .. "]"
+                self:out("if " .. cell .. " ~= nil then " .. base .. " = " .. cell .. ".v; " .. cell .. " = nil end")
+            end
+        end
+    end
+end
+
+function ctx:prepareoutssa()
+    local outssa = self.ir.outssa
+    if not outssa or not outssa.verified then
+        error("LumenV4: SSA_DESTRUCT out-of-SSA verification did not complete", 2)
+    end
+    self.outssaNames = self.outssaNames or {}
+    self.outssaEdges = self.outssaEdges or {}
+    local nameset, names = {}, {}
+    for pred, bysucc in pairs(outssa.edgeCopies or {}) do
+        for succ, copies in pairs(bysucc) do
+            for _, copy in ipairs(copies) do
+                local block = self.cfg.blocks[succ]
+                local name = self:vname(copy.dstValue, copy.reg, nil, block and block.startPC or 1)
+                self.outssaNames[copy.dst] = name
+                if not nameset[name] and self.declared[name] == nil then
+                    nameset[name] = true
+                    names[#names + 1] = name
+                    self.declared[name] = 0
+                    self:declaresymbol(copy.dst, name, 0)
+                end
+            end
+        end
+    end
+    table.sort(names)
+    for i = 1, #names, 12 do
+        local part = {}
+        for j = i, math.min(i + 11, #names) do part[#part + 1] = names[j] end
+        self:out("local " .. table.concat(part, ", "))
+    end
+    self.v4.outssaVerified = true
+    self.v4.outssaCopies = outssa.copyCount or 0
+end
+
+function ctx:hasedge(pred, succ)
+    local outssa = self.ir.outssa
+    local list = outssa and outssa.edgeCopies and outssa.edgeCopies[pred] and outssa.edgeCopies[pred][succ]
+    return list ~= nil and #list > 0
+end
+
+function ctx:edge(pred, succ)
+    if not pred or not succ or pred == succ then return end
+    local outssa = self.ir.outssa
+    local copies = outssa and outssa.edgeCopies and outssa.edgeCopies[pred] and outssa.edgeCopies[pred][succ]
+    if not copies or #copies == 0 then return end
+
+    self.outssaNames = self.outssaNames or {}
+    self.outssaEdges = self.outssaEdges or {}
+    local pending = {}
+    local pb, sb = self.cfg.blocks[pred], self.cfg.blocks[succ]
+    for _, copy in ipairs(copies) do
+        local dst = self.outssaNames[copy.dst] or self:vname(copy.dstValue, copy.reg, nil, sb and sb.startPC or 1)
+        self.outssaNames[copy.dst] = dst
+        local src
+        if copy.undef then
+            src = "nil"
+        else
+            src = self.outssaNames[copy.src] or self:vname(copy.srcValue, copy.reg, nil, pb and pb.endPC or 1)
+            self.outssaNames[copy.src] = src
+        end
+        if copy.src and not copy.undef then self:usesymbol(copy.src, src) end
+        if dst ~= src then pending[#pending + 1] = { dst = dst, src = src, variable = copy.undef ~= true } end
+    end
+
+    local serial = 0
+    while #pending > 0 do
+        serial += 1
+        if serial > #copies * 4 + 8 then error("LumenV4: SSA_DESTRUCT parallel copy resolution did not converge", 2) end
+        local used = {}
+        for _, copy in ipairs(pending) do if copy.variable then used[copy.src] = true end end
+        local pick
+        for i, copy in ipairs(pending) do
+            if not used[copy.dst] then pick = i break end
+        end
+        if pick then
+            local copy = table.remove(pending, pick)
+            self:out(copy.dst .. " = " .. copy.src)
+        else
+            local first = pending[1]
+            local tmp = self.naming:unique("phiTemp")
+            self:out("local " .. tmp .. " = " .. first.dst)
+            for _, copy in ipairs(pending) do
+                if copy.variable and copy.src == first.dst then copy.src = tmp end
+            end
+        end
+    end
+
+    local key = tostring(pred) .. ">" .. tostring(succ)
+    self.outssaEdges[key] = (self.outssaEdges[key] or 0) + 1
+end
+
+function ctx:edgepc(frompc, topc)
+    local pred = frompc and self.cfg.blockmap[frompc]
+    local succ = topc and self.cfg.blockmap[topc]
+    if pred and succ then self:edge(pred, succ) end
+end
+
+function ctx:verifyoutssa()
+    local outssa = self.ir.outssa
+    if not outssa or not outssa.verified then return false, "analysis" end
+    for pred, bysucc in pairs(outssa.edgeCopies or {}) do
+        for succ, copies in pairs(bysucc) do
+            if #copies > 0 then
+                local key = tostring(pred) .. ">" .. tostring(succ)
+                if not self.outssaEdges or not self.outssaEdges[key] then
+                    return false, key
+                end
+            end
+        end
+    end
+    return true
+end
+
+function ctx:verifyexpr()
+    for _, node in pairs(self.expr or {}) do ex.verify(node) end
+    for _, node in pairs(self.vals or {}) do ex.verify(node) end
+    self.v4.exprVerified = true
+    return true
+end
+
+function ctx:verifyscope()
+    for symbol, uses in pairs(self.symbolUses or {}) do
+        local decl = self.symbolScopes and self.symbolScopes[symbol]
+        if not decl then
+            error("LumenV4: SCOPE_VERIFY semantic symbol " .. tostring(symbol) .. " has no lexical declaration", 2)
+        end
+        for _, use in ipairs(uses) do
+            if decl.depth > use.depth then
+                error(("LumenV4: SCOPE_VERIFY symbol %s (%s) escapes declaration depth %d -> use depth %d"):format(tostring(symbol), tostring(use.name), decl.depth, use.depth), 2)
+            end
+            if decl.depth == use.depth and decl.seq > use.seq and not decl.parameter then
+                error(("LumenV4: SCOPE_VERIFY symbol %s (%s) used before declaration"):format(tostring(symbol), tostring(use.name)), 2)
+            end
+        end
+    end
+    self.v4.scopeVerified = true
+    return true
+end
+
 
 return ctx
 ]===],
@@ -14275,6 +16358,67 @@ local function closurechild(parsed, proto, op, byobject)
     end
 end
 
+local function sharddispatch(out, startindex, depth, leafsize)
+    leafsize = math.max(8, tonumber(leafsize) or 48)
+    local prefix = string.rep("    ", depth)
+    local raw = {}
+    for i = startindex, #out do raw[#raw + 1] = out[i] end
+    for i = #out, startindex, -1 do out[i] = nil end
+
+    local branches = {}
+    local current
+    for _, text in ipairs(raw) do
+        local pc = text:match("^" .. prefix .. "if __pc == (%-?%d+) then$")
+            or text:match("^" .. prefix .. "elseif __pc == (%-?%d+) then$")
+        if pc then
+            current = { pc = tonumber(pc), body = {} }
+            branches[#branches + 1] = current
+        elseif current then
+            current.body[#current.body + 1] = text
+        end
+    end
+
+    if #branches == 0 then
+        line(out, depth, "error(\"LumenV4 VM fallback: empty dispatcher\")")
+        return
+    end
+
+    local function body(branch, newdepth)
+        for _, text in ipairs(branch.body) do
+            local spaces = text:match("^(%s*)") or ""
+            local olddepth = math.floor(#spaces / 4)
+            local rel = math.max(0, olddepth - (depth + 1))
+            line(out, newdepth + rel, text:sub(#spaces + 1))
+        end
+    end
+
+    local function leaf(lo, hi, d)
+        for i = lo, hi do
+            local b = branches[i]
+            line(out, d, (i == lo and "if " or "elseif ") .. "__pc == " .. tostring(b.pc) .. " then")
+            body(b, d + 1)
+        end
+        line(out, d, "else")
+        line(out, d + 1, "error(\"LumenV4 VM fallback: invalid pc \" .. tostring(__pc))")
+        line(out, d, "end")
+    end
+
+    local function tree(lo, hi, d)
+        if hi - lo + 1 <= leafsize then
+            leaf(lo, hi, d)
+            return
+        end
+        local mid = math.floor((lo + hi) / 2)
+        line(out, d, "if __pc <= " .. tostring(branches[mid].pc) .. " then")
+        tree(lo, mid, d + 1)
+        line(out, d, "else")
+        tree(mid + 1, hi, d + 1)
+        line(out, d, "end")
+    end
+
+    tree(1, #branches, depth)
+end
+
 local function emitprotofactory(out, parsed, proto, id, byobject, pulse)
     local pcs, slots = realpcs(proto)
     local maxstack = math.max(1, tonumber(proto.MaxStackSize) or 255)
@@ -14336,6 +16480,7 @@ local function emitprotofactory(out, parsed, proto, id, byobject, pulse)
         end
     end
 
+    local dispatchstart = #out + 1
     local branchindex = 0
     for _, pc in ipairs(pcs) do
         if pulse then pulse() end
@@ -14568,9 +16713,7 @@ local function emitprotofactory(out, parsed, proto, id, byobject, pulse)
         end
     end
 
-    line(out, 3, "else")
-    line(out, 4, "error(\"LumenV4 VM fallback: invalid pc \" .. tostring(__pc))")
-    line(out, 3, "end")
+    sharddispatch(out, dispatchstart, 3, 48)
     line(out, 2, "end")
     line(out, 1, "end")
     line(out, 1, "return __fn")
@@ -14786,6 +16929,11 @@ function vm.run(parsed, reason)
         syntaxValid = true,
         originCoverageValid = true,
         coverage = 1,
+        reachableInstructions = decoded,
+        coveredInstructions = decoded,
+        structuredBlocks = 0,
+        fallbackBlocks = decoded,
+        captureVerified = true,
         verification = "decoded-bytecode-total-dispatch",
         structuredError = tostring(reason or ""),
     }
@@ -14828,22 +16976,32 @@ end
 
 function decomp:_state(proto, up, ph)
     self:_check()
-    local limits = {
-        maxinstructions = self.opt.structuredmaxprotoinstructions or self.opt.structuredmaxinstructions,
-        maxblocks = self.opt.structuredmaxblocks,
-    }
+    local limits
+    if self.losslessOnly then
+        local mi = tonumber(self.opt.structuredmaxprotoinstructions) or 16000
+        local mb = tonumber(self.opt.structuredmaxblocks) or 1024
+        limits = { maxinstructions = mi > 0 and math.max(mi, 65536) or 0, maxblocks = mb > 0 and math.max(mb, 4096) or 0 }
+    else
+        limits = {
+            maxinstructions = self.opt.structuredmaxprotoinstructions or self.opt.structuredmaxinstructions,
+            maxblocks = self.opt.structuredmaxblocks,
+        }
+    end
     local ir = irbuild.run(proto, function() self:_check() end, limits)
     ir.paramhints = ph or {}
     self:_check()
     ir = irpass.run(ir, self.opt, function() self:_check() end)
     self:_check()
+    local nt = os.clock()
     local naming = names.new(ir.cfg.registerStats, self.opt, proto)
+    ir.timings = ir.timings or {}; ir.timings.symbolNaming = os.clock() - nt
     local st = context.new(proto, ir, naming, up, lower.new(), self.opt)
-    st.v4 = { fallback = false, visited = {}, status = "STRUCTURED", cellNames = {} }
+    st.v4 = { fallback = false, visited = {}, status = "STRUCTURED", cellNames = {}, captureVerified = true, childCaptures = 0, timings = ir.timings }
 
 
     if ir.cells and next(ir.cells) then
         local oldvname = st.vname
+        st.basevname = oldvname
         local ids = {}
         for cid in pairs(ir.cells) do ids[#ids + 1] = cid end
         table.sort(ids)
@@ -14863,7 +17021,17 @@ function decomp:_state(proto, up, ph)
             end
         end
         st.vname = function(self, value, reg, hint, pc)
-            local cid = value and ((self.ir.cellOfValue and self.ir.cellOfValue[value]) or resolvedcell[self.ir:resolve(value)])
+            local raw = value and self.ir:resolve(value)
+            local cid
+            if pc and raw then
+                local def = self.ssa.defsByPC[pc] and self.ssa.defsByPC[pc][reg]
+                if def and self.ir:resolve(def) == raw then cid = self.ir.cellDef and self.ir.cellDef[pc] and self.ir.cellDef[pc][reg] end
+                if not cid then
+                    local use = self.ssa.usesByPC[pc] and self.ssa.usesByPC[pc][reg]
+                    if use and self.ir:resolve(use) == raw then cid = self.ir.cellUse and self.ir.cellUse[pc] and self.ir.cellUse[pc][reg] end
+                end
+            end
+            if not cid then cid = value and ((self.ir.cellOfValue and self.ir.cellOfValue[value]) or resolvedcell[raw]) end
             local cellname = cid and self.v4.cellNames[cid]
             if cellname then return cellname end
             return oldvname(self, value, reg, hint, pc)
@@ -14871,26 +17039,8 @@ function decomp:_state(proto, up, ph)
     end
 
 
-    for bid, phis in pairs(ir.phis or {}) do
-        local block = assert(ir.cfg.blocks[bid], "LumenV4: phi references invalid CFG block")
-        for reg, phi in pairs(phis) do
-            local pid = ir:resolve(phi.id)
-            if pid and not ir.dead[pid] then
-                local target = st:vname(pid, reg, nil, block.startPC)
-                for pred, raw in pairs(phi.incoming or {}) do
-                    local rid = ir:resolve(raw)
-                    local value = rid and ir.vals[rid] or nil
-                    if value and value.kind ~= "undef" then
-                        local pb = assert(ir.cfg.blocks[pred], "LumenV4: phi references invalid predecessor")
-                        local source = st:vname(rid, reg, nil, pb.endPC)
-                        if source ~= target then
-                            error(("LumenV4: UNSUPPORTED SSA destruction mismatch for phi v%d r%d: b%d uses %s, target is %s")
-                                :format(pid, reg, pred, tostring(source), tostring(target)), 2)
-                        end
-                    end
-                end
-            end
-        end
+    if not ir.outssa or ir.outssa.verified ~= true then
+        error("LumenV4: SSA_DESTRUCT out-of-SSA verification did not complete", 2)
     end
     st.v4.ssaDestructionVerified = true
     return st
@@ -14980,18 +17130,7 @@ function decomp:_op(st, pc)
     end
 
     local name = ins.name(op)
-    local nx
-
-    if name == "NEWTABLE" then
-        st:set(pc, op.A, ex.atom("{}", false))
-        nx = st:next(pc)
-    elseif name == "DUPTABLE" then
-        local constant = st.proto.Constants and st.proto.Constants[(op.D or 0) + 1]
-        st:set(pc, op.A, ex.atom(lit.constant(constant), false))
-        nx = st:next(pc)
-    else
-        nx = ops.run(self, st, pc)
-    end
+    local nx = ops.run(self, st, pc)
 
     if pack.producesTop then
         local produced = st.top
@@ -15014,6 +17153,12 @@ function decomp:_op(st, pc)
         end
         st.top = nil
     end
+    local bid = st.cfg.blockmap[pc]
+    local sid = nx and st.cfg.blockmap[nx]
+    local block = bid and st.cfg.blocks[bid]
+    if not (st.v4 and st.v4.dispatcher) and bid and sid and bid ~= sid and block and #block.successors == 1 and block.successors[1] == sid then
+        st:edge(bid, sid)
+    end
     return nx
 end
 
@@ -15022,23 +17167,40 @@ function decomp:_child(proto, up, ph)
     local st = self:_state(proto, up, ph)
     local args = arguments(st, proto)
     preparepacks(st)
-    self:_region(st, 1, #proto.Instructions + 1, {})
+    local scopeclock
 
-    if hashard(st) then
+    if not self.losslessOnly then
+        scopeclock = os.clock(); st:prepareoutssa(); st.v4.timings.scope = (st.v4.timings.scope or 0) + (os.clock() - scopeclock)
+        local structureclock = os.clock(); self:_region(st, 1, #proto.Instructions + 1, {}); st.v4.timings.structuring = (st.v4.timings.structuring or 0) + (os.clock() - structureclock)
+        local outok, outwhy = st:verifyoutssa()
+        if not outok then st.bad[#st.bad + 1] = "SSA_DESTRUCT structured edge not represented: " .. tostring(outwhy) end
+    end
 
-        st = self:_state(proto, up, ph)
-        args = arguments(st, proto)
-        preparepacks(st)
+    if self.losslessOnly or hashard(st) then
+        if not self.losslessOnly then
+            local base = tonumber(self.opt.structuredbudget) or 1.25
+            local extra = math.min(5, #(proto.Instructions or {}) / 1500)
+            self.deadline = os.clock() + math.max(1.5, base + extra)
+            st = self:_state(proto, up, ph)
+            args = arguments(st, proto)
+            preparepacks(st)
+        end
         st.v4.fallback = true
         st.v4.status = "LOSSLESS_FALLBACK"
-        self:_dispatcher(st)
+        st:preparedispatch()
+        scopeclock = os.clock(); st:prepareoutssa(); st.v4.timings.scope = (st.v4.timings.scope or 0) + (os.clock() - scopeclock)
+        local dispatchclock = os.clock(); self:_dispatcher(st); st.v4.timings.lossless = (st.v4.timings.lossless or 0) + (os.clock() - dispatchclock)
+        local fallbackok, fallbackwhy = st:verifyoutssa()
+        if not fallbackok then st.bad[#st.bad + 1] = "SSA_DESTRUCT fallback edge not represented: " .. tostring(fallbackwhy) end
         if hashard(st) then
             error("LumenV4: UNSUPPORTED semantic lowering issue: " .. table.concat(st.bad, " | "), 2)
         end
     end
 
     self:_check()
-    local root = astpass.run(st.ast:done(), self.opt)
+    local verifyclock = os.clock(); st:verifyexpr(); st.v4.timings.expressionVerify = os.clock() - verifyclock
+    local scopeverifyclock = os.clock(); st:verifyscope(); st.v4.timings.scopeVerify = os.clock() - scopeverifyclock
+    local astclock = os.clock(); local root = astpass.run(st.ast:done(), self.opt); st.v4.timings.ast = os.clock() - astclock
     self:_check()
     return root, st, args
 end
@@ -15070,8 +17232,9 @@ function decomp:_numfor(st, pc, op, stop, active)
     if step ~= "1" then head ..= ", " .. step end
     st:out(head .. " do"); st.indent += 1
     st.alias[varreg] = var; st.declared[var] = st.indent
+    if lv then st:declaresymbol(st.ir:nameid(lv), var, st.indent) end
     local prev, olddepth = active.loop, active.loopdepth
-    active.loop = { breakpc = info.exit, contpc = loop }; active.loopdepth = depth
+    active.loop = { breakpc = info.exit, contpc = loop, headerpc = pc, kind = "numeric" }; active.loopdepth = depth
     self:_region(st, bodystart, loop, active)
     active.loop, active.loopdepth = prev, olddepth
     st:trim(st.indent); st.indent -= 1; st:out("end"); st.alias[varreg] = old
@@ -15085,11 +17248,12 @@ function decomp:_genfor(st, pc, op, stop, active)
     local loop, lop = info.loop, info.op
     local aux = lop.AuxValue and lop.AuxValue.Value or 0
     local n = math.max(1, bit32.band(aux, 0xff))
-    local depth, vars, old = (active.loopdepth or 0) + 1, {}, {}
+    local depth, vars, old, varids = (active.loopdepth or 0) + 1, {}, {}, {}
     for i = 1, n do
         local r = op.A + 2 + i; old[r] = st.alias[r]
         local hint = i == 1 and (n == 1 and "item" or "key") or (i == 2 and "value" or ("value" .. tostring(i)))
         local v = st:verdef(loop, r)
+        varids[i] = v
         vars[i] = not loopused(st, r, st:next(pc), loop) and "_" or st:vname(v, r, hint, loop)
     end
     local src
@@ -15100,9 +17264,12 @@ function decomp:_genfor(st, pc, op, stop, active)
     elseif ins.name(op) == "FORGPREP_NEXT" then src = "pairs(" .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ")"
     else src = ex.str(st:loopx(pc, loop, op.A)) .. ", " .. ex.str(st:loopx(pc, loop, op.A + 1)) .. ", " .. ex.str(st:loopx(pc, loop, op.A + 2)) end
     st:out("for " .. table.concat(vars, ", ") .. " in " .. src .. " do"); st.indent += 1
-    for i = 1, n do local r = op.A + 2 + i; st.alias[r] = vars[i]; st.declared[vars[i]] = st.indent end
+    for i = 1, n do
+        local r = op.A + 2 + i; st.alias[r] = vars[i]; st.declared[vars[i]] = st.indent
+        if varids[i] and vars[i] ~= "_" then st:declaresymbol(st.ir:nameid(varids[i]), vars[i], st.indent) end
+    end
     local prev, olddepth = active.loop, active.loopdepth
-    active.loop = { breakpc = info.exit, contpc = loop }; active.loopdepth = depth
+    active.loop = { breakpc = info.exit, contpc = loop, headerpc = pc, kind = "generic" }; active.loopdepth = depth
     self:_region(st, st:next(pc), loop, active)
     active.loop, active.loopdepth = prev, olddepth
     st:trim(st.indent); st.indent -= 1; st:out("end")
@@ -15112,16 +17279,39 @@ function decomp:_genfor(st, pc, op, stop, active)
 end
 
 function decomp:_emitif(st, info, active, word)
+    local condpcs = info.condpcs or { info.head }
+    local single = #condpcs == 1 and condpcs[1] ~= nil
+    local falsepc = single and condpcs[1] or nil
+    local falseentry = info.c or info.join
+    local falsepred = falsepc and st.cfg.blockmap[falsepc] or nil
+    local falsesucc = falseentry and st.cfg.blockmap[falseentry] or nil
+    local falsecopy = falsepred and falsesucc and st:hasedge(falsepred, falsesucc) or false
+
     st:out((word or "if") .. " " .. ex.str(info.cond) .. " then"); st.indent += 1
+    if single then st:edgepc(info.last or info.head, info.a) end
     local old = active.join; active.join = info.join
     self:_region(st, info.a, info.b, active); active.join = old
     st:trim(st.indent); st.indent -= 1
+
     if info.c then
         local sub = branch.elseifInfo(st, info.c, info.join)
-        if sub then self:_emitif(st, sub, active, "elseif"); return end
-        st:out("else"); st.indent += 1; old = active.join; active.join = info.join
-        self:_region(st, info.c, info.d, active); active.join = old
+        if sub and not falsecopy then
+            self:_emitif(st, sub, active, "elseif")
+            return
+        end
+        st:out("else"); st.indent += 1
+        if single then st:edgepc(falsepc, info.c) end
+        if sub then
+            self:_emitif(st, sub, active, "if")
+        else
+            old = active.join; active.join = info.join
+            self:_region(st, info.c, info.d, active); active.join = old
+        end
         st:trim(st.indent); st.indent -= 1
+    elseif falsecopy then
+        st:out("else"); st.indent += 1
+        st:edgepc(falsepc, info.join)
+        st.indent -= 1
     end
     st:out("end")
 end
@@ -15143,7 +17333,7 @@ function decomp:_region(st, start, stop, active)
 
                 st:hoist(pc)
                 active["repeat:" .. tostring(pc)] = true; st:out("repeat"); st.indent += 1
-                local prev = active.loop; active.loop = { breakpc = rep.exit, contpc = rep.cont }
+                local prev = active.loop; active.loop = { breakpc = rep.exit, contpc = rep.cont, headerpc = pc, kind = "repeat" }
                 self:_region(st, rep.body, rep.latch, active); active.loop = prev
                 local x = cond.fall(st, rep.latch, st.proto.Instructions[rep.latch]); st.v4.visited[rep.latch] = true
                 st:trim(st.indent); st.indent -= 1; st:out("until " .. ex.str(x)); active["repeat:" .. tostring(pc)] = nil; pc = rep.exit
@@ -15153,7 +17343,7 @@ function decomp:_region(st, start, stop, active)
 
                     st:hoist(pc)
                     st:out("while true do"); st.indent += 1; local prev = active.loop
-                    active.loop = { breakpc = forever.exit, contpc = forever.cont, cont2 = forever.latch }
+                    active.loop = { breakpc = forever.exit, contpc = forever.cont, cont2 = forever.latch, headerpc = pc, kind = "forever" }
                     self:_region(st, forever.body, forever.latch, active); active.loop = prev; st.v4.visited[forever.latch] = true
                     st:trim(st.indent); st.indent -= 1; st:out("end"); pc = forever.exit
                 else
@@ -15166,8 +17356,21 @@ function decomp:_region(st, start, stop, active)
                         else st:badpc(pc, "unrecognized CMPPROTO inline guard -> " .. tostring(target)); pc = st:next(pc) end
                     elseif ins.isConditional(op) and name ~= "FORNLOOP" and name ~= "FORGLOOP" then
                         local loop, target = active.loop, ins.jumpTarget(pc, op)
-                        if loop and target == loop.breakpc then st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then break end"); pc = st:next(pc)
-                        elseif loop and (target == loop.contpc or target == loop.cont2) then st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then continue end"); pc = st:next(pc)
+                        local edgekind = loops.edgeKind(st, pc, target, active)
+                        if loop and (target == loop.breakpc or edgekind == "break") then
+                            local from, to = st.cfg.blockmap[pc], st.cfg.blockmap[target]
+                            if from and to and st:hasedge(from, to) then
+                                st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then"); st.indent += 1
+                                st:edge(from, to); st:out("break"); st.indent -= 1; st:out("end")
+                            else st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then break end") end
+                            pc = st:next(pc)
+                        elseif loop and (target == loop.contpc or target == loop.cont2 or edgekind == "continue") then
+                            local from, to = st.cfg.blockmap[pc], st.cfg.blockmap[target]
+                            if from and to and st:hasedge(from, to) then
+                                st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then"); st.indent += 1
+                                st:edge(from, to); st:out("continue"); st.indent -= 1; st:out("end")
+                            else st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then continue end") end
+                            pc = st:next(pc)
                         else
                             local bp = cond.bool(st, pc, op)
                             if bp then pc = bp
@@ -15175,7 +17378,7 @@ function decomp:_region(st, start, stop, active)
                                 local wh = loops.whileInfo(st, pc)
                                 if wh and wh.exit <= stop then
                                     st:hoist(pc); st:out("while " .. ex.str(wh.cond) .. " do"); st.indent += 1
-                                    local prev = active.loop; active.loop = { breakpc = wh.exit, contpc = wh.cont }
+                                    local prev = active.loop; active.loop = { breakpc = wh.exit, contpc = wh.cont, headerpc = pc, kind = "while" }
                                     self:_region(st, wh.body, wh.bodyend, active); active.loop = prev
                                     st:trim(st.indent); st.indent -= 1; st:out("end"); pc = wh.exit
                                 else
@@ -15187,9 +17390,10 @@ function decomp:_region(st, start, stop, active)
                         end
                     elseif name == "JUMP" or name == "JUMPBACK" or name == "JUMPX" then
                         local target, loop = ins.jumpTarget(pc, op), active.loop
-                        if loop and target == loop.breakpc then st:out("break"); pc = st:next(pc)
-                        elseif loop and (target == loop.contpc or target == loop.cont2) then st:out("continue"); pc = st:next(pc)
-                        elseif target == stop or target == active.join then pc = stop
+                        local edgekind = loops.edgeKind(st, pc, target, active)
+                        if loop and (target == loop.breakpc or edgekind == "break") then st:edgepc(pc, target); st:out("break"); pc = st:next(pc)
+                        elseif loop and (target == loop.contpc or target == loop.cont2 or edgekind == "continue") then st:edgepc(pc, target); st:out("continue"); pc = st:next(pc)
+                        elseif target == stop or target == active.join then st:edgepc(pc, target); pc = stop
                         else st:badpc(pc, "unstructured jump -> " .. tostring(target)); pc = st:next(pc) end
                     else pc = self:_op(st, pc) end
                 end
@@ -15202,19 +17406,37 @@ end
 local function dispatcherunsupported(st)
     for _, n in ipairs(st.ir.ops) do
         local name = n.name
-        if name == "FORNPREP" or name == "FORNLOOP" or name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT" or name == "FORGLOOP" then
-            return "dispatcher requires VM loop-state emulation for " .. name .. " at pc " .. tostring(n.pc)
+        if name == "CMPPROTO" then
+            return "CMPPROTO cannot be represented losslessly in source fallback at pc " .. tostring(n.pc)
         end
-        if name == "CMPPROTO" then return "CMPPROTO cannot be represented losslessly in source fallback at pc " .. tostring(n.pc) end
-        if name == "CLOSEUPVALS" then return "dispatcher would change upvalue close/cell lifetime at pc " .. tostring(n.pc) end
-        if name == "CAPTURE" and n.op.A == 1 then return "dispatcher would hoist a by-reference captured local cell at pc " .. tostring(n.pc) end
     end
 end
 
 function decomp:_dispatcher(st)
+    st.v4.dispatcher = true
     local why = dispatcherunsupported(st)
     if why then error("LumenV4: UNSUPPORTED lossless fallback: " .. why, 2) end
 
+    local fornum = st.naming:unique("__fornum")
+    local iterprep = st.naming:unique("__iterprep")
+    st:out("local function " .. fornum .. "(v)")
+    st.indent += 1
+    st:out("if type(v) == \"number\" then return v end")
+    st:out("local n = tonumber(v)")
+    st:out("if n == nil then error(\"invalid 'for' limit/step/index (number expected)\", 2) end")
+    st:out("return n")
+    st.indent -= 1; st:out("end")
+    st:out("local function " .. iterprep .. "(v)")
+    st.indent += 1
+    st:out("local mt")
+    st:out("if type(getrawmetatable) == \"function\" then local ok, raw = pcall(getrawmetatable, v); if ok then mt = raw end end")
+    st:out("if mt == nil then mt = getmetatable(v) end")
+    st:out("local it = type(mt) == \"table\" and mt.__iter or nil")
+    st:out("if it ~= nil then return it(v) end")
+    st:out("if type(mt) == \"table\" and mt.__call ~= nil then return v, nil, nil end")
+    st:out("if type(v) == \"table\" then return next, v, nil end")
+    st:out("return v, nil, nil")
+    st.indent -= 1; st:out("end")
 
     local nameset, ordered = {}, {}
     for id, v in ipairs(st.ir.vals) do
@@ -15243,25 +17465,77 @@ function decomp:_dispatcher(st)
             if not st.consumed[pc] then
                 local op, name = st.proto.Instructions[pc], ins.name(st.proto.Instructions[pc])
                 local last = pi == #b.pcs
-                if last and ins.isConditional(op) then
+                if last and name == "FORNPREP" then
+                    local a = op.A
+                    local oldlimit, oldstep, oldidx = st:use(pc, a), st:use(pc, a + 1), st:use(pc, a + 2)
+                    local limit = st:set(pc, a, ex.atom(fornum .. "(" .. oldlimit .. ")", false)) or st:defName(pc, a)
+                    local step = st:set(pc, a + 1, ex.atom(fornum .. "(" .. oldstep .. ")", false)) or st:defName(pc, a + 1)
+                    local idx = st:set(pc, a + 2, ex.atom(fornum .. "(" .. oldidx .. ")", false)) or st:defName(pc, a + 2)
+                    local target, fall = st.cfg.blockmap[ins.jumpTarget(pc, op)], st.cfg.blockmap[st:next(pc)]
+                    if not target or not fall then error("LumenV4: invalid FORNPREP edge at pc " .. tostring(pc), 2) end
+                    st:out("if (" .. step .. " > 0 and " .. idx .. " <= " .. limit .. ") or (not (" .. step .. " > 0) and " .. limit .. " <= " .. idx .. ") then")
+                    st.indent += 1; st:edge(b.id, fall); st:out(state .. " = " .. tostring(fall)); st.indent -= 1
+                    st:out("else"); st.indent += 1; st:edge(b.id, target); st:out(state .. " = " .. tostring(target)); st.indent -= 1; st:out("end")
+                elseif last and name == "FORNLOOP" then
+                    local a = op.A
+                    local limit, step, oldidx = st:use(pc, a), st:use(pc, a + 1), st:use(pc, a + 2)
+                    local idx = st:set(pc, a + 2, ex.atom(oldidx .. " + " .. step, false)) or st:defName(pc, a + 2)
+                    local target, fall = st.cfg.blockmap[ins.jumpTarget(pc, op)], st.cfg.blockmap[st:next(pc)]
+                    if not target or not fall then error("LumenV4: invalid FORNLOOP edge at pc " .. tostring(pc), 2) end
+                    st:out("if (" .. step .. " > 0 and " .. idx .. " <= " .. limit .. ") or (not (" .. step .. " > 0) and " .. limit .. " <= " .. idx .. ") then")
+                    st.indent += 1; st:edge(b.id, target); st:out(state .. " = " .. tostring(target)); st.indent -= 1
+                    st:out("else"); st.indent += 1; st:edge(b.id, fall); st:out(state .. " = " .. tostring(fall)); st.indent -= 1; st:out("end")
+                elseif last and (name == "FORGPREP" or name == "FORGPREP_INEXT" or name == "FORGPREP_NEXT") then
+                    local a = op.A
+                    local g0, s0, i0 = st:use(pc, a), st:use(pc, a + 1), st:use(pc, a + 2)
+                    local gtmp = st.naming:unique("iterator")
+                    local stmp = st.naming:unique("state")
+                    local itmp = st.naming:unique("index")
+                    if name == "FORGPREP" then
+                        st:out("local " .. gtmp .. ", " .. stmp .. ", " .. itmp .. " = " .. g0 .. ", " .. s0 .. ", " .. i0)
+                        st:out("if type(" .. gtmp .. ") ~= \"function\" then " .. gtmp .. ", " .. stmp .. ", " .. itmp .. " = " .. iterprep .. "(" .. gtmp .. ") end")
+                    else
+                        st:out("local " .. gtmp .. ", " .. stmp .. ", " .. itmp .. " = " .. g0 .. ", " .. s0 .. ", " .. i0)
+                    end
+                    st:set(pc, a, ex.atom(gtmp, false))
+                    st:set(pc, a + 1, ex.atom(stmp, false))
+                    st:set(pc, a + 2, ex.atom(itmp, false))
+                    local target = st.cfg.blockmap[ins.jumpTarget(pc, op)]
+                    if not target then error("LumenV4: invalid FORGPREP edge at pc " .. tostring(pc), 2) end
+                    st:edge(b.id, target); st:out(state .. " = " .. tostring(target))
+                elseif last and name == "FORGLOOP" then
+                    local a = op.A
+                    local count = math.max(1, bit32.band((op.AuxValue and op.AuxValue.Value or 0), 0xff))
+                    local ret = st.naming:unique("iterResult")
+                    st:out("local " .. ret .. " = table.pack((" .. st:use(pc, a) .. ")(" .. st:use(pc, a + 1) .. ", " .. st:use(pc, a + 2) .. "))")
+                    local indexname = st:set(pc, a + 2, ex.atom(ret .. "[1]", false)) or st:defName(pc, a + 2)
+                    for i = 1, count do st:set(pc, a + 2 + i, ex.atom(ret .. "[" .. tostring(i) .. "]", false)) end
+                    local target, fall = st.cfg.blockmap[ins.jumpTarget(pc, op)], st.cfg.blockmap[st:next(pc)]
+                    if not target or not fall then error("LumenV4: invalid FORGLOOP edge at pc " .. tostring(pc), 2) end
+                    st:out("if " .. indexname .. " ~= nil then")
+                    st.indent += 1; st:edge(b.id, target); st:out(state .. " = " .. tostring(target)); st.indent -= 1
+                    st:out("else"); st.indent += 1; st:edge(b.id, fall); st:out(state .. " = " .. tostring(fall)); st.indent -= 1; st:out("end")
+                elseif last and ins.isConditional(op) then
                     local target, fall = st.cfg.blockmap[ins.jumpTarget(pc, op)], st.cfg.blockmap[st:next(pc)]
                     if not target or not fall then error("LumenV4: invalid dispatcher conditional edge at pc " .. tostring(pc), 2) end
                     st:out("if " .. ex.str(cond.jump(st, pc, op)) .. " then")
-                    st.indent += 1; st:out(state .. " = " .. tostring(target)); st.indent -= 1
-                    st:out("else"); st.indent += 1; st:out(state .. " = " .. tostring(fall)); st.indent -= 1; st:out("end")
+                    st.indent += 1; st:edge(b.id, target); st:out(state .. " = " .. tostring(target)); st.indent -= 1
+                    st:out("else"); st.indent += 1; st:edge(b.id, fall); st:out(state .. " = " .. tostring(fall)); st.indent -= 1; st:out("end")
                 elseif last and (name == "JUMP" or name == "JUMPBACK" or name == "JUMPX") then
                     local target = st.cfg.blockmap[ins.jumpTarget(pc, op)]
                     if not target then error("LumenV4: invalid dispatcher jump edge at pc " .. tostring(pc), 2) end
+                    st:edge(b.id, target)
                     st:out(state .. " = " .. tostring(target))
                 elseif last and name == "LOADB" and (op.C or 0) ~= 0 then
                     self:_op(st, pc)
                     local target = st.cfg.blockmap[pc + op.C + 1]
                     if not target then error("LumenV4: invalid LOADB edge at pc " .. tostring(pc), 2) end
+                    st:edge(b.id, target)
                     st:out(state .. " = " .. tostring(target))
                 else
                     self:_op(st, pc)
                     if last and name ~= "RETURN" then
-                        if #b.successors == 1 then st:out(state .. " = " .. tostring(b.successors[1]))
+                        if #b.successors == 1 then st:edge(b.id, b.successors[1]); st:out(state .. " = " .. tostring(b.successors[1]))
                         elseif #b.successors == 0 then st:out("break")
                         elseif #b.successors > 1 then error("LumenV4: unhandled multi-successor block at pc " .. tostring(pc), 2) end
                     end
@@ -15273,6 +17547,7 @@ function decomp:_dispatcher(st)
     st:out("else"); st.indent += 1; st:out("error(\"LumenV4: invalid dispatcher state \" .. tostring(" .. state .. "))"); st.indent -= 1
     st:out("end")
     st.indent -= 1; st:out("end")
+    st.v4.dispatcher = nil
 end
 
 local function metrics(st)
@@ -15286,9 +17561,35 @@ local function metrics(st)
     return reachable, covered, reachable == 0 and 1 or covered / reachable
 end
 
+local function capturebackstop(src)
+    for text in tostring(src or ""):gmatch("[^\r\n]+") do
+        local lhs, rhs = text:match("^%s*local%s+([%a_][%w_]*)%s*=%s*([%a_][%w_]*)%s*;?%s*$")
+        if lhs and lhs == rhs and (lhs:match("^upvalue%d+$") or lhs:match("^capture%d*Value%d*$") or lhs:match("^cell%d+$")) then
+            return false, lhs
+        end
+    end
+    return true
+end
+
 function decomp:decompileProto(proto, up)
     local root, st = self:_child(proto, up or {})
-    local src = printer.run(root, self.opt)
+    if not st.v4 or st.v4.captureVerified ~= true then
+        error("LumenV4: CAPTURE_VERIFY structured capture verification did not complete", 2)
+    end
+    if not st.v4.ssaDestructionVerified or not st.v4.outssaVerified or not st.ir.outssa or st.ir.outssa.verified ~= true then
+        error("LumenV4: SSA_DESTRUCT structured out-of-SSA verification did not complete", 2)
+    end
+    if not st.ir.objectVerified then error("LumenV4: OBJECT_VERIFY object identity verification did not complete", 2) end
+    if not st.ssa.valuePackVerified then error("LumenV4: VALUEPACK_VERIFY ValuePack verification did not complete", 2) end
+    if not st.v4.exprVerified then error("LumenV4: EXPR_VERIFY semantic expression verification did not complete", 2) end
+    if not st.v4.scopeVerified then error("LumenV4: SCOPE_VERIFY scope verification did not complete", 2) end
+    if not st.cfg.verified or not st.cfg.structure or not st.cfg.structure.verified then error("LumenV4: CFG_STRUCTURE verification did not complete", 2) end
+    local printclock = os.clock(); local src = printer.run(root, self.opt); st.v4.timings.printing = os.clock() - printclock
+    local verifyclock = os.clock()
+    local capok, capname = capturebackstop(src)
+    if not capok then
+        error("LumenV4: CAPTURE_VERIFY accidental self-initialization for " .. tostring(capname), 2)
+    end
     local reachable, covered, coverage = metrics(st)
     if covered ~= reachable then
         error(("LumenV4: PARTIAL origin coverage %d/%d (%.2f%%)"):format(covered, reachable, coverage * 100), 2)
@@ -15312,19 +17613,22 @@ function decomp:decompileProto(proto, up)
         error("LumenV4: UNSUPPORTED syntax verification requires loadstring()", 2)
     end
 
-    local header = ("-- LumenV4 status=%s coverage=%.2f reachable=%d covered=%d blocks=%d structuredBlocks=%d fallbackBlocks=%d phis=%d undefs=%d packs=%d cells=%d objects=%d escapedObjects=%d irreducible=%d bytecodeVersion=%d ssa=true parser=true diagnostics=%d\n")
+    local header = ("-- LumenV4 status=%s coverage=%.2f reachable=%d covered=%d blocks=%d structuredBlocks=%d fallbackBlocks=%d phis=%d undefs=%d packs=%d cells=%d objects=%d escapedObjects=%d irreducible=%d bytecodeVersion=%d ssa=true outssa=true copies=%d parser=true capture=true objects=true valuepacks=true scope=true expr=true cfgstructure=true diagnostics=%d\n")
         :format(st.v4.status, coverage * 100, reachable, covered, #st.cfg.blocks, structuredblocks, fallbackblocks,
-            ss.phis or 0, ss.undefs or 0, packcount, cellcount, objectcount, escapedobjects, irreducible, bytecodeversion, #st.bad)
+            ss.phis or 0, ss.undefs or 0, packcount, cellcount, objectcount, escapedobjects, irreducible, bytecodeversion, st.ir.outssa.copyCount or 0, #st.bad)
     src = header .. src
     local check, err = loadstring(src, "@LumenV4/verify")
     if not check then error("LumenV4: INVALID emitted Luau: " .. tostring(err), 2) end
+    st.v4.timings.verification = os.clock() - verifyclock
 
     return src, {
         status = st.v4.status, cfg = st.cfg, ir = st.ir, ssa = st.ssa, ssaSummary = ss, issues = st.bad,
         coverage = coverage, coveredInstructions = covered, reachableInstructions = reachable, fallback = st.v4.fallback,
-        syntaxValid = true, originCoverageValid = true, verification = "syntax+CFG-origin-invariants",
+        syntaxValid = true, originCoverageValid = true, verification = "syntax+CFG-origin+SSA+out-of-SSA+capture+object+scope+expression-invariants", captureVerified = true, outssaVerified = true,
+        objectVerified = true, valuePackVerified = true, scopeVerified = true, expressionVerified = true, cfgStructureVerified = true,
+        outssaCopyCount = st.ir.outssa.copyCount or 0, outssaCoalesced = st.ir.outssa.coalesced or 0,
         objectCount = objectcount, escapedObjects = escapedobjects, cellCount = cellcount, valuePackCount = packcount,
-        irreducible = st.cfg.irreducible == true, bytecodeVersion = bytecodeversion,
+        irreducible = st.cfg.irreducible == true, bytecodeVersion = bytecodeversion, timings = st.v4.timings,
     }
 end
 
@@ -15340,13 +17644,15 @@ function decomp:decompileParsed(parsed)
         totalinstructions += n
         if n > maxprotoinstructions then maxprotoinstructions = n end
     end
-    local maxtotal = tonumber(self.opt.structuredmaxinstructions) or 8000
-    local maxproto = tonumber(self.opt.structuredmaxprotoinstructions) or 4000
+    local maxtotal = tonumber(self.opt.structuredmaxinstructions) or 32000
+    local maxproto = tonumber(self.opt.structuredmaxprotoinstructions) or 16000
     local structurederror
     if (maxtotal > 0 and totalinstructions > maxtotal) or (maxproto > 0 and maxprotoinstructions > maxproto) then
         structurederror = "LumenV4: STRUCTURED_COMPLEXITY total=" .. tostring(totalinstructions) .. " maxproto=" .. tostring(maxprotoinstructions)
     else
-        local budget = tonumber(self.opt.structuredbudget) or 1.25
+        local basebudget = tonumber(self.opt.structuredbudget) or 1.25
+        local adaptive = math.min(5, totalinstructions / 2500)
+        local budget = basebudget > 0 and (basebudget + adaptive) or 0
         self.slice = os.clock()
         self.deadline = budget > 0 and (self.slice + budget) or nil
         local ok, src, info = pcall(function() return self:decompileProto(proto, {}) end)
@@ -15360,14 +17666,31 @@ function decomp:decompileParsed(parsed)
 
     self.deadline = nil
     self.slice = os.clock()
+
+    local losslessReason = structurederror
+    self.losslessOnly = true
+    local basebudget = tonumber(self.opt.structuredbudget) or 1.25
+    local losslessBudget = math.max(2.0, basebudget + math.min(8, totalinstructions / 1500))
+    self.deadline = os.clock() + losslessBudget
+    local lok, lsrc, linfo = pcall(function() return self:decompileProto(proto, {}) end)
+    self.deadline = nil
+    self.losslessOnly = nil
+    if lok then
+        self.parsed = nil
+        linfo.structuredError = losslessReason
+        return lsrc, linfo
+    end
+
+    local losslesserror = tostring(lsrc)
+    self.slice = os.clock()
     local fok, fsrc, finfo = pcall(function()
-        return vmfallback.run(parsed, structurederror)
+        return vmfallback.run(parsed, losslessReason .. " | lossless retry: " .. losslesserror)
     end)
     self.parsed = nil
 
     if not fok then
         error("LumenV4: VM fallback generator failure after structured failure: " .. tostring(fsrc)
-            .. " | structured: " .. structurederror, 2)
+            .. " | structured: " .. structurederror .. " | lossless: " .. losslesserror, 2)
     end
     return fsrc, finfo
 end
@@ -15447,12 +17770,14 @@ function ops.run(d, st, pc)
     local a, b, c, dd = op.A, op.B, op.C, op.D
     local aux = op.AuxValue and op.AuxValue.Value or 0
 
-    if name == "NOP" or name == "BREAK" or name == "CLOSEUPVALS" or name == "PREPVARARGS" or name == "COVERAGE" or name == "NATIVECALL" then
-    elseif name == "LOADNIL" then st:set(pc, a, ex.atom("nil", true))
+    if name == "CLOSEUPVALS" then
+        if st.v4 and st.v4.dispatcher then st:closecells(pc) end
+    elseif name == "NOP" or name == "BREAK" or name == "PREPVARARGS" or name == "COVERAGE" or name == "NATIVECALL" then
+    elseif name == "LOADNIL" then st:set(pc, a, ex.literal("nil"))
     elseif name == "LOADB" then
-        st:set(pc, a, ex.atom(b == 1 and "true" or "false", true))
+        st:set(pc, a, ex.literal(b == 1 and "true" or "false"))
         if c ~= 0 then return pc + c + 1 end
-    elseif name == "LOADN" then st:set(pc, a, ex.atom(tostring(dd), true))
+    elseif name == "LOADN" then st:set(pc, a, ex.literal(tostring(dd)))
     elseif name == "LOADK" then
         local k = getk(st.proto, dd)
         local raw = k and k.__type == "String" and lit.rawStringConstant(k) or nil
@@ -15465,15 +17790,17 @@ function ops.run(d, st, pc)
         st:set(pc, a, st:usex(pc, b), nil, st:raw(pc, b))
     elseif name == "GETGLOBAL" then
         local g = lit.rawStringConstant(getk(st.proto, aux)) or "unknownGlobal"
-        st:set(pc, a, ex.atom(g, false), g)
+        st:set(pc, a, ex.global(g), g)
     elseif name == "SETGLOBAL" then
         local g = lit.rawStringConstant(getk(st.proto, aux)) or "unknownGlobal"
         st:out(g .. " = " .. st:use(pc, a))
     elseif name == "GETUPVAL" then
-        local u = st.up[b + 1] or ("upvalue" .. tostring(b))
+        local u = st:upname(b + 1)
+        if not u then error(("LumenV4: CAPTURE_VERIFY GETUPVAL missing slot U%d at pc %d"):format(b, pc), 2) end
         st:set(pc, a, ex.atom(u, false), u)
     elseif name == "SETUPVAL" then
-        local u = st.up[b + 1] or ("upvalue" .. tostring(b))
+        local u = st:upname(b + 1)
+        if not u then error(("LumenV4: CAPTURE_VERIFY SETUPVAL missing slot U%d at pc %d"):format(b, pc), 2) end
         st:out(u .. " = " .. st:use(pc, a))
     elseif name == "GETIMPORT" then
         local v = lit.rawStringConstant(getk(st.proto, dd)) or lit.constant(getk(st.proto, dd))
@@ -15482,10 +17809,10 @@ function ops.run(d, st, pc)
         st:set(pc, a, ex.prop(st:usex(pc, b), "[" .. st:use(pc, c) .. "]"))
     elseif name == "SETTABLE" then
         local tv = st:veruse(pc, b)
-        local t = tv and st.tbl[tv]
+        local t = tv and tab.get(st, tv)
         local sv = st:veruse(pc, a)
         local kv = st:veruse(pc, c)
-        if t and not t.done and sv ~= tv and kv ~= tv then
+        if tab.canput(t, pc) and sv ~= tv and kv ~= tv then
             t.entries[#t.entries + 1] = { kind = "key", key = st:use(pc, c), val = st:usex(pc, a) }
         else
             st:out(st:use(pc, b) .. "[" .. st:use(pc, c) .. "] = " .. st:use(pc, a))
@@ -15499,9 +17826,9 @@ function ops.run(d, st, pc)
         local ki = name == "SETUDATAKS" and bit32.band(aux, 0xffff) or aux
         local f = lit.rawStringConstant(getk(st.proto, ki)) or "?"
         local tv = st:veruse(pc, b)
-        local t = tv and st.tbl[tv]
+        local t = tv and tab.get(st, tv)
         local sv = st:veruse(pc, a)
-        if t and not t.done and lit.identifier(f) and sv ~= tv then
+        if tab.canput(t, pc) and lit.identifier(f) and sv ~= tv then
             tab.put(t, "field", f, st:usex(pc, a))
         else
             st:out(lit.property(st:use(pc, b), f) .. " = " .. st:use(pc, a))
@@ -15510,9 +17837,9 @@ function ops.run(d, st, pc)
         st:set(pc, a, ex.prop(st:usex(pc, b), "[" .. tostring(c + 1) .. "]"))
     elseif name == "SETTABLEN" then
         local tv = st:veruse(pc, b)
-        local t = tv and st.tbl[tv]
+        local t = tv and tab.get(st, tv)
         local sv = st:veruse(pc, a)
-        if t and not t.done and sv ~= tv then
+        if tab.canput(t, pc) and sv ~= tv then
             local idx = c + 1
             local kind = idx == #t.entries + 1 and "list" or "key"
             t.entries[#t.entries + 1] = { kind = kind, key = tostring(idx), val = st:usex(pc, a) }
@@ -15542,39 +17869,16 @@ function ops.run(d, st, pc)
             st:out("return " .. table.concat(vals, ", "))
         end
     elseif name == "NEWTABLE" then
-        local v = st:verdef(pc, a)
-        local safe = v ~= nil and not st.naming:isDebugAt(a, pc)
-        local real = 0
-        if safe then
-            local block = st.cfg.blockmap[pc]
-            for _, u in ipairs(st.ir:uses(v) or {}) do
-                if not u.pc or st.cfg.blockmap[u.pc] ~= block then safe = false break end
-                if not st:tblmut(u, a) then real += 1 end
-            end
-        end
-        if safe then st.tbl[v] = { reg = a, entries = {}, real = real, done = false }
-        else st:set(pc, a, ex.atom("{}", false)) end
+        local t = tab.begin(st, pc, a, {}, {})
+        if not t then st:set(pc, a, ex.atom("{}", false)) end
     elseif name == "DUPTABLE" then
-        local v = st:verdef(pc, a)
-        local safe = v ~= nil and not st.naming:isDebugAt(a, pc)
-        local real = 0
-        if safe then
-            local block = st.cfg.blockmap[pc]
-            for _, u in ipairs(st.ir:uses(v) or {}) do
-                if not u.pc or st.cfg.blockmap[u.pc] ~= block then safe = false break end
-                if not st:tblmut(u, a) then real += 1 end
-            end
-        end
-        if safe then
-            local entries, slots = tab.seed(getk(st.proto, dd))
-            st.tbl[v] = { reg = a, entries = entries, slots = slots, real = real, done = false }
-        else
-            st:set(pc, a, ex.atom(lit.constant(getk(st.proto, dd)), false))
-        end
+        local entries, slots = tab.seed(getk(st.proto, dd))
+        local t = tab.begin(st, pc, a, entries, slots)
+        if not t then st:set(pc, a, ex.atom(lit.constant(getk(st.proto, dd)), false)) end
     elseif name == "SETLIST" then
         local start = aux
         local tv = st:veruse(pc, a)
-        local t = tv and st.tbl[tv]
+        local t = tv and tab.get(st, tv)
         local vals = {}
         local mult = false
         if c == 0 then
@@ -15592,9 +17896,10 @@ function ops.run(d, st, pc)
         local selfref = false
         for i = 1, #vals do
             local r = b + i - 1
-            if st:veruse(pc, r) == tv then selfref = true break end
+            local rv = st:veruse(pc, r)
+            if t and rv and st.ir.objectId and st.ir:objectId(rv) == t.oid then selfref = true break end
         end
-        if t and not t.done and not selfref then
+        if tab.canput(t, pc) and not selfref then
             for i, v in ipairs(vals) do
                 local idx = start + i - 1
                 local kind = idx == #t.entries + 1 and "list" or "key"
@@ -15625,7 +17930,9 @@ function ops.run(d, st, pc)
         local ck = getk(st.proto, dd)
         local child
         if d.parsed and ck and ck.__type == "Closure" then child = d.parsed.Protos[(ck.Value or 0) + 1] end
-        if child then func.emit(d, st, pc, a, child, {}, st:next(pc))
+        if child then
+            local caps, nx = func.caps(st, pc, child, "dup")
+            func.emit(d, st, pc, a, child, caps, nx)
         else st:badpc(pc, "missing DUPCLOSURE proto"); st:set(pc, a, ex.atom("function(...) end", false)) end
     elseif name == "ADD" or name == "SUB" or name == "MUL" or name == "DIV" or name == "MOD" or name == "POW" or name == "IDIV" or name == "AND" or name == "OR" then
         local map = { ADD = "+", SUB = "-", MUL = "*", DIV = "/", MOD = "%", POW = "^", IDIV = "//", AND = "and", OR = "or" }
@@ -15789,7 +18096,7 @@ local function analyzecells(out, check)
         end
     end
 
-    local valuecells, closesites = {}, {}
+    local valuecells, closesites, celluse, celldef, closevalue = {}, {}, {}, {}, {}
     local function markvalue(version, set)
         if not version or not set or not next(set) then return end
         local dst = valuecells[version]
@@ -15799,6 +18106,8 @@ local function analyzecells(out, check)
 
     for _, b in ipairs(out.cfg.blocks) do
         local state = copystate(instate[b.id])
+        local current = {}
+        for r, version in pairs(out.ssa.inVersions[b.id] or {}) do current[r] = version end
         for _, pc in ipairs(b.pcs) do
             local op = out.proto.Instructions[pc]
             local name = ins.name(op)
@@ -15811,12 +18120,27 @@ local function analyzecells(out, check)
                 set[capturecell[pc]] = true
             end
 
-            for r, version in pairs(uses) do markvalue(version, state[r]) end
-            for r, version in pairs(defs) do markvalue(version, state[r]) end
+            for r, version in pairs(uses) do
+                markvalue(version, state[r])
+                if state[r] and next(state[r]) then
+                    local m = celluse[pc]; if not m then m = {}; celluse[pc] = m end
+                    m[r] = copyset(state[r])
+                end
+            end
+            for r, version in pairs(defs) do
+                markvalue(version, state[r])
+                if state[r] and next(state[r]) then
+                    local m = celldef[pc]; if not m then m = {}; celldef[pc] = m end
+                    m[r] = copyset(state[r])
+                end
+                current[r] = version
+            end
 
             if name == "CLOSEUPVALS" then
                 for r, set in pairs(state) do
                     if r >= (op.A or 0) then
+                        local cm = closevalue[pc]; if not cm then cm = {}; closevalue[pc] = cm end
+                        cm[r] = { value = current[r], cells = copyset(set) }
                         for cid in pairs(set) do
                             local list = closesites[cid]
                             if not list then list = {}; closesites[cid] = list end
@@ -15844,11 +18168,10 @@ local function analyzecells(out, check)
         local first
         for cid in pairs(set or {}) do if first then join(first, cid) else first = cid end end
     end
-    for _, set in pairs(valuecells) do joinset(set) end
     for _, state in pairs(instate) do for _, set in pairs(state) do joinset(set) end end
     for _, state in pairs(outstate) do for _, set in pairs(state) do joinset(set) end end
 
-    local cells, cellofvalue = {}, {}
+    local cells, cellofvalue, cellsets = {}, {}, {}
     for pc, cid in pairs(capturecell) do
         local rid = root(cid)
         capturecell[pc] = rid
@@ -15857,13 +18180,43 @@ local function analyzecells(out, check)
         c.captures[#c.captures + 1] = pc
     end
     for version, set in pairs(valuecells) do
-        local rid
-        for cid in pairs(set) do rid = root(cid); break end
-        if rid then
-            cellofvalue[version] = rid
+        local roots, count, only = {}, 0, nil
+        for cid in pairs(set) do
+            local rid = root(cid)
+            if not roots[rid] then roots[rid] = true; count += 1; only = rid end
+        end
+        cellsets[version] = roots
+        if count == 1 then cellofvalue[version] = only end
+        for rid in pairs(roots) do
             local c = cells[rid]
             if not c then c = { id = rid, reg = capturereg[rid], captures = {}, closes = {}, values = {} }; cells[rid] = c end
             c.values[version] = true
+        end
+    end
+
+    local function rootmap(source)
+        local outmap = {}
+        for pc, regsmap in pairs(source) do
+            local pm = {}; outmap[pc] = pm
+            for r, set in pairs(regsmap) do
+                local rid
+                for cid in pairs(set) do
+                    local nextid = root(cid)
+                    if rid and rid ~= nextid then error("LumenV4: CellId point state contains distinct cells", 2) end
+                    rid = nextid
+                end
+                if rid then pm[r] = rid end
+            end
+        end
+        return outmap
+    end
+    celluse = rootmap(celluse)
+    celldef = rootmap(celldef)
+    for pc, regsmap in pairs(closevalue) do
+        for _, rec in pairs(regsmap) do
+            local roots = {}
+            for cid in pairs(rec.cells or {}) do roots[root(cid)] = true end
+            rec.cells = roots
         end
     end
     for cid, sites in pairs(closesites) do
@@ -15875,6 +18228,10 @@ local function analyzecells(out, check)
 
     out.cells = cells
     out.cellOfValue = cellofvalue
+    out.cellSetsByValue = cellsets
+    out.cellUse = celluse
+    out.cellDef = celldef
+    out.cellCloseValue = closevalue
     out.captureCell = capturecell
     out.cellInState = instate
     out.cellOutState = outstate
@@ -15965,9 +18322,24 @@ local function analyzeobjects(out, check)
         end
     end
 
+    for value, os in pairs(sets) do
+        assert(out.vals[value] ~= nil, "LumenV4: OBJECT_VERIFY set references unknown SSA value")
+        for oid in pairs(os) do assert(objects[oid] ~= nil, "LumenV4: OBJECT_VERIFY set references unknown ObjectId") end
+    end
+    for oid, obj in pairs(objects) do
+        local op = out.proto.Instructions[obj.allocPC]
+        local name = op and ins.name(op) or nil
+        assert(name == "NEWTABLE" or name == "DUPTABLE" or name == "NEWCLASS", "LumenV4: OBJECT_VERIFY ObjectId has invalid allocation")
+        assert(obj.id == oid, "LumenV4: OBJECT_VERIFY ObjectId mismatch")
+        for value in pairs(obj.aliases or {}) do
+            assert(sets[value] and sets[value][oid], "LumenV4: OBJECT_VERIFY alias does not point back to object")
+        end
+    end
+
     out.objectSets = sets
     out.objects = objects
     out.objectIterations = iterations
+    out.objectVerified = true
     function out:objectIds(valueid) return self.objectSets[self:resolve(valueid)] or {} end
     function out:objectId(valueid)
         local one
@@ -15978,8 +18350,9 @@ local function analyzeobjects(out, check)
 end
 
 function build.run(proto, check, limits)
-    local cfg = graph.build(proto, check, limits)
-    local flow = ssa.build(proto, cfg, check, limits)
+    local timings = {}
+    local t = os.clock(); local cfg = graph.build(proto, check, limits); timings.graph = os.clock() - t
+    t = os.clock(); local flow = ssa.build(proto, cfg, check, limits); timings.ssa = os.clock() - t
     assert(flow.converged, "LumenV4: refusing non-converged SSA")
     local out = fn.new(proto, cfg, flow)
     for id, src in ipairs(flow.versions) do
@@ -16005,8 +18378,11 @@ function build.run(proto, check, limits)
         end
     end
     out:reindex()
-    analyzecells(out, check)
-    analyzeobjects(out, check)
+    t = os.clock(); analyzecells(out, check); timings.cells = os.clock() - t
+    t = os.clock(); analyzeobjects(out, check); timings.objects = os.clock() - t
+    out.timings = timings
+    out.timings.cfg = cfg.timings or {}
+    out.timings.ssaDetail = flow.timings or {}
     return out
 end
 return build
@@ -16647,8 +19023,7 @@ end
 
 return w
 ]===],
-    ["main.output.expr"] = [===[
-local expr = {}
+    ["main.output.expr"] = [===[local expr = {}
 
 local prec = {
     ["or"] = 1,
@@ -16669,53 +19044,103 @@ local prec = {
     ["^"] = 8,
 }
 
-local function node(s, p, stable, kind, a, b, op)
-    return { s = s, p = p or 99, stable = stable == true, kind = kind, a = a, b = b, op = op }
-end
-
-local function text(v)
-    return type(v) == "table" and v.s or tostring(v)
-end
-
-local function wrap(v, p, right, op)
+local function render(v)
     if type(v) ~= "table" then return tostring(v) end
-    if v.p < p then return "(" .. v.s .. ")" end
-    if v.p == p then
-        if p == 3 then return "(" .. v.s .. ")" end
-        if op == "^" and not right then return "(" .. v.s .. ")" end
-        if op == ".." and not right then return "(" .. v.s .. ")" end
-        if right and op ~= "^" and op ~= ".." then return "(" .. v.s .. ")" end
+    local kind = v.kind
+    if kind == "atom" or kind == "raw" or kind == "literal" or kind == "local" or kind == "global" then
+        return tostring(v.value or "")
+    elseif kind == "bin" then
+        local p = v.p
+        local function wrap(x, right)
+            if type(x) ~= "table" then return tostring(x) end
+            local text = render(x)
+            if x.p < p then return "(" .. text .. ")" end
+            if x.p == p then
+                if p == 3 then return "(" .. text .. ")" end
+                if v.op == "^" and not right then return "(" .. text .. ")" end
+                if v.op == ".." and not right then return "(" .. text .. ")" end
+                if right and v.op ~= "^" and v.op ~= ".." then return "(" .. text .. ")" end
+            end
+            return text
+        end
+        return wrap(v.a, false) .. " " .. v.op .. " " .. wrap(v.b, true)
+    elseif kind == "un" then
+        local a = render(v.a)
+        if type(v.a) == "table" and v.a.p < v.p then a = "(" .. a .. ")" end
+        return v.op == "not" and ("not " .. a) or (v.op .. a)
+    elseif kind == "prop" then
+        local a = render(v.a)
+        if type(v.a) == "table" and v.a.p < 9 then a = "(" .. a .. ")" end
+        return a .. tostring(v.field or "")
+    elseif kind == "call" then
+        local fn = render(v.fn)
+        if type(v.fn) == "table" and v.fn.p < 9 then fn = "(" .. fn .. ")" end
+        if v.method then fn = fn .. ":" .. tostring(v.method) end
+        local args = {}
+        for i, arg in ipairs(v.args or {}) do args[i] = render(arg) end
+        return fn .. "(" .. table.concat(args, ", ") .. ")"
+    elseif kind == "table" then
+        local out = {}
+        for _, field in ipairs(v.fields or {}) do
+            if field.kind == "list" then
+                out[#out + 1] = render(field.value)
+            elseif field.kind == "field" then
+                out[#out + 1] = tostring(field.key) .. " = " .. render(field.value)
+            else
+                out[#out + 1] = "[" .. tostring(field.key) .. "] = " .. render(field.value)
+            end
+        end
+        return #out == 0 and "{}" or ("{ " .. table.concat(out, ", ") .. " }")
     end
-    return v.s
+    error("LumenV4: EXPR_VERIFY unknown semantic expression kind " .. tostring(kind), 2)
+end
+
+local function node(kind, p, stable, data)
+    local out = { kind = kind, p = p or 99, stable = stable == true }
+    for k, v in pairs(data or {}) do out[k] = v end
+    out.s = render(out)
+    return out
 end
 
 function expr.atom(s, stable)
-    return node(s, 99, stable, "atom")
+    return node("atom", 99, stable, { value = s })
+end
+
+function expr.raw(s, stable)
+    return node("raw", 99, stable, { value = s })
+end
+
+function expr.literal(s)
+    return node("literal", 99, true, { value = s })
+end
+
+function expr.localref(symbol, name)
+    return node("local", 99, false, { symbol = symbol, value = name })
+end
+
+function expr.global(name)
+    return node("global", 99, false, { value = name })
 end
 
 function expr.bin(a, op, b)
     local p = prec[op] or 5
-    return node(wrap(a, p, false, op) .. " " .. op .. " " .. wrap(b, p, true, op), p, a.stable and b.stable, "bin", a, b, op)
+    return node("bin", p, type(a) == "table" and a.stable and type(b) == "table" and b.stable, { a = a, b = b, op = op })
 end
 
 function expr.un(op, a)
-    local p = 7
-    local s = type(a) == "table" and (a.p < p and "(" .. a.s .. ")" or a.s) or tostring(a)
-    if op == "not" then
-        return node("not " .. s, p, a.stable, "un", a, nil, op)
-    end
-    return node(op .. s, p, a.stable, "un", a, nil, op)
+    return node("un", 7, type(a) == "table" and a.stable, { a = a, op = op })
 end
 
 function expr.prop(a, field)
-    local base = type(a) == "table" and (a.p < 9 and "(" .. a.s .. ")" or a.s) or tostring(a)
-    return node(base .. field, 10, false, "prop", a, field)
+    return node("prop", 10, false, { a = a, field = field })
 end
 
 function expr.call(fn, args, method)
-    local base = type(fn) == "table" and (fn.p < 9 and "(" .. fn.s .. ")" or fn.s) or tostring(fn)
-    if method then base = base .. ":" .. method end
-    return node(base .. "(" .. table.concat(args, ", ") .. ")", 10, false, "call", fn, args, method)
+    return node("call", 10, false, { fn = fn, args = args or {}, method = method })
+end
+
+function expr.table(fields)
+    return node("table", 99, false, { fields = fields or {} })
 end
 
 function expr.join(list, op)
@@ -16725,9 +19150,42 @@ function expr.join(list, op)
 end
 
 function expr.str(v)
-    return text(v)
+    return render(v)
 end
 
+local function verify(v, seen)
+    if type(v) ~= "table" then return true end
+    seen = seen or {}
+    if seen[v] then return true end
+    seen[v] = true
+    local kind = v.kind
+    if kind == "local" then
+        assert(v.symbol ~= nil, "LumenV4: EXPR_VERIFY local expression has no SymbolId")
+        assert(type(v.value) == "string" and v.value ~= "", "LumenV4: EXPR_VERIFY local expression has no display name")
+    elseif kind == "global" or kind == "literal" or kind == "atom" or kind == "raw" then
+        assert(v.value ~= nil, "LumenV4: EXPR_VERIFY atom has no value")
+    elseif kind == "bin" then
+        assert(v.op and v.a ~= nil and v.b ~= nil, "LumenV4: EXPR_VERIFY malformed binary expression")
+        verify(v.a, seen); verify(v.b, seen)
+    elseif kind == "un" then
+        assert(v.op and v.a ~= nil, "LumenV4: EXPR_VERIFY malformed unary expression")
+        verify(v.a, seen)
+    elseif kind == "prop" then
+        assert(v.a ~= nil and v.field ~= nil, "LumenV4: EXPR_VERIFY malformed property expression")
+        verify(v.a, seen)
+    elseif kind == "call" then
+        assert(v.fn ~= nil and type(v.args) == "table", "LumenV4: EXPR_VERIFY malformed call expression")
+        verify(v.fn, seen); for _, a in ipairs(v.args) do verify(a, seen) end
+    elseif kind == "table" then
+        for _, field in ipairs(v.fields or {}) do assert(field.value ~= nil, "LumenV4: EXPR_VERIFY table field has no value"); verify(field.value, seen) end
+    else
+        error("LumenV4: EXPR_VERIFY unknown expression kind " .. tostring(kind), 2)
+    end
+    assert(render(v) == v.s, "LumenV4: EXPR_VERIFY cached rendering diverged from semantic tree")
+    return true
+end
+
+expr.verify = verify
 return expr
 ]===],
     ["main.output.literals"] = [===[
@@ -17108,7 +19566,8 @@ function pass.run(ir, check)
     for id, v in pairs(ir.vals) do
         if check then check() end
         id = ir:resolve(id)
-        if id and not ir.dead[id] and v.kind == "def" and not mutable[id] then
+        local protected = id and ir.outssa and ir.outssa.materialize and ir.outssa.materialize[id]
+        if id and not ir.dead[id] and v.kind == "def" and not mutable[id] and not protected then
             local u = ir:only(id)
             local n = v.pc and ir.bypc[v.pc]
             if u and u.pc and n and ir.cfg.blockmap[v.pc] == ir.cfg.blockmap[u.pc] then
@@ -17125,7 +19584,8 @@ function pass.run(ir, check)
 
     for id in pairs(ir.const) do
         id = ir:resolve(id)
-        if id and not mutable[id] then
+        local protected = id and ir.outssa and ir.outssa.materialize and ir.outssa.materialize[id]
+        if id and not mutable[id] and not protected then
             local ok = ir:count(id) > 0
             for _, u in ipairs(ir:uses(id) or {}) do
                 local useop = u.pc and ir.bypc[u.pc] or nil
@@ -17139,40 +19599,449 @@ end
 
 return pass
 ]===],
-    ["main.passes.names"] = [===[
-local pass = {}
+    ["main.passes.names"] = [===[local pass = {}
 
-function pass.run(ir)
-    local parent = {}
+local function copyset(src)
+    local out = {}
+    for k in pairs(src or {}) do out[k] = true end
+    return out
+end
+
+local function seteq(a, b)
+    a, b = a or {}, b or {}
+    for k in pairs(a) do if not b[k] then return false end end
+    for k in pairs(b) do if not a[k] then return false end end
+    return true
+end
+
+local function union(dst, src)
+    for k in pairs(src or {}) do dst[k] = true end
+end
+
+local function addpair(graph, a, b)
+    if not a or not b or a == b then return end
+    local ga = graph[a]
+    if not ga then ga = {}; graph[a] = ga end
+    local gb = graph[b]
+    if not gb then gb = {}; graph[b] = gb end
+    ga[b] = true
+    gb[a] = true
+end
+
+local function cellmap(ir)
+    local out = {}
+    for raw, set in pairs(ir.cellSetsByValue or {}) do
+        local id = ir:resolve(raw)
+        if id then
+            local count, only = 0, nil
+            for cid in pairs(set or {}) do count += 1; only = cid end
+            local marker = count == 1 and only or (count > 1 and ("multi:" .. tostring(id)) or nil)
+            if marker then
+                local old = out[id]
+                if old and old ~= marker then
+                    error(("LumenV4: SSA_DESTRUCT value v%d aliases incompatible CellIds %s/%s"):format(id, tostring(old), tostring(marker)), 2)
+                end
+                out[id] = marker
+            end
+        end
+    end
+    for raw, cid in pairs(ir.cellOfValue or {}) do
+        local id = ir:resolve(raw)
+        if id and out[id] == nil then out[id] = cid end
+    end
+    return out
+end
+
+local function buildliveness(ir)
+    local cfg = ir.cfg
+    local use, def, phidef, edgeuse = {}, {}, {}, {}
+
+    for _, block in ipairs(cfg.blocks) do
+        local bid = block.id
+        local u, d, pd = {}, {}, {}
+        local phis = ir.phis[bid]
+        if phis then
+            for _, phi in pairs(phis) do
+                local id = ir:resolve(phi.id)
+                if id and not ir.dead[id] and ir:count(id) > 0 then
+                    d[id] = true
+                    pd[id] = true
+                end
+            end
+        end
+
+        for _, pc in ipairs(block.pcs) do
+            local uses = ir.ssa.usesByPC[pc]
+            if uses then
+                for _, raw in pairs(uses) do
+                    local id = ir:resolve(raw)
+                    if id and not ir.dead[id] and not d[id] then u[id] = true end
+                end
+            end
+            local defs = ir.ssa.defsByPC[pc]
+            if defs then
+                for _, raw in pairs(defs) do
+                    local id = ir:resolve(raw)
+                    if id and not ir.dead[id] then d[id] = true end
+                end
+            end
+        end
+        use[bid], def[bid], phidef[bid] = u, d, pd
+    end
+
+    for succ, phis in pairs(ir.phis) do
+        for _, phi in pairs(phis) do
+            local dst = ir:resolve(phi.id)
+            if dst and not ir.dead[dst] and ir:count(dst) > 0 then
+                for pred, raw in pairs(phi.incoming or {}) do
+                    local id = ir:resolve(raw)
+                    if id and not ir.dead[id] then
+                        local bypred = edgeuse[pred]
+                        if not bypred then bypred = {}; edgeuse[pred] = bypred end
+                        local set = bypred[succ]
+                        if not set then set = {}; bypred[succ] = set end
+                        set[id] = true
+                    end
+                end
+            end
+        end
+    end
+
+    local lin, lout = {}, {}
+    for _, block in ipairs(cfg.blocks) do lin[block.id], lout[block.id] = {}, {} end
+
+    local changed, iterations = true, 0
+    local limit = math.max(64, #cfg.blocks * 512)
+    while changed do
+        iterations += 1
+        if iterations > limit then error("LumenV4: SSA_DESTRUCT liveness failed to converge", 2) end
+        changed = false
+        for i = #cfg.blocks, 1, -1 do
+            local block = cfg.blocks[i]
+            local bid = block.id
+            local out = {}
+            for _, succ in ipairs(block.successors) do
+                local sin = lin[succ] or {}
+                local spd = phidef[succ] or {}
+                for id in pairs(sin) do if not spd[id] then out[id] = true end end
+                local eu = edgeuse[bid] and edgeuse[bid][succ]
+                union(out, eu)
+            end
+            local inn = copyset(use[bid])
+            for id in pairs(out) do if not def[bid][id] then inn[id] = true end end
+            if not seteq(lout[bid], out) then lout[bid] = out; changed = true end
+            if not seteq(lin[bid], inn) then lin[bid] = inn; changed = true end
+        end
+    end
+
+    return {
+        use = use,
+        def = def,
+        phiDef = phidef,
+        edgeUse = edgeuse,
+        liveIn = lin,
+        liveOut = lout,
+        iterations = iterations,
+    }
+end
+
+local function interference(ir, live)
+    local graph = {}
+    for id in pairs(ir.vals) do graph[id] = graph[id] or {} end
+
+    for _, block in ipairs(ir.cfg.blocks) do
+        local now = copyset(live.liveOut[block.id])
+
+        for i = #block.pcs, 1, -1 do
+            local pc = block.pcs[i]
+            local defs = {}
+            for _, raw in pairs(ir.ssa.defsByPC[pc] or {}) do
+                local id = ir:resolve(raw)
+                if id and not ir.dead[id] then defs[id] = true end
+            end
+            for d in pairs(defs) do
+                for v in pairs(now) do addpair(graph, d, v) end
+            end
+            for d in pairs(defs) do now[d] = nil end
+            for _, raw in pairs(ir.ssa.usesByPC[pc] or {}) do
+                local id = ir:resolve(raw)
+                if id and not ir.dead[id] then now[id] = true end
+            end
+        end
+
+        local phis = ir.phis[block.id]
+        if phis then
+            local pdefs, incoming = {}, {}
+            for _, phi in pairs(phis) do
+                local d = ir:resolve(phi.id)
+                if d and not ir.dead[d] and ir:count(d) > 0 then
+                    pdefs[d] = true
+                    for _, raw in pairs(phi.incoming or {}) do
+                        local id = ir:resolve(raw)
+                        if id then incoming[id] = true end
+                    end
+                end
+            end
+            for d in pairs(pdefs) do
+                for v in pairs(now) do
+                    if not incoming[v] then addpair(graph, d, v) end
+                end
+                for other in pairs(pdefs) do addpair(graph, d, other) end
+            end
+        end
+    end
+
+    return graph
+end
+
+local function coalesce(ir, graph, cells)
+    local parent, members, groupcell = {}, {}, {}
+
+    for id in pairs(ir.vals) do
+        id = ir:resolve(id)
+        if id and not parent[id] then
+            parent[id] = id
+            members[id] = { [id] = true }
+            groupcell[id] = cells[id]
+        end
+    end
 
     local function root(x)
         x = ir:resolve(x)
         if not x then return nil end
         local p = parent[x]
-        if not p then parent[x] = x return x end
+        if not p then
+            parent[x], members[x], groupcell[x] = x, { [x] = true }, cells[x]
+            return x
+        end
         if p ~= x then parent[x] = root(p) end
         return parent[x]
     end
 
-    local function join(a, b)
-        a, b = root(a), root(b)
-        if a and b and a ~= b then parent[b] = a end
+    local function compatible(a, b)
+        local ca, cb = groupcell[a], groupcell[b]
+        return ca == cb or (ca == nil and cb == nil)
     end
 
-    for id in pairs(ir.vals) do parent[id] = id end
+    local function conflicts(a, b)
+        for x in pairs(members[a]) do
+            local gx = graph[x]
+            if gx then
+                for y in pairs(members[b]) do if gx[y] then return true end end
+            end
+        end
+        return false
+    end
 
-    for _, phis in pairs(ir.phis) do
-        for _, p in pairs(phis) do
-            local pid = ir:resolve(p.id)
-            if pid and not ir.dead[pid] and ir:count(pid) > 0 then
-                for raw in pairs(p.inputs or {}) do join(pid, raw) end
+    local function join(a, b)
+        a, b = root(a), root(b)
+        if not a or not b or a == b then return true end
+        local av, bv = ir.vals[a], ir.vals[b]
+        if (av and av.kind == "undef") or (bv and bv.kind == "undef") then return false end
+        if not compatible(a, b) or conflicts(a, b) then return false end
+        local keep, drop = a, b
+        if drop < keep then keep, drop = drop, keep end
+        parent[drop] = keep
+        for id in pairs(members[drop]) do members[keep][id] = true end
+        members[drop] = nil
+        groupcell[keep] = groupcell[keep] or groupcell[drop]
+        groupcell[drop] = nil
+        return true
+    end
+
+    local candidates = {}
+    for bid, phis in pairs(ir.phis) do
+        for reg, phi in pairs(phis) do
+            local dst = ir:resolve(phi.id)
+            if dst and not ir.dead[dst] and ir:count(dst) > 0 then
+                local preds = {}
+                for pred in pairs(phi.incoming or {}) do preds[#preds + 1] = pred end
+                table.sort(preds)
+                for _, pred in ipairs(preds) do
+                    local src = ir:resolve(phi.incoming[pred])
+                    if src and not ir.dead[src] then
+                        candidates[#candidates + 1] = { kind = "phi", dst = dst, src = src, bid = bid, pred = pred, reg = reg }
+                    end
+                end
             end
         end
     end
 
-    local fam = {}
-    for id in pairs(ir.vals) do fam[id] = root(id) end
-    ir.family = fam
+    for _, n in ipairs(ir.ops or {}) do
+        if n.name == "MOVE" then
+            local dst = ir:def(n.pc, n.op.A)
+            local src = ir:use(n.pc, n.op.B)
+            if dst and src and dst ~= src then
+                candidates[#candidates + 1] = { kind = "move", dst = dst, src = src, pc = n.pc }
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        if a.kind ~= b.kind then return a.kind == "phi" end
+        local ap, bp = a.pc or (a.bid * 65536 + a.pred), b.pc or (b.bid * 65536 + b.pred)
+        return ap < bp
+    end)
+
+    local merged = 0
+    for _, c in ipairs(candidates) do if join(c.dst, c.src) then merged += 1 end end
+
+    local family = {}
+    for id in pairs(ir.vals) do
+        local rid = ir:resolve(id)
+        if rid then family[id] = root(rid) end
+    end
+
+    return family, root, members, merged
+end
+
+local function buildcopies(ir, family)
+    local edge = {}
+    local count = 0
+
+    for succ, phis in pairs(ir.phis) do
+        local block = ir.cfg.blocks[succ]
+        if block then
+            for reg, phi in pairs(phis) do
+                local dst = ir:resolve(phi.id)
+                if dst and not ir.dead[dst] and ir:count(dst) > 0 then
+                    local df = family[dst] or dst
+                    for _, pred in ipairs(block.predecessors) do
+                        local raw = phi.incoming and phi.incoming[pred]
+                        local src = raw and ir:resolve(raw) or nil
+                        local sf = src and (family[src] or src) or nil
+                        if sf ~= df then
+                            local bypred = edge[pred]
+                            if not bypred then bypred = {}; edge[pred] = bypred end
+                            local list = bypred[succ]
+                            if not list then list = {}; bypred[succ] = list end
+                            list[#list + 1] = {
+                                dst = df,
+                                src = sf,
+                                dstValue = dst,
+                                srcValue = src,
+                                reg = reg,
+                                phi = phi.id,
+                                undef = src and ir.vals[src] and ir.vals[src].kind == "undef" or src == nil,
+                            }
+                            count += 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    for _, bysucc in pairs(edge) do
+        for _, list in pairs(bysucc) do
+            table.sort(list, function(a, b)
+                if a.reg ~= b.reg then return a.reg < b.reg end
+                return (a.dst or 0) < (b.dst or 0)
+            end)
+        end
+    end
+    return edge, count
+end
+
+local function verify(ir, outssa)
+    local family = outssa.family
+    local graph = outssa.interference
+    local cells = outssa.cells
+
+    local seenfamilies = {}
+    for id in pairs(ir.vals) do
+        local rid = ir:resolve(id)
+        if rid and family[rid] then
+            local f = family[rid]
+            local list = seenfamilies[f]
+            if not list then list = {}; seenfamilies[f] = list end
+            list[#list + 1] = rid
+        end
+    end
+
+    for _, list in pairs(seenfamilies) do
+        local cell
+        for i = 1, #list do
+            local a = list[i]
+            local ca = cells[a]
+            if ca then
+                if cell and cell ~= ca then error("LumenV4: SSA_DESTRUCT coalesced distinct CellIds", 2) end
+                cell = ca
+            end
+            for j = i + 1, #list do
+                local b = list[j]
+                if graph[a] and graph[a][b] then
+                    error(("LumenV4: SSA_DESTRUCT coalesced interfering values v%d/v%d"):format(a, b), 2)
+                end
+            end
+        end
+    end
+
+    for succ, phis in pairs(ir.phis) do
+        local block = assert(ir.cfg.blocks[succ], "LumenV4: SSA_DESTRUCT phi block missing")
+        for reg, phi in pairs(phis) do
+            local dst = ir:resolve(phi.id)
+            if dst and not ir.dead[dst] and ir:count(dst) > 0 then
+                for _, pred in ipairs(block.predecessors) do
+                    local raw = phi.incoming and phi.incoming[pred]
+                    if raw == nil and not phi.missing then
+                        error(("LumenV4: SSA_DESTRUCT phi v%d r%d missing predecessor b%d"):format(dst, reg, pred), 2)
+                    end
+                    local src = raw and ir:resolve(raw) or nil
+                    local df = family[dst] or dst
+                    local sf = src and (family[src] or src) or nil
+                    if sf ~= df then
+                        local found = false
+                        for _, copy in ipairs(outssa.edgeCopies[pred] and outssa.edgeCopies[pred][succ] or {}) do
+                            if copy.dst == df and copy.src == sf and copy.reg == reg then found = true break end
+                        end
+                        if not found then
+                            error(("LumenV4: SSA_DESTRUCT missing edge copy b%d->b%d r%d"):format(pred, succ, reg), 2)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return true
+end
+
+function pass.run(ir)
+    local live = buildliveness(ir)
+    local cells = cellmap(ir)
+    local graph = interference(ir, live)
+    local family, _, members, merged = coalesce(ir, graph, cells)
+    local copies, copycount = buildcopies(ir, family)
+
+    local materialize = {}
+    for _, bysucc in pairs(copies) do
+        for _, list in pairs(bysucc) do
+            for _, copy in ipairs(list) do
+                if copy.dst then materialize[copy.dst] = true end
+                if copy.src and not copy.undef then materialize[copy.src] = true end
+            end
+        end
+    end
+    for id, fam in pairs(family) do if materialize[fam] then materialize[id] = true end end
+
+    ir.family = family
+    ir.outssa = {
+        liveIn = live.liveIn,
+        liveOut = live.liveOut,
+        edgeUse = live.edgeUse,
+        livenessIterations = live.iterations,
+        interference = graph,
+        cells = cells,
+        members = members,
+        family = family,
+        edgeCopies = copies,
+        copyCount = copycount,
+        coalesced = merged,
+        materialize = materialize,
+        verified = false,
+    }
+    ir.outssa.verified = verify(ir, ir.outssa)
     return ir
 end
 
@@ -17181,6 +20050,7 @@ return pass
     ["main.passes.pipeline"] = [===[
 
 local dead = require("main.passes.deadcode")
+local simplify = require("main.passes.simplify")
 local names = require("main.passes.names")
 local prov = require("main.passes.provenance")
 local inline = require("main.passes.inline")
@@ -17191,27 +20061,32 @@ local pipe = {}
 
 function pipe.run(ir, opt, check)
     opt = opt or {}
-
+    ir.timings = ir.timings or {}
+    local pt = ir.timings.passes or {}
+    ir.timings.passes = pt
+    local t
 
     if check then check() end
-    if opt.dce ~= false then dead.run(ir, check) end
+    if opt.dce ~= false then t = os.clock(); dead.run(ir, check); pt.deadcode = os.clock() - t end
+    if check then check() end
+    t = os.clock(); simplify.run(ir); pt.simplify = os.clock() - t
     if check then check() end
 
-
-    names.run(ir)
+    t = os.clock(); names.run(ir); pt.outssa = os.clock() - t
     if check then check() end
     if opt.smartnames ~= false then
-        prov.run(ir)
+        t = os.clock(); prov.run(ir); pt.naming = os.clock() - t
         if check then check() end
     else
         ir.bestname, ir.namescore, ir.hints, ir.origin = {}, {}, {}, {}
+        pt.naming = 0
     end
 
-    if opt.inline ~= false then inline.run(ir, check) end
+    if opt.inline ~= false then t = os.clock(); inline.run(ir, check); pt.inline = os.clock() - t end
     if check then check() end
-    cond.run(ir)
+    t = os.clock(); cond.run(ir); pt.conditions = os.clock() - t
     if check then check() end
-    flow.run(ir)
+    t = os.clock(); flow.run(ir); pt.flow = os.clock() - t
     if check then check() end
     return ir
 end
@@ -17601,19 +20476,65 @@ local cond = require("main.recover.conditions")
 
 local branch = {}
 
+
+local function graphinfo(st, pc, stop)
+    local bid = st.cfg.blockmap[pc]
+    local block = bid and st.cfg.blocks[bid]
+    local structure = st.cfg.structure
+    local region = structure and structure.byHeader and structure.byHeader[bid]
+    local op = st.proto.Instructions[pc]
+    if not block or block.endPC ~= pc or not region or not op or not ins.isConditional(op) then return nil end
+
+    local joinpc = region.joinPC
+    if not joinpc or joinpc <= pc or joinpc > stop then return nil end
+    local jumppc, fallpc = ins.jumpTarget(pc, op), st:next(pc)
+    local jumpbid, fallbid = st.cfg.blockmap[jumppc], st.cfg.blockmap[fallpc]
+
+    if region.kind == "triangle" then
+        local bodybid = region.thenBlock
+        local body = bodybid and st.cfg.blocks[bodybid]
+        if not body or body.startPC <= pc or body.startPC >= joinpc then return nil end
+        if st.cfg.ipdom[bodybid] ~= region.join then return nil end
+        local condition
+        if jumpbid == bodybid and fallbid == region.join then condition = cond.jump(st, pc, op)
+        elseif fallbid == bodybid and jumpbid == region.join then condition = cond.fall(st, pc, op)
+        else return nil end
+        return {
+            cond = condition, a = body.startPC, b = joinpc, join = joinpc,
+            head = pc, last = pc, condpcs = { pc }, graph = true, region = region,
+        }
+    elseif region.kind == "diamond" then
+        local ab, bb = st.cfg.blocks[region.thenBlock], st.cfg.blocks[region.elseBlock]
+        if not ab or not bb then return nil end
+        if st.cfg.ipdom[ab.id] ~= region.join or st.cfg.ipdom[bb.id] ~= region.join then return nil end
+        local first, second = ab, bb
+        if second.startPC < first.startPC then first, second = second, first end
+        if first.startPC <= pc or second.startPC <= first.startPC or second.startPC >= joinpc then return nil end
+        local condition
+        if jumpbid == first.id then condition = cond.jump(st, pc, op)
+        elseif fallbid == first.id then condition = cond.fall(st, pc, op)
+        else return nil end
+        return {
+            cond = condition, a = first.startPC, b = second.startPC,
+            c = second.startPC, d = joinpc, join = joinpc,
+            head = pc, last = pc, condpcs = { pc }, graph = true, region = region,
+        }
+    end
+end
+
 function branch.info(st, pc, stop)
     local ch = cond.chain(st, pc)
-    if not ch or ch.exit <= ch.body then return nil end
+    if not ch or ch.exit <= ch.body then return graphinfo(st, pc, stop) end
 
     local join = st:join(pc)
 
-    if not join or join <= pc or join > stop then return nil end
-    if ch.exit > join then return nil end
+    if not join or join <= pc or join > stop then return graphinfo(st, pc, stop) end
+    if ch.exit > join then return graphinfo(st, pc, stop) end
 
     if ch.exit == join then
-        return { cond = ch.cond, a = ch.body, b = join, join = join }
+        return { cond = ch.cond, a = ch.body, b = join, join = join, head = pc, last = ch.last, condpcs = ch.pcs }
     end
-    return { cond = ch.cond, a = ch.body, b = ch.exit, c = ch.exit, d = join, join = join }
+    return { cond = ch.cond, a = ch.body, b = ch.exit, c = ch.exit, d = join, join = join, head = pc, last = ch.last, condpcs = ch.pcs }
 end
 
 function branch.elseifInfo(st, pc, join)
@@ -17703,6 +20624,7 @@ function cond.chain(st, pc)
     local exit = ins.jumpTarget(pc, first)
     local cur = pc
     local list = {}
+    local pcs = {}
     local count = 0
 
     while true do
@@ -17711,23 +20633,25 @@ function cond.chain(st, pc)
         if not ins.isConditional(op) or name == "FORNLOOP" or name == "FORGLOOP" then break end
         if ins.jumpTarget(cur, op) ~= exit then break end
         list[#list + 1] = cond.fall(st, cur, op)
+        pcs[#pcs + 1] = cur
         count += 1
         local nx = st:next(cur)
         local nop = st.proto.Instructions[nx]
         if not nop or not ins.isConditional(nop) then
-            return { cond = ex.join(list, "and"), body = nx, exit = exit, last = cur }
+            return { cond = ex.join(list, "and"), body = nx, exit = exit, last = cur, pcs = pcs }
         end
         if ins.jumpTarget(nx, nop) ~= exit then break end
         cur = nx
     end
 
     if count > 1 then
-        return { cond = ex.join(list, "and"), body = st:next(cur), exit = exit, last = cur }
+        return { cond = ex.join(list, "and"), body = st:next(cur), exit = exit, last = cur, pcs = pcs }
     end
 
     local body = exit
     local p = pc
     local ors = {}
+    local orpcs = {}
     while p < body do
         local op = st.proto.Instructions[p]
         if not op or not ins.isConditional(op) then break end
@@ -17735,16 +20659,18 @@ function cond.chain(st, pc)
         local jt = ins.jumpTarget(p, op)
         if jt == body and nx < body then
             ors[#ors + 1] = cond.jump(st, p, op)
+            orpcs[#orpcs + 1] = p
             p = nx
         elseif nx == body and jt > body then
             ors[#ors + 1] = cond.fall(st, p, op)
-            return { cond = ex.join(ors, "or"), body = body, exit = jt, last = p }
+            orpcs[#orpcs + 1] = p
+            return { cond = ex.join(ors, "or"), body = body, exit = jt, last = p, pcs = orpcs }
         else
             break
         end
     end
 
-    return { cond = cond.fall(st, pc, first), body = st:next(pc), exit = exit, last = pc }
+    return { cond = cond.fall(st, pc, first), body = st:next(pc), exit = exit, last = pc, pcs = { pc } }
 end
 
 function cond.bool(st, pc, op)
@@ -17816,21 +20742,133 @@ local function cbhints(st, pc, r)
     return pend and meth[pend.method] or nil
 end
 
-local function capturename(st, cp, kind, src, debugname)
-
-
-    local parent
-    if kind == 0 or kind == 1 then
-        parent = st:useName(cp, src, nil)
-    else
-        parent = st.up[src + 1] or ("upvalue" .. tostring(src))
+local function valuecap(st, cp, src, slot, debugname, selfreg)
+    local raw = st:veruse(cp, src)
+    if not raw then
+        error(("LumenV4: CAPTURE_VERIFY value capture references undefined parent register R%d at pc %d"):format(src, cp), 2)
     end
-    if not parent or parent == "" then parent = debugname end
-    return parent or ("upvalue" .. tostring(src))
+    local value = st.ir:resolve(raw)
+    if src == selfreg then
+        return {
+            kind = "self",
+            mode = 0,
+            value = value,
+            reg = src,
+            pc = cp,
+            slot = slot,
+            owner = st,
+            debugname = debugname,
+        }
+    end
+    local snap = st.naming:unique("capture" .. tostring(slot) .. "Value")
+    st.declared[snap] = st.indent
+    st:out("local " .. snap .. " = " .. st:use(cp, src))
+    return {
+        kind = "value",
+        mode = 0,
+        value = value,
+        reg = src,
+        pc = cp,
+        slot = slot,
+        owner = st,
+        name = snap,
+        debugname = debugname,
+    }
 end
 
-function fn.caps(st, pc, child)
+local function refcap(st, cp, src, slot, debugname)
+    local raw = st:veruse(cp, src)
+    if not raw then
+        error(("LumenV4: CAPTURE_VERIFY ref capture references undefined parent register R%d at pc %d"):format(src, cp), 2)
+    end
+    local value = st.ir:resolve(raw)
+    local cell = st.ir.captureCell and st.ir.captureCell[cp]
+    if not cell and st.ir.cellOfValue then cell = st.ir.cellOfValue[raw] or st.ir.cellOfValue[value] end
+    if not cell then
+        error(("LumenV4: CAPTURE_VERIFY REF capture has no CellId for R%d at pc %d"):format(src, cp), 2)
+    end
+    local name
+    if st.dispatchCells then
+        local box = st.dispatchCells .. "[" .. tostring(cell) .. "]"
+        local base = st:dispatchbase(value, src, cp)
+        st:out("if " .. box .. " == nil then " .. box .. " = {v = " .. base .. "} end")
+        local snap = st.naming:unique("capture" .. tostring(slot) .. "Cell")
+        st.declared[snap] = st.indent
+        st:out("local " .. snap .. " = " .. box)
+        name = snap .. ".v"
+    end
+    return {
+        kind = "ref",
+        mode = 1,
+        value = value,
+        cell = cell,
+        reg = src,
+        pc = cp,
+        slot = slot,
+        owner = st,
+        name = name,
+        debugname = debugname,
+    }
+end
+
+local function upcap(st, cp, src, slot, debugname)
+    local parent = st:updesc(src + 1)
+    if not parent then
+        error(("LumenV4: CAPTURE_VERIFY UPVAL capture references missing parent upvalue U%d at pc %d"):format(src, cp), 2)
+    end
+    return {
+        kind = "upvalue",
+        mode = 2,
+        parent = parent,
+        cell = st:upcell(src + 1),
+        source = src,
+        pc = cp,
+        slot = slot,
+        owner = st,
+        debugname = debugname,
+    }
+end
+
+function fn.verify(child, caps, pc)
+    local want = child.UpvalueCount or 0
+    if #caps ~= want then
+        error(("LumenV4: CAPTURE_VERIFY NEWCLOSURE at pc %d capture slot mismatch %d/%d"):format(pc, #caps, want), 2)
+    end
+    for i = 1, want do
+        local cap = caps[i]
+        if type(cap) ~= "table" then
+            error(("LumenV4: CAPTURE_VERIFY slot %d at pc %d is not semantic"):format(i, pc), 2)
+        end
+        if cap.slot ~= i then
+            error(("LumenV4: CAPTURE_VERIFY slot index mismatch %d/%s at pc %d"):format(i, tostring(cap.slot), pc), 2)
+        end
+        if cap.kind == "self" then
+            if not cap.value or not cap.name then
+                error(("LumenV4: CAPTURE_VERIFY recursive value slot %d at pc %d has no function identity"):format(i, pc), 2)
+            end
+        elseif cap.kind == "value" then
+            if not cap.value or not cap.name then
+                error(("LumenV4: CAPTURE_VERIFY value slot %d at pc %d has no snapshot identity"):format(i, pc), 2)
+            end
+        elseif cap.kind == "ref" then
+            if not cap.cell then
+                error(("LumenV4: CAPTURE_VERIFY ref slot %d at pc %d has no CellId"):format(i, pc), 2)
+            end
+        elseif cap.kind == "upvalue" then
+            if not cap.parent then
+                error(("LumenV4: CAPTURE_VERIFY inherited slot %d at pc %d has no parent upvalue"):format(i, pc), 2)
+            end
+        else
+            error(("LumenV4: CAPTURE_VERIFY invalid capture kind %s at pc %d"):format(tostring(cap.kind), pc), 2)
+        end
+    end
+    return true
+end
+
+function fn.caps(st, pc, child, closurekind)
     local out = {}
+    local closureop = st.proto.Instructions[pc]
+    local selfreg = closureop and closureop.A or nil
     local nx = st:next(pc)
     for i = 1, (child.UpvalueCount or 0) do
         local cp = nx
@@ -17838,38 +20876,30 @@ function fn.caps(st, pc, child)
         local du = child.Upvalues and child.Upvalues[i]
         local dn = du and du.Name
         if not op or ins.name(op) ~= "CAPTURE" then
-            error(("LumenV4: UNSUPPORTED NEWCLOSURE at pc %d expected CAPTURE %d/%d"):format(pc, i, child.UpvalueCount or 0), 2)
+            error(("LumenV4: CAPTURE_VERIFY NEWCLOSURE at pc %d expected CAPTURE %d/%d"):format(pc, i, child.UpvalueCount or 0), 2)
         end
 
         local kind, src = op.A, op.B
-        if kind ~= 0 and kind ~= 1 and kind ~= 2 then
-            error(("LumenV4: UNSUPPORTED CAPTURE kind %s at pc %d"):format(tostring(kind), cp), 2)
+        if closurekind == "dup" and kind == 1 then
+            error(("LumenV4: CAPTURE_VERIFY DUPCLOSURE at pc %d cannot REF capture at pc %d"):format(pc, cp), 2)
         end
-        if kind == 0 or kind == 1 then
-            if not st:veruse(cp, src) then
-                error(("LumenV4: UNSUPPORTED CAPTURE references undefined parent register R%d at pc %d"):format(src, cp), 2)
-            end
-        elseif not st.up[src + 1] then
-            error(("LumenV4: UNSUPPORTED CAPTURE_UPVAL references missing parent upvalue U%d at pc %d"):format(src, cp), 2)
-        end
-
         if kind == 0 then
-
-
-            local snap = st.naming:unique("capture" .. tostring(i) .. "Value")
-            st.declared[snap] = st.indent
-            st:out("local " .. snap .. " = " .. st:use(cp, src))
-            out[i] = snap
+            out[i] = valuecap(st, cp, src, i, dn, selfreg)
+        elseif kind == 1 then
+            out[i] = refcap(st, cp, src, i, dn)
+        elseif kind == 2 then
+            out[i] = upcap(st, cp, src, i, dn)
         else
-            out[i] = capturename(st, cp, kind, src, dn)
+            error(("LumenV4: CAPTURE_VERIFY invalid CAPTURE mode %s at pc %d"):format(tostring(kind), cp), 2)
         end
         st.consumed[cp] = true
         nx = st:next(cp)
     end
     local extra = st.proto.Instructions[nx]
     if extra and ins.name(extra) == "CAPTURE" then
-        error(("LumenV4: UNSUPPORTED NEWCLOSURE at pc %d has more CAPTURE instructions than child upvalues"):format(pc), 2)
+        error(("LumenV4: CAPTURE_VERIFY NEWCLOSURE at pc %d has more CAPTURE instructions than child upvalues"):format(pc), 2)
     end
+    fn.verify(child, out, pc)
     return out, nx
 end
 
@@ -17896,12 +20926,31 @@ local function direct(st, pc, r, nx)
 end
 
 function fn.emit(d, st, pc, r, child, caps, nx)
+    caps = caps or {}
     local hint = child.Name
     if hint == nil or hint == "" then hint = st.ir.bestname and st.ir.bestname[st.ir:nameid(st:verdef(pc, r))] end
     if hint == nil or hint == "" then hint = "fn" .. tostring(r) end
-    local root, sub, args = d:_child(child, caps, cbhints(st, pc, r))
+
     local target, assign, store = direct(st, pc, r, nx or st:next(pc))
-    if target then
+    local value = st:verdef(pc, r)
+    local symbol = value and st.ir:nameid(value) or ("r" .. tostring(r))
+    local localname = st:defName(pc, r, hint)
+    local selfcapture = false
+    for _, cap in ipairs(caps) do
+        if cap.kind == "self" then
+            selfcapture = true
+            cap.name = localname
+        end
+    end
+    fn.verify(child, caps, pc)
+
+    local root, sub, args = d:_child(child, caps, cbhints(st, pc, r))
+    if not sub.v4 or sub.v4.captureVerified ~= true then
+        error(("LumenV4: CAPTURE_VERIFY child at pc %d did not pass capture verification"):format(pc), 2)
+    end
+    st.v4.childCaptures = (st.v4.childCaptures or 0) + #caps
+
+    if target and not selfcapture then
         st.consumed[store] = true
         if not assign and target:find("%.") and args[1] and (args[1]:match("^self%s*[:$]") or args[1] == "self") then
             local base, field = target:match("^(.*)%.([%a_][%w_]*)$")
@@ -17909,13 +20958,22 @@ function fn.emit(d, st, pc, r, child, caps, nx)
         end
         st.ast:add({ kind = "function", name = target, args = table.concat(args, ", "), body = root, localfn = false, assign = assign })
     else
-        local name = st:defName(pc, r, hint)
-        local depth = st.declared[name]
-        if depth == nil or depth > st.indent then
-            st.declared[name] = st.indent
-            st.ast:add({ kind = "function", name = name, args = table.concat(args, ", "), body = root, localfn = true, assign = false })
+        local depth = st.declared[localname]
+        local lexical = lit.identifier(localname)
+        if lexical and (depth == nil or depth > st.indent) then
+            st.declared[localname] = st.indent
+            st:declaresymbol(symbol, localname, st.indent)
+            st.ast:add({ kind = "function", name = localname, symbol = symbol, args = table.concat(args, ", "), body = root, localfn = true, assign = false })
         else
-            st.ast:add({ kind = "function", name = name, args = table.concat(args, ", "), body = root, localfn = false, assign = true })
+            if depth == nil or depth > st.indent then
+                st.declared[localname] = st.indent
+                st:declaresymbol(symbol, localname, st.indent)
+            end
+            st.ast:add({ kind = "function", name = localname, symbol = symbol, args = table.concat(args, ", "), body = root, localfn = false, assign = true })
+        end
+        if target then
+            st.consumed[store] = true
+            st:out(target .. " = " .. localname)
         end
     end
     for _, issue in ipairs(sub.bad) do st.bad[#st.bad + 1] = issue end
@@ -18027,10 +21085,24 @@ function loops.genInfo(st, pc, op, stop)
     return { loop = loop, op = lop, exit = st:next(loop) }
 end
 
+
+function loops.edgeKind(st, pc, target, active)
+    local loop = active and active.loop
+    if not loop or not loop.headerpc or loop.kind == "repeat" then return nil end
+    local structure = st.cfg.structure
+    if not structure then return nil end
+    local from, to = st.cfg.blockmap[pc], st.cfg.blockmap[target]
+    if not from or not to then return nil end
+    local li = structure.loopByBlock and structure.loopByBlock[from]
+    local natural = li and st.cfg.loops[li]
+    if not natural or natural.headerPC ~= loop.headerpc then return nil end
+    local map = structure.edgeKinds and structure.edgeKinds[from]
+    return map and map[to] or nil
+end
+
 return loops
 ]===],
-    ["main.recover.tables"] = [===[
-local ins = require("main.bytecode.instructions")
+    ["main.recover.tables"] = [===[local ins = require("main.bytecode.instructions")
 local lit = require("main.output.literals")
 local ex = require("main.output.expr")
 
@@ -18090,24 +21162,135 @@ function tab.mut(st, use, r)
     return false
 end
 
-function tab.expr(t)
-    local out = {}
-    for _, e in ipairs(t.entries) do
-        if not e.pending and e.val then
-            if e.kind == "list" then
-                out[#out + 1] = ex.str(e.val)
-            elseif e.kind == "field" then
-                out[#out + 1] = e.key .. " = " .. ex.str(e.val)
-            else
-                out[#out + 1] = "[" .. e.key .. "] = " .. ex.str(e.val)
+local function sameobject(st, value, oid)
+    if not value or not oid or not st.ir.objectId then return false end
+    return st.ir:objectId(value) == oid
+end
+
+local function mutation(st, pc, oid)
+    local op = st.proto.Instructions[pc]
+    if not op then return false end
+    local name = ins.name(op)
+    local uses = st.ssa.usesByPC[pc] or {}
+    local base
+    if name == "SETTABLE" or name == "SETTABLEKS" or name == "SETUDATAKS" or name == "SETTABLEN" then base = uses[op.B]
+    elseif name == "SETLIST" then base = uses[op.A]
+    else return false end
+    if not sameobject(st, base, oid) then return false end
+
+    if name == "SETTABLE" then
+        if sameobject(st, uses[op.A], oid) or sameobject(st, uses[op.C], oid) then return false, "self" end
+    elseif name == "SETTABLEKS" or name == "SETUDATAKS" or name == "SETTABLEN" then
+        if sameobject(st, uses[op.A], oid) then return false, "self" end
+    elseif name == "SETLIST" then
+        local _, _, pack = require("main.analysis.registers").readWrite(op)
+        if op.C == 0 and pack.openReadFrom then return false, "open" end
+        local last = op.C > 1 and (op.B + op.C - 2) or (op.B - 1)
+        for r = op.B, last do if sameobject(st, uses[r], oid) then return false, "self" end end
+    end
+    return true
+end
+
+local function linear(cfg, first, second)
+    if first == second then return true end
+    local seen = {}
+    local cur = first
+    while cur and not seen[cur] do
+        seen[cur] = true
+        local b = cfg.blocks[cur]
+        if not b or #b.successors ~= 1 then return false end
+        local nx = b.successors[1]
+        local nb = cfg.blocks[nx]
+        if not nb or #nb.predecessors ~= 1 or nb.predecessors[1] ~= cur then return false end
+        if nx == second then return true end
+        cur = nx
+    end
+    return false
+end
+
+function tab.get(st, value)
+    if not value then return nil end
+    local direct = st.tbl[value]
+    if direct then return direct end
+    local oid = st.ir.objectId and st.ir:objectId(value)
+    return oid and st.tblobj and st.tblobj[oid] or nil
+end
+
+function tab.begin(st, pc, reg, seed, slots)
+    local value = st:verdef(pc, reg)
+    if not value or not st.ir.objectId then return nil end
+    local oid = st.ir:objectId(value)
+    if not oid then return nil end
+    local object = st.ir.objects and st.ir.objects[oid]
+    if not object or object.allocPC ~= pc then return nil end
+
+    local t = {
+        oid = oid,
+        value = value,
+        reg = reg,
+        entries = seed or {},
+        slots = slots,
+        real = 0,
+        done = false,
+        allowed = {},
+        allocPC = pc,
+        object = object,
+    }
+
+    local uses = {}
+    for alias in pairs(object.aliases or {}) do
+        for _, use in ipairs(st.ir:uses(alias) or {}) do
+            if use.pc and use.pc > pc then uses[use.pc] = true end
+        end
+    end
+    local pcs = {}
+    for upc in pairs(uses) do pcs[#pcs + 1] = upc end
+    table.sort(pcs)
+
+    local allocblock = st.cfg.blockmap[pc]
+    local lastblock = allocblock
+    local observed = false
+    for _, upc in ipairs(pcs) do
+        local ub = st.cfg.blockmap[upc]
+        local ok, why = mutation(st, upc, oid)
+        if ok and not observed and ub and linear(st.cfg, lastblock, ub) then
+            t.allowed[upc] = true
+            lastblock = ub
+        else
+            local op = st.proto.Instructions[upc]
+            local name = op and ins.name(op)
+            if name ~= "MOVE" and not (ok and why == nil) then
+                observed = true
+                t.real += 1
+            elseif not ok then
+                observed = true
+                t.real += 1
             end
         end
     end
-    return ex.atom(#out == 0 and "{}" or ("{ " .. table.concat(out, ", ") .. " }"), false)
+
+    st.tblobj = st.tblobj or {}
+    st.tblobj[oid] = t
+    st.tbl[value] = t
+    return t
+end
+
+function tab.canput(t, pc)
+    return t and not t.done and t.allowed and t.allowed[pc] == true
+end
+
+function tab.expr(t)
+    local fields = {}
+    for _, e in ipairs(t.entries) do
+        if not e.pending and e.val then
+            fields[#fields + 1] = { kind = e.kind, key = e.key, value = e.val }
+        end
+    end
+    return ex.table(fields)
 end
 
 function tab.use(st, v, r, pc)
-    local t = st.tbl[v]
+    local t = tab.get(st, v)
     if not t or t.done then return nil end
     t.done = true
     local node = tab.expr(t)

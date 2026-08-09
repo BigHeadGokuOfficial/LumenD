@@ -165,7 +165,93 @@ local function verify(proto, aux, blocks, blockmap, nexts)
     return true
 end
 
+
+local function structural(blocks, ipdom, naturalloops, check)
+    local structure = { byHeader = {}, regions = {}, edgeKinds = {}, loopByBlock = {}, iterations = 0, verified = false }
+
+    local loopsizes = {}
+    for i, loop in ipairs(naturalloops or {}) do
+        local size = 0
+        for _ in pairs(loop.nodes or {}) do size += 1 end
+        loopsizes[i] = size
+    end
+    for bid = 1, #blocks do
+        local best, bestsize
+        for i, loop in ipairs(naturalloops or {}) do
+            if loop.nodes and loop.nodes[bid] then
+                local size = loopsizes[i]
+                if not bestsize or size < bestsize then best, bestsize = i, size end
+            end
+        end
+        structure.loopByBlock[bid] = best
+    end
+
+    for pred, block in ipairs(blocks) do
+        local li = structure.loopByBlock[pred]
+        local loop = li and naturalloops[li]
+        if loop then
+            local map = {}
+            structure.edgeKinds[pred] = map
+            for _, succ in ipairs(block.successors) do
+                if succ == loop.header then
+                    map[succ] = "continue"
+                elseif not loop.nodes[succ] then
+                    map[succ] = "break"
+                end
+            end
+            if not next(map) then structure.edgeKinds[pred] = nil end
+        end
+    end
+
+    local claimed = {}
+    local changed = true
+    local limit = math.max(8, #blocks * 2)
+    while changed do
+        structure.iterations += 1
+        if structure.iterations > limit then error("LumenV4: CFG_STRUCTURE region discovery failed to converge", 2) end
+        changed = false
+        for _, block in ipairs(blocks) do
+            if check then check() end
+            if #block.successors == 2 and not structure.byHeader[block.id] then
+                local join = ipdom[block.id]
+                if join and blocks[join] then
+                    local a, b = block.successors[1], block.successors[2]
+                    local region
+                    if a == join and b ~= join then
+                        region = { kind = "triangle", header = block.id, thenBlock = b, elseBlock = nil, join = join }
+                    elseif b == join and a ~= join then
+                        region = { kind = "triangle", header = block.id, thenBlock = a, elseBlock = nil, join = join }
+                    elseif a ~= join and b ~= join then
+                        region = { kind = "diamond", header = block.id, thenBlock = a, elseBlock = b, join = join }
+                    end
+                    if region then
+                        region.headerPC = block.endPC
+                        region.joinPC = blocks[join].startPC
+                        region.thenPC = region.thenBlock and blocks[region.thenBlock].startPC or nil
+                        region.elsePC = region.elseBlock and blocks[region.elseBlock].startPC or nil
+                        structure.byHeader[block.id] = region
+                        structure.regions[#structure.regions + 1] = region
+                        claimed[block.id] = true
+                        changed = true
+                    end
+                end
+            end
+        end
+    end
+
+    for _, region in ipairs(structure.regions) do
+        assert(blocks[region.header] and blocks[region.join], "LumenV4: CFG_STRUCTURE invalid region endpoint")
+        assert(region.header ~= region.join, "LumenV4: CFG_STRUCTURE self-joining region")
+        if region.thenBlock then assert(blocks[region.thenBlock], "LumenV4: CFG_STRUCTURE invalid then block") end
+        if region.elseBlock then assert(blocks[region.elseBlock], "LumenV4: CFG_STRUCTURE invalid else block") end
+    end
+    structure.verified = true
+    return structure
+end
+
 function graph.build(proto, check, limits)
+    local timings = {}
+    local graphstart = os.clock()
     local ops = proto.Instructions
     limits = limits or {}
     local maxinstructions = tonumber(limits.maxinstructions) or 0
@@ -262,12 +348,13 @@ function graph.build(proto, check, limits)
     if maxblocks > 0 and #blocks > maxblocks then
         error("LumenV4: STRUCTURED_COMPLEXITY cfg blocks " .. tostring(#blocks) .. " > " .. tostring(maxblocks), 2)
     end
+    timings.cfg = os.clock() - graphstart
     if check then check() end
-    local dominators = dom.compute(blocks, check)
-    local idom = immediatefromsets(blocks, dominators, check)
-    local postdom, ipdom, exitid = post.run(blocks, check)
-    local naturalloops = loops.find(blocks, dominators, check)
-    local sccs = tarjan(blocks, check)
+    local t = os.clock(); local dominators = dom.compute(blocks, check); timings.dominators = os.clock() - t
+    t = os.clock(); local idom = immediatefromsets(blocks, dominators, check); timings.idom = os.clock() - t
+    t = os.clock(); local postdom, ipdom, exitid = post.run(blocks, check); timings.postdominators = os.clock() - t
+    t = os.clock(); local naturalloops = loops.find(blocks, dominators, check); timings.loops = os.clock() - t
+    t = os.clock(); local sccs = tarjan(blocks, check); timings.scc = os.clock() - t
     local out = {
         proto = proto,
         aux = aux,
@@ -285,9 +372,11 @@ function graph.build(proto, check, limits)
         sccs = sccs,
         irreducible = false,
         registerStats = regs.stats(proto, aux),
+        timings = timings,
     }
+    local stime = os.clock(); out.structure = structural(blocks, ipdom, naturalloops, check); timings.structural = os.clock() - stime
     for _, component in ipairs(sccs) do if component.irreducible then out.irreducible = true break end end
-    out.verified = verify(proto, aux, blocks, blockmap, nexts)
+    out.verified = verify(proto, aux, blocks, blockmap, nexts) and out.structure.verified
     return out
 end
 

@@ -1,6 +1,7 @@
 
 
 local dead = require("main.passes.deadcode")
+local simplify = require("main.passes.simplify")
 local names = require("main.passes.names")
 local prov = require("main.passes.provenance")
 local inline = require("main.passes.inline")
@@ -11,27 +12,32 @@ local pipe = {}
 
 function pipe.run(ir, opt, check)
     opt = opt or {}
-
+    ir.timings = ir.timings or {}
+    local pt = ir.timings.passes or {}
+    ir.timings.passes = pt
+    local t
 
     if check then check() end
-    if opt.dce ~= false then dead.run(ir, check) end
+    if opt.dce ~= false then t = os.clock(); dead.run(ir, check); pt.deadcode = os.clock() - t end
+    if check then check() end
+    t = os.clock(); simplify.run(ir); pt.simplify = os.clock() - t
     if check then check() end
 
-
-    names.run(ir)
+    t = os.clock(); names.run(ir); pt.outssa = os.clock() - t
     if check then check() end
     if opt.smartnames ~= false then
-        prov.run(ir)
+        t = os.clock(); prov.run(ir); pt.naming = os.clock() - t
         if check then check() end
     else
         ir.bestname, ir.namescore, ir.hints, ir.origin = {}, {}, {}, {}
+        pt.naming = 0
     end
 
-    if opt.inline ~= false then inline.run(ir, check) end
+    if opt.inline ~= false then t = os.clock(); inline.run(ir, check); pt.inline = os.clock() - t end
     if check then check() end
-    cond.run(ir)
+    t = os.clock(); cond.run(ir); pt.conditions = os.clock() - t
     if check then check() end
-    flow.run(ir)
+    t = os.clock(); flow.run(ir); pt.flow = os.clock() - t
     if check then check() end
     return ir
 end

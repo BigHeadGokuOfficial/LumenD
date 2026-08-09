@@ -1,3 +1,4 @@
+local expr = require("main.output.expr")
 
 local printast = {}
 
@@ -10,6 +11,7 @@ local function hasname(node, name)
     local pat = "%f[%w_]" .. esc(name) .. "%f[^%w_]"
     local function hit(s) return type(s) == "string" and s:find(pat) ~= nil end
     if hit(node.text) or hit(node.cond) or hit(node.head) or hit(node.args) then return true end
+    if node.values then for _, value in ipairs(node.values) do if hit(expr.str(value)) then return true end end end
     if node.kind == "if" then
         for _, b in ipairs(node.branches or {}) do
             if hit(b.cond) then return true end
@@ -69,6 +71,18 @@ local function block(out, b, depth, opt)
             local k = node.kind
             if k == "raw" or k == "return" or k == "break" or k == "continue" then
                 line(out, opt, depth, node.text, true)
+            elseif k == "assign" then
+                local names = {}
+                for i, name in ipairs(node.names or {}) do
+                    local an = node.annotations and node.annotations[i]
+                    names[i] = name .. (node.declare and an and (": " .. an) or "")
+                end
+                local vals = {}; for i, value in ipairs(node.values or {}) do vals[i] = expr.str(value) end
+                line(out, opt, depth, (node.declare and "local " or "") .. table.concat(names, ", ") .. " = " .. table.concat(vals, ", "), true)
+            elseif k == "decl" then
+                local names = {}
+                for i, name in ipairs(node.names or {}) do local an = node.annotations and node.annotations[i]; names[i] = name .. (an and (": " .. an) or "") end
+                line(out, opt, depth, "local " .. table.concat(names, ", "), true)
             elseif k == "if" then
                 for i, branch in ipairs(node.branches) do
                     line(out, opt, depth, (i == 1 and "if " or "elseif ") .. cond(opt, branch.cond) .. " then")

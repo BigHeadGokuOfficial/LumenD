@@ -99,7 +99,7 @@ local function analyzecells(out, check)
         end
     end
 
-    local valuecells, closesites = {}, {}
+    local valuecells, closesites, celluse, celldef, closevalue = {}, {}, {}, {}, {}
     local function markvalue(version, set)
         if not version or not set or not next(set) then return end
         local dst = valuecells[version]
@@ -109,6 +109,8 @@ local function analyzecells(out, check)
 
     for _, b in ipairs(out.cfg.blocks) do
         local state = copystate(instate[b.id])
+        local current = {}
+        for r, version in pairs(out.ssa.inVersions[b.id] or {}) do current[r] = version end
         for _, pc in ipairs(b.pcs) do
             local op = out.proto.Instructions[pc]
             local name = ins.name(op)
@@ -121,12 +123,27 @@ local function analyzecells(out, check)
                 set[capturecell[pc]] = true
             end
 
-            for r, version in pairs(uses) do markvalue(version, state[r]) end
-            for r, version in pairs(defs) do markvalue(version, state[r]) end
+            for r, version in pairs(uses) do
+                markvalue(version, state[r])
+                if state[r] and next(state[r]) then
+                    local m = celluse[pc]; if not m then m = {}; celluse[pc] = m end
+                    m[r] = copyset(state[r])
+                end
+            end
+            for r, version in pairs(defs) do
+                markvalue(version, state[r])
+                if state[r] and next(state[r]) then
+                    local m = celldef[pc]; if not m then m = {}; celldef[pc] = m end
+                    m[r] = copyset(state[r])
+                end
+                current[r] = version
+            end
 
             if name == "CLOSEUPVALS" then
                 for r, set in pairs(state) do
                     if r >= (op.A or 0) then
+                        local cm = closevalue[pc]; if not cm then cm = {}; closevalue[pc] = cm end
+                        cm[r] = { value = current[r], cells = copyset(set) }
                         for cid in pairs(set) do
                             local list = closesites[cid]
                             if not list then list = {}; closesites[cid] = list end
@@ -154,11 +171,10 @@ local function analyzecells(out, check)
         local first
         for cid in pairs(set or {}) do if first then join(first, cid) else first = cid end end
     end
-    for _, set in pairs(valuecells) do joinset(set) end
     for _, state in pairs(instate) do for _, set in pairs(state) do joinset(set) end end
     for _, state in pairs(outstate) do for _, set in pairs(state) do joinset(set) end end
 
-    local cells, cellofvalue = {}, {}
+    local cells, cellofvalue, cellsets = {}, {}, {}
     for pc, cid in pairs(capturecell) do
         local rid = root(cid)
         capturecell[pc] = rid
@@ -167,13 +183,43 @@ local function analyzecells(out, check)
         c.captures[#c.captures + 1] = pc
     end
     for version, set in pairs(valuecells) do
-        local rid
-        for cid in pairs(set) do rid = root(cid); break end
-        if rid then
-            cellofvalue[version] = rid
+        local roots, count, only = {}, 0, nil
+        for cid in pairs(set) do
+            local rid = root(cid)
+            if not roots[rid] then roots[rid] = true; count += 1; only = rid end
+        end
+        cellsets[version] = roots
+        if count == 1 then cellofvalue[version] = only end
+        for rid in pairs(roots) do
             local c = cells[rid]
             if not c then c = { id = rid, reg = capturereg[rid], captures = {}, closes = {}, values = {} }; cells[rid] = c end
             c.values[version] = true
+        end
+    end
+
+    local function rootmap(source)
+        local outmap = {}
+        for pc, regsmap in pairs(source) do
+            local pm = {}; outmap[pc] = pm
+            for r, set in pairs(regsmap) do
+                local rid
+                for cid in pairs(set) do
+                    local nextid = root(cid)
+                    if rid and rid ~= nextid then error("LumenV4: CellId point state contains distinct cells", 2) end
+                    rid = nextid
+                end
+                if rid then pm[r] = rid end
+            end
+        end
+        return outmap
+    end
+    celluse = rootmap(celluse)
+    celldef = rootmap(celldef)
+    for pc, regsmap in pairs(closevalue) do
+        for _, rec in pairs(regsmap) do
+            local roots = {}
+            for cid in pairs(rec.cells or {}) do roots[root(cid)] = true end
+            rec.cells = roots
         end
     end
     for cid, sites in pairs(closesites) do
@@ -185,6 +231,10 @@ local function analyzecells(out, check)
 
     out.cells = cells
     out.cellOfValue = cellofvalue
+    out.cellSetsByValue = cellsets
+    out.cellUse = celluse
+    out.cellDef = celldef
+    out.cellCloseValue = closevalue
     out.captureCell = capturecell
     out.cellInState = instate
     out.cellOutState = outstate
@@ -275,9 +325,24 @@ local function analyzeobjects(out, check)
         end
     end
 
+    for value, os in pairs(sets) do
+        assert(out.vals[value] ~= nil, "LumenV4: OBJECT_VERIFY set references unknown SSA value")
+        for oid in pairs(os) do assert(objects[oid] ~= nil, "LumenV4: OBJECT_VERIFY set references unknown ObjectId") end
+    end
+    for oid, obj in pairs(objects) do
+        local op = out.proto.Instructions[obj.allocPC]
+        local name = op and ins.name(op) or nil
+        assert(name == "NEWTABLE" or name == "DUPTABLE" or name == "NEWCLASS", "LumenV4: OBJECT_VERIFY ObjectId has invalid allocation")
+        assert(obj.id == oid, "LumenV4: OBJECT_VERIFY ObjectId mismatch")
+        for value in pairs(obj.aliases or {}) do
+            assert(sets[value] and sets[value][oid], "LumenV4: OBJECT_VERIFY alias does not point back to object")
+        end
+    end
+
     out.objectSets = sets
     out.objects = objects
     out.objectIterations = iterations
+    out.objectVerified = true
     function out:objectIds(valueid) return self.objectSets[self:resolve(valueid)] or {} end
     function out:objectId(valueid)
         local one
@@ -288,8 +353,9 @@ local function analyzeobjects(out, check)
 end
 
 function build.run(proto, check, limits)
-    local cfg = graph.build(proto, check, limits)
-    local flow = ssa.build(proto, cfg, check, limits)
+    local timings = {}
+    local t = os.clock(); local cfg = graph.build(proto, check, limits); timings.graph = os.clock() - t
+    t = os.clock(); local flow = ssa.build(proto, cfg, check, limits); timings.ssa = os.clock() - t
     assert(flow.converged, "LumenV4: refusing non-converged SSA")
     local out = fn.new(proto, cfg, flow)
     for id, src in ipairs(flow.versions) do
@@ -315,8 +381,11 @@ function build.run(proto, check, limits)
         end
     end
     out:reindex()
-    analyzecells(out, check)
-    analyzeobjects(out, check)
+    t = os.clock(); analyzecells(out, check); timings.cells = os.clock() - t
+    t = os.clock(); analyzeobjects(out, check); timings.objects = os.clock() - t
+    out.timings = timings
+    out.timings.cfg = cfg.timings or {}
+    out.timings.ssaDetail = flow.timings or {}
     return out
 end
 return build

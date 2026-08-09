@@ -2415,7 +2415,7 @@ Main = (function()
 				if enum and enum ~= "" then return {Name = enum,Category = "Enum"} end
 				local name = engine or script or "string"
 				if primitive[name] then return {Name = name,Category = "Primitive"} end
-				if name == "EnumItem" or name == "Enum" or (script and sub(script,1,5) == "Enum.") then
+				if name == "EnumItem" or name == "Enum" or (script and string.sub(script,1,5) == "Enum.") then
 					return {Name = enum or script or "Enum",Category = "Enum"}
 				end
 				if name == "Object" then name = "Instance" end

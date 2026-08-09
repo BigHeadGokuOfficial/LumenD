@@ -64,4 +64,19 @@ function loops.genInfo(st, pc, op, stop)
     return { loop = loop, op = lop, exit = st:next(loop) }
 end
 
+
+function loops.edgeKind(st, pc, target, active)
+    local loop = active and active.loop
+    if not loop or not loop.headerpc or loop.kind == "repeat" then return nil end
+    local structure = st.cfg.structure
+    if not structure then return nil end
+    local from, to = st.cfg.blockmap[pc], st.cfg.blockmap[target]
+    if not from or not to then return nil end
+    local li = structure.loopByBlock and structure.loopByBlock[from]
+    local natural = li and st.cfg.loops[li]
+    if not natural or natural.headerPC ~= loop.headerpc then return nil end
+    local map = structure.edgeKinds and structure.edgeKinds[from]
+    return map and map[to] or nil
+end
+
 return loops

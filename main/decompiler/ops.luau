@@ -71,12 +71,14 @@ function ops.run(d, st, pc)
     local a, b, c, dd = op.A, op.B, op.C, op.D
     local aux = op.AuxValue and op.AuxValue.Value or 0
 
-    if name == "NOP" or name == "BREAK" or name == "CLOSEUPVALS" or name == "PREPVARARGS" or name == "COVERAGE" or name == "NATIVECALL" then
-    elseif name == "LOADNIL" then st:set(pc, a, ex.atom("nil", true))
+    if name == "CLOSEUPVALS" then
+        if st.v4 and st.v4.dispatcher then st:closecells(pc) end
+    elseif name == "NOP" or name == "BREAK" or name == "PREPVARARGS" or name == "COVERAGE" or name == "NATIVECALL" then
+    elseif name == "LOADNIL" then st:set(pc, a, ex.literal("nil"))
     elseif name == "LOADB" then
-        st:set(pc, a, ex.atom(b == 1 and "true" or "false", true))
+        st:set(pc, a, ex.literal(b == 1 and "true" or "false"))
         if c ~= 0 then return pc + c + 1 end
-    elseif name == "LOADN" then st:set(pc, a, ex.atom(tostring(dd), true))
+    elseif name == "LOADN" then st:set(pc, a, ex.literal(tostring(dd)))
     elseif name == "LOADK" then
         local k = getk(st.proto, dd)
         local raw = k and k.__type == "String" and lit.rawStringConstant(k) or nil
@@ -89,15 +91,17 @@ function ops.run(d, st, pc)
         st:set(pc, a, st:usex(pc, b), nil, st:raw(pc, b))
     elseif name == "GETGLOBAL" then
         local g = lit.rawStringConstant(getk(st.proto, aux)) or "unknownGlobal"
-        st:set(pc, a, ex.atom(g, false), g)
+        st:set(pc, a, ex.global(g), g)
     elseif name == "SETGLOBAL" then
         local g = lit.rawStringConstant(getk(st.proto, aux)) or "unknownGlobal"
         st:out(g .. " = " .. st:use(pc, a))
     elseif name == "GETUPVAL" then
-        local u = st.up[b + 1] or ("upvalue" .. tostring(b))
+        local u = st:upname(b + 1)
+        if not u then error(("LumenV4: CAPTURE_VERIFY GETUPVAL missing slot U%d at pc %d"):format(b, pc), 2) end
         st:set(pc, a, ex.atom(u, false), u)
     elseif name == "SETUPVAL" then
-        local u = st.up[b + 1] or ("upvalue" .. tostring(b))
+        local u = st:upname(b + 1)
+        if not u then error(("LumenV4: CAPTURE_VERIFY SETUPVAL missing slot U%d at pc %d"):format(b, pc), 2) end
         st:out(u .. " = " .. st:use(pc, a))
     elseif name == "GETIMPORT" then
         local v = lit.rawStringConstant(getk(st.proto, dd)) or lit.constant(getk(st.proto, dd))
@@ -106,10 +110,10 @@ function ops.run(d, st, pc)
         st:set(pc, a, ex.prop(st:usex(pc, b), "[" .. st:use(pc, c) .. "]"))
     elseif name == "SETTABLE" then
         local tv = st:veruse(pc, b)
-        local t = tv and st.tbl[tv]
+        local t = tv and tab.get(st, tv)
         local sv = st:veruse(pc, a)
         local kv = st:veruse(pc, c)
-        if t and not t.done and sv ~= tv and kv ~= tv then
+        if tab.canput(t, pc) and sv ~= tv and kv ~= tv then
             t.entries[#t.entries + 1] = { kind = "key", key = st:use(pc, c), val = st:usex(pc, a) }
         else
             st:out(st:use(pc, b) .. "[" .. st:use(pc, c) .. "] = " .. st:use(pc, a))
@@ -123,9 +127,9 @@ function ops.run(d, st, pc)
         local ki = name == "SETUDATAKS" and bit32.band(aux, 0xffff) or aux
         local f = lit.rawStringConstant(getk(st.proto, ki)) or "?"
         local tv = st:veruse(pc, b)
-        local t = tv and st.tbl[tv]
+        local t = tv and tab.get(st, tv)
         local sv = st:veruse(pc, a)
-        if t and not t.done and lit.identifier(f) and sv ~= tv then
+        if tab.canput(t, pc) and lit.identifier(f) and sv ~= tv then
             tab.put(t, "field", f, st:usex(pc, a))
         else
             st:out(lit.property(st:use(pc, b), f) .. " = " .. st:use(pc, a))
@@ -134,9 +138,9 @@ function ops.run(d, st, pc)
         st:set(pc, a, ex.prop(st:usex(pc, b), "[" .. tostring(c + 1) .. "]"))
     elseif name == "SETTABLEN" then
         local tv = st:veruse(pc, b)
-        local t = tv and st.tbl[tv]
+        local t = tv and tab.get(st, tv)
         local sv = st:veruse(pc, a)
-        if t and not t.done and sv ~= tv then
+        if tab.canput(t, pc) and sv ~= tv then
             local idx = c + 1
             local kind = idx == #t.entries + 1 and "list" or "key"
             t.entries[#t.entries + 1] = { kind = kind, key = tostring(idx), val = st:usex(pc, a) }
@@ -166,39 +170,16 @@ function ops.run(d, st, pc)
             st:out("return " .. table.concat(vals, ", "))
         end
     elseif name == "NEWTABLE" then
-        local v = st:verdef(pc, a)
-        local safe = v ~= nil and not st.naming:isDebugAt(a, pc)
-        local real = 0
-        if safe then
-            local block = st.cfg.blockmap[pc]
-            for _, u in ipairs(st.ir:uses(v) or {}) do
-                if not u.pc or st.cfg.blockmap[u.pc] ~= block then safe = false break end
-                if not st:tblmut(u, a) then real += 1 end
-            end
-        end
-        if safe then st.tbl[v] = { reg = a, entries = {}, real = real, done = false }
-        else st:set(pc, a, ex.atom("{}", false)) end
+        local t = tab.begin(st, pc, a, {}, {})
+        if not t then st:set(pc, a, ex.atom("{}", false)) end
     elseif name == "DUPTABLE" then
-        local v = st:verdef(pc, a)
-        local safe = v ~= nil and not st.naming:isDebugAt(a, pc)
-        local real = 0
-        if safe then
-            local block = st.cfg.blockmap[pc]
-            for _, u in ipairs(st.ir:uses(v) or {}) do
-                if not u.pc or st.cfg.blockmap[u.pc] ~= block then safe = false break end
-                if not st:tblmut(u, a) then real += 1 end
-            end
-        end
-        if safe then
-            local entries, slots = tab.seed(getk(st.proto, dd))
-            st.tbl[v] = { reg = a, entries = entries, slots = slots, real = real, done = false }
-        else
-            st:set(pc, a, ex.atom(lit.constant(getk(st.proto, dd)), false))
-        end
+        local entries, slots = tab.seed(getk(st.proto, dd))
+        local t = tab.begin(st, pc, a, entries, slots)
+        if not t then st:set(pc, a, ex.atom(lit.constant(getk(st.proto, dd)), false)) end
     elseif name == "SETLIST" then
         local start = aux
         local tv = st:veruse(pc, a)
-        local t = tv and st.tbl[tv]
+        local t = tv and tab.get(st, tv)
         local vals = {}
         local mult = false
         if c == 0 then
@@ -216,9 +197,10 @@ function ops.run(d, st, pc)
         local selfref = false
         for i = 1, #vals do
             local r = b + i - 1
-            if st:veruse(pc, r) == tv then selfref = true break end
+            local rv = st:veruse(pc, r)
+            if t and rv and st.ir.objectId and st.ir:objectId(rv) == t.oid then selfref = true break end
         end
-        if t and not t.done and not selfref then
+        if tab.canput(t, pc) and not selfref then
             for i, v in ipairs(vals) do
                 local idx = start + i - 1
                 local kind = idx == #t.entries + 1 and "list" or "key"
@@ -249,7 +231,9 @@ function ops.run(d, st, pc)
         local ck = getk(st.proto, dd)
         local child
         if d.parsed and ck and ck.__type == "Closure" then child = d.parsed.Protos[(ck.Value or 0) + 1] end
-        if child then func.emit(d, st, pc, a, child, {}, st:next(pc))
+        if child then
+            local caps, nx = func.caps(st, pc, child, "dup")
+            func.emit(d, st, pc, a, child, caps, nx)
         else st:badpc(pc, "missing DUPCLOSURE proto"); st:set(pc, a, ex.atom("function(...) end", false)) end
     elseif name == "ADD" or name == "SUB" or name == "MUL" or name == "DIV" or name == "MOD" or name == "POW" or name == "IDIV" or name == "AND" or name == "OR" then
         local map = { ADD = "+", SUB = "-", MUL = "*", DIV = "/", MOD = "%", POW = "^", IDIV = "//", AND = "and", OR = "or" }
