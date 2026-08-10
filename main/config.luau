@@ -1,4 +1,3 @@
-
 local base = {
     aggressive = false,
     fold = true,
@@ -7,12 +6,12 @@ local base = {
     conditions = true,
     guards = false,
     types = true,
-    selects = false,
-    returns = false,
-    compound = false,
+    selects = true,
+    returns = true,
+    compound = true,
     inlineast = false,
     callbacks = false,
-    booleans = false,
+    booleans = true,
     smartnames = true,
     functions = true,
     doblocks = 0,
@@ -22,6 +21,14 @@ local base = {
     structuredmaxinstructions = 32000,
     structuredmaxprotoinstructions = 16000,
     structuredmaxblocks = 1024,
+    formatter = {
+        IndentWidth = 4,
+        MaxLineLength = 110,
+        TableInlineLimit = 4,
+        BlankLinesBetweenFunctions = true,
+        AppendSemicolons = false,
+        ParenthesizeConditions = false,
+    },
 }
 
 local map = {
@@ -40,15 +47,34 @@ local map = {
 
 return function(opt)
     local out = {}
-    for k, v in pairs(base) do out[k] = v end
-    if opt then for k, v in pairs(opt) do out[map[k] or k] = v end end
+    for k, v in pairs(base) do
+        if k == "formatter" and type(v) == "table" then
+            local copy = {}
+            for fk, fv in pairs(v) do copy[fk] = fv end
+            out[k] = copy
+        else
+            out[k] = v
+        end
+    end
+    if opt then
+        for k, v in pairs(opt) do
+            local key = map[k] or k
+            if key == "formatter" and type(v) == "table" then
+                local merged = {}
+                for fk, fv in pairs(out.formatter or {}) do merged[fk] = fv end
+                for fk, fv in pairs(v) do merged[fk] = fv end
+                out.formatter = merged
+            else
+                out[key] = v
+            end
+        end
+    end
     out.doblocks = math.max(0, math.floor(tonumber(out.doblocks) or 0))
     out.structuredbudget = math.max(0, tonumber(out.structuredbudget) or 1.25)
     out.structuredmaxinstructions = math.max(0, math.floor(tonumber(out.structuredmaxinstructions) or 32000))
     out.structuredmaxprotoinstructions = math.max(0, math.floor(tonumber(out.structuredmaxprotoinstructions) or 16000))
     out.structuredmaxblocks = math.max(0, math.floor(tonumber(out.structuredmaxblocks) or 1024))
     if out.fidelity ~= false then
-
         out.fold = false
         out.guards = false
         out.selects = false

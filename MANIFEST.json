@@ -1,0 +1,22 @@
+{
+  "READABILITY_V1.md": "42d3e77b6cdcfa6d1c67246bc02aec33e631488bd5cd51b0812cda3c95937e94",
+  "main/ast/booleans.luau": "90b2a316df90da3316ad671c9a7562f2b67519c429834bd86ef11294131a2b3c",
+  "main/ast/compound.luau": "ed477f9de26b75a305a4b823277fd568df5c5707cab3350cb08958ab560d7484",
+  "main/ast/condition_utils.luau": "d6f814131f4af2e317f370874c5296790ff115248a37f1be80792dbfd4a7518f",
+  "main/ast/deadcode.luau": "179cda2b38cea12daff904e985e5fea57addc6bce871cb2aa6e5c347a844d97d",
+  "main/ast/guards2.luau": "8ff12ffeecb3b2c0f8ac2aa56a9b58f14437b0590f95b2dd67b65d6af622583b",
+  "main/ast/locals.luau": "076e433a26f189daad2fd7d460badf0072d0583482fab90a325ed9006a4d8ee8",
+  "main/ast/logic.luau": "f5caff936c3c09de08fe8d1a7f28b7da3de4e42df2065b3892252d5b064699de",
+  "main/ast/normalize.luau": "79a3d06ac74d756d2c88fb383dea074d29d8bf316a2c8be1bd45c0017a00ed3d",
+  "main/ast/pipeline.luau": "d93a500fb90508cfef6631222d2d57987268720fb916737705d01ba7da637fab",
+  "main/ast/place_locals.luau": "035a03b42d9745bae8cf637b2e2f6643db00acca6239c75c4a5e8b42768f2775",
+  "main/ast/printer.luau": "c64e6ff5b1931b074d951b9f6bbeff646ecf94b490b0a6f55b16e285df3e0b2c",
+  "main/ast/returns.luau": "d53a7d3cfbe247d3f125243c285b6d4b461eb372d48fc09b586bc256dd7ba4d8",
+  "main/ast/selects.luau": "2d2724d3376926844e29760685137aa94e0456a2a90b9b8de32a5d36e73c00ce",
+  "main/ast/statements.luau": "57cb944f2a7836ef6b164c7caad5b12f8b1d45d52d11d26fbd5177b7d23818dd",
+  "main/ast/text_utils.luau": "0df0f80945c010c287e0ae900d41cba195949c533d98929ce7f097515cf8cdc7",
+  "main/config.luau": "18f541235c750eae543a6fea81fe95e8b2f291ddcd18dd9c6e8141c8df574c3b",
+  "main/options.luau": "307ebccff20b665ad630f1ea5295f7202c43fe3c038e503a653429391cf85834",
+  "main/output/expr.luau": "359c615572e43c155aeccaae605b85e26161999e7428cf8bd106ec56bdf4ae6f",
+  "tools/build_bundle.py": "a5d3e4df607f70b33638657662c6cbbd8b01b25c8b53008bb71daad6d4783ee9"
+}

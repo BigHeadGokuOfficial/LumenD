@@ -1,4 +1,3 @@
-
 local opt = {}
 
 function opt.new()
@@ -14,6 +13,14 @@ function opt.new()
         StructuredMaxInstructions = 32000,
         StructuredMaxProtoInstructions = 16000,
         StructuredMaxBlocks = 1024,
+        formatter = {
+            IndentWidth = 4,
+            MaxLineLength = 110,
+            TableInlineLimit = 4,
+            BlankLinesBetweenFunctions = true,
+            AppendSemicolons = false,
+            ParenthesizeConditions = false,
+        },
     }
 end
 

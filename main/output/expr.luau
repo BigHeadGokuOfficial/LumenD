@@ -128,6 +128,59 @@ function expr.str(v)
     return render(v)
 end
 
+local function fmtcfg(opt)
+    local f = opt and opt.formatter or {}
+    local width = math.max(0, math.min(16, math.floor(tonumber(f.IndentWidth) or 4)))
+    local maxline = math.max(40, math.floor(tonumber(f.MaxLineLength) or 110))
+    local inline = math.max(1, math.floor(tonumber(f.TableInlineLimit) or 4))
+    return width, maxline, inline
+end
+
+local function pretty(v, opt, depth)
+    if type(v) ~= "table" or v.kind ~= "table" then return render(v) end
+
+    local fields = v.fields or {}
+    if #fields == 0 then return "{}" end
+
+    local width, maxline, inline = fmtcfg(opt)
+    local plain = render(v)
+    local nested = false
+    for _, field in ipairs(fields) do
+        if type(field.value) == "table" and field.value.kind == "table" then
+            nested = true
+            break
+        end
+    end
+
+    if not nested and #fields <= inline and (#plain + width * (depth or 0)) <= maxline then
+        return plain
+    end
+
+    depth = depth or 0
+    local innerindent = string.rep(" ", width * (depth + 1))
+    local closeindent = string.rep(" ", width * depth)
+    local out = { "{" }
+
+    for _, field in ipairs(fields) do
+        local prefix
+        if field.kind == "list" then
+            prefix = ""
+        elseif field.kind == "field" then
+            prefix = tostring(field.key) .. " = "
+        else
+            prefix = "[" .. tostring(field.key) .. "] = "
+        end
+        out[#out + 1] = innerindent .. prefix .. pretty(field.value, opt, depth + 1) .. ","
+    end
+
+    out[#out + 1] = closeindent .. "}"
+    return table.concat(out, "\n")
+end
+
+function expr.format(v, opt, depth)
+    return pretty(v, opt, depth or 0)
+end
+
 local function verify(v, seen)
     if type(v) ~= "table" then return true end
     seen = seen or {}
@@ -152,7 +205,10 @@ local function verify(v, seen)
         assert(v.fn ~= nil and type(v.args) == "table", "LumenV4: EXPR_VERIFY malformed call expression")
         verify(v.fn, seen); for _, a in ipairs(v.args) do verify(a, seen) end
     elseif kind == "table" then
-        for _, field in ipairs(v.fields or {}) do assert(field.value ~= nil, "LumenV4: EXPR_VERIFY table field has no value"); verify(field.value, seen) end
+        for _, field in ipairs(v.fields or {}) do
+            assert(field.value ~= nil, "LumenV4: EXPR_VERIFY table field has no value")
+            verify(field.value, seen)
+        end
     else
         error("LumenV4: EXPR_VERIFY unknown expression kind " .. tostring(kind), 2)
     end

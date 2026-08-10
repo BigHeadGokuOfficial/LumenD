@@ -11,13 +11,19 @@ local function hasname(node, name)
     local pat = "%f[%w_]" .. esc(name) .. "%f[^%w_]"
     local function hit(s) return type(s) == "string" and s:find(pat) ~= nil end
     if hit(node.text) or hit(node.cond) or hit(node.head) or hit(node.args) then return true end
-    if node.values then for _, value in ipairs(node.values) do if hit(expr.str(value)) then return true end end end
+    if node.values then
+        for _, value in ipairs(node.values) do
+            if hit(expr.str(value)) then return true end
+        end
+    end
     if node.kind == "if" then
         for _, b in ipairs(node.branches or {}) do
             if hit(b.cond) then return true end
             for _, x in ipairs(b.body.body or {}) do if hasname(x, name) then return true end end
         end
-        if node.elsebody then for _, x in ipairs(node.elsebody.body or {}) do if hasname(x, name) then return true end end end
+        if node.elsebody then
+            for _, x in ipairs(node.elsebody.body or {}) do if hasname(x, name) then return true end end
+        end
     elseif node.body then
         for _, x in ipairs(node.body.body or {}) do if hasname(x, name) then return true end end
     end
@@ -66,8 +72,14 @@ local function fnhead(node, opt)
 end
 
 local function block(out, b, depth, opt)
-    for _, node in ipairs(b.body) do
+    local previous
+    for _, node in ipairs(b.body or {}) do
         if not node.dead then
+            if depth == 0 and previous and opt.formatter and opt.formatter.BlankLinesBetweenFunctions
+                and (previous.kind == "function" or node.kind == "function") then
+                out[#out + 1] = ""
+            end
+
             local k = node.kind
             if k == "raw" or k == "return" or k == "break" or k == "continue" then
                 line(out, opt, depth, node.text, true)
@@ -77,14 +89,19 @@ local function block(out, b, depth, opt)
                     local an = node.annotations and node.annotations[i]
                     names[i] = name .. (node.declare and an and (": " .. an) or "")
                 end
-                local vals = {}; for i, value in ipairs(node.values or {}) do vals[i] = expr.str(value) end
-                line(out, opt, depth, (node.declare and "local " or "") .. table.concat(names, ", ") .. " = " .. table.concat(vals, ", "), true)
+                local vals = {}
+                for i, value in ipairs(node.values or {}) do vals[i] = expr.format(value, opt, depth) end
+                local rhs = #vals > 0 and (" = " .. table.concat(vals, ", ")) or ""
+                line(out, opt, depth, (node.declare and "local " or "") .. table.concat(names, ", ") .. rhs, true)
             elseif k == "decl" then
                 local names = {}
-                for i, name in ipairs(node.names or {}) do local an = node.annotations and node.annotations[i]; names[i] = name .. (an and (": " .. an) or "") end
+                for i, name in ipairs(node.names or {}) do
+                    local an = node.annotations and node.annotations[i]
+                    names[i] = name .. (an and (": " .. an) or "")
+                end
                 line(out, opt, depth, "local " .. table.concat(names, ", "), true)
             elseif k == "if" then
-                for i, branch in ipairs(node.branches) do
+                for i, branch in ipairs(node.branches or {}) do
                     line(out, opt, depth, (i == 1 and "if " or "elseif ") .. cond(opt, branch.cond) .. " then")
                     block(out, branch.body, depth + 1, opt)
                 end
@@ -123,6 +140,7 @@ local function block(out, b, depth, opt)
                 block(out, node.body, depth + 1, opt)
                 line(out, opt, depth, "end", opt.functions == false or node.assign)
             end
+            previous = node
         end
     end
 end
