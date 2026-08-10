@@ -1,0 +1,12 @@
+[package]
+name = "lumend-native"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.7.9"
+base64 = "0.22.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+luau-lifter = { git = "https://github.com/Stefanuk12/medal-decompiler.git", rev = "d6681a77966efcb120352fbff327c9235ded0e1c", package = "luau-lifter" }

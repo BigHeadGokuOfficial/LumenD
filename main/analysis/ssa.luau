@@ -17,9 +17,7 @@ local function seteq(a, b)
     return true
 end
 
-
 local ambig = {}
-
 
 local function packflow(proto, cfg, check)
     local pin, pout, before, consumer = {}, {}, {}, {}
@@ -58,7 +56,6 @@ local function packflow(proto, cfg, check)
             if pout[block.id] ~= cur then pout[block.id] = cur; changed = true end
         end
     end
-
 
     for _, block in ipairs(cfg.blocks) do
         local cur = pin[block.id]
@@ -141,6 +138,8 @@ local function liveness(proto, cfg, packinput, ambiguous, check)
 end
 
 function ssa.build(proto, cfg, check, limits)
+    local timings = {}
+    local ssastart = os.clock()
     cfg = cfg or graph.build(proto, check, limits)
     local packinblock, packoutblock, packbefore, packinput, ambiguouspack = packflow(proto, cfg, check)
     local livein, liveout, liveafter = liveness(proto, cfg, packinput, ambiguouspack, check)
@@ -166,7 +165,6 @@ function ssa.build(proto, cfg, check, limits)
     for reg = 0, (proto.ParameterCount or 0) - 1 do
         local id = newver("param", reg, 0, 1); result.params[reg] = id
     end
-
 
     for _, b in ipairs(cfg.blocks) do
         if check then check() end
@@ -247,7 +245,6 @@ function ssa.build(proto, cfg, check, limits)
         end
         if not next(phis) then result.phisByBlock[bid] = nil end
     end
-
 
     for _, b in ipairs(cfg.blocks) do
         local current = copy(result.inVersions[b.id] or {})
